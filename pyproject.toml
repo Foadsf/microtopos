@@ -1,0 +1,39 @@
+[project]
+name = "microtopos"
+version = "0.6.0"
+description = "Encoderless computational microscopy: live X-Y stitching, shape-from-focus height maps and surface metrology for manual microscopes"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.12",
+    # headless build: the GUI build bundles its own Qt plugins, which clash with PySide6
+    "opencv-python-headless>=4.9",
+    "scikit-image>=0.22",
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13.7",
+    "PyOpenGL>=3.1.7",
+    "tifffile>=2024.2.12",
+]
+
+[project.optional-dependencies]
+serial = ["pyserial>=3.5"]
+
+[project.scripts]
+microtopos = "microtopos.app:main"
+microtopos-selftest = "microtopos.selftest:main"
+microtopos-record = "microtopos.record:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

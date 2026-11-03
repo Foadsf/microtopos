@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+# raw camera recordings are large; keep them out of version control
+recordings/
+# design conversations and AI prompts: kept locally, not part of the published software
+GEMINI_ONE_SHOT_PROMPT*.md
+Gemini v5 response.md
+Manual zoom microscope video analysis.md
+Microscope Metrology Software Specifications.md
+Microscope video focus stacking.md

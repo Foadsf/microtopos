@@ -6,6 +6,7 @@ at the capture resolution. Qt-free, so it runs in a worker thread and in the sel
 
 from __future__ import annotations
 
+import datetime
 import time
 from dataclasses import dataclass
 
@@ -175,4 +176,5 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         "breathing_scale_range": float(max(scales) - min(scales)), "focus_window_px": window,
         "measure": st.measure, "timings": timings, "warnings": warnings,
         "frame_indices": idx.tolist(), "z_values": z.tolist(),
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
     }

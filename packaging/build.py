@@ -20,23 +20,10 @@ system = {"Linux": "linux", "Windows": "windows", "Darwin": "macos"}[platform.sy
 arch = {"x86_64": "x86_64", "AMD64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine(),
                                                                                        platform.machine())
 name = f"microtopos-{__version__}-{system}-{arch}"
-args = [
-    sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--name", "microtopos",
-    "--collect-submodules", "pyqtgraph", "--collect-data", "pyqtgraph",
-    "--collect-submodules", "OpenGL", "--collect-submodules", "skimage", "--collect-data", "skimage",
-    "--exclude-module", "matplotlib", "--exclude-module", "tkinter", "--exclude-module", "IPython",
-    "--exclude-module", "pytest", "--exclude-module", "pyqtgraph.examples", "--exclude-module", "pyqtgraph.jupyter",
-]
-if system == "macos":
-    args += ["--windowed", "--osx-bundle-identifier", "org.microtopos.MicroTopos"]
-elif system == "windows":
-    args += ["--onefile", "--console", "--hide-console", "hide-early"]
-else:
-    args += ["--onefile"]
-args.append(str(ROOT / "packaging" / "entry.py"))
-subprocess.run(args, check=True, cwd=ROOT)
+subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "microtopos.spec"], check=True,
+               cwd=ROOT / "packaging")
 
-dist = ROOT / "dist"
+dist = ROOT / "packaging" / "dist"
 out = ROOT / "release"
 out.mkdir(exist_ok=True)
 if system == "macos":

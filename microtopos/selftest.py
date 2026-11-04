@@ -326,6 +326,38 @@ def check_mosaic_jump(seed):
     return rows
 
 
+def check_height_mosaic(seed):
+    """Stitched heights: two overlapping patches of the true surface with an arbitrary 3 um offset between them
+    must be levelled to agree; a patch must follow its keyframe when the pose graph moves it."""
+    obj = OBJECTIVES["10x / 0.25"]
+    sim = SpecimenSimulator(seed, obj)
+    fov_px = sim.out_w
+    m = Mosaic()
+    a_alb, a_h = sim.truth_patch(0.0, 0.0)
+    shift_px = int(0.4 * fov_px)
+    b_alb, b_h = sim.truth_patch(shift_px * sim.um_per_px, 0.0)
+    m._add_keyframe(a_alb, m._bp(a_alb), 1.0, 0.0, 0.0, None, (0, 0))
+    m._add_keyframe(b_alb, m._bp(b_alb), 1.0, float(shift_px), 0.0, 0, (float(shift_px), 0.0))
+    m.add_height_patch(0.0, 0.0, a_alb, a_h, "um")
+    m.add_height_patch(float(shift_px), 0.0, b_alb, b_h + 3.0, "um")
+    hm, (x0, _) = m.height_mosaic()
+    ov = slice(shift_px - x0, fov_px - x0)
+    # in the overlap both patches see the same surface: after levelling, the patch-to-patch step must vanish
+    step = abs((m.patches[1].offset + 3.0) - m.patches[0].offset)
+    truth = a_h[:, shift_px:]
+    stitched = hm[:, ov] - m.patches[0].offset
+    rms = float(np.sqrt(np.nanmean((stitched - truth) ** 2)))
+    rows = [("height mosaic: residual step between levelled patches (um)", seed, f"{step:.3f}", "< 0.05", step < 0.05),
+            ("height mosaic: stitched overlap vs truth RMS (um)", seed, f"{rms:.3f}", "< 0.05", rms < 0.05)]
+    m.edges.append((0, 1, float(shift_px) + 7.0, 0.0, 5.0))  # a strong edge that moves keyframe 1 by ~7 px
+    m._relax()
+    p = m.patches[1]
+    follows = abs(p.x - (m.keyframes[1].x + p.rel[0])) < 1e-6 and abs(m.keyframes[1].x - shift_px) > 1.0
+    rows.append(("height mosaic: patch follows its keyframe after relaxation", seed,
+                 f"keyframe moved {m.keyframes[1].x - shift_px:+.2f} px", "patch moved with it", follows))
+    return rows
+
+
 def check_sfilter(_seed):
     um, lam = 0.5, 20.0
     x = np.arange(512) * um
@@ -466,7 +498,7 @@ def check_real_recording(folder: str) -> list:
 
 CHECKS = [check_conventions, check_focus_measures, check_registration, check_sff,
           lambda s: check_sff(s, "10x / 0.25"), check_hand_sweep, check_reversal, check_textureless,
-          check_state_machine, check_objective_change, check_mosaic, check_mosaic_jump,
+          check_state_machine, check_objective_change, check_mosaic, check_mosaic_jump, check_height_mosaic,
           check_superres]
 ONCE = [check_sfilter, check_exports, check_timing]
 

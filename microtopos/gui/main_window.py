@@ -110,6 +110,10 @@ class MainWindow(QMainWindow):
         self.job: Job | None = None
         self.sr_result = None
         self.last_mosaic_version = -1
+        self.history: list[dict] = []
+        self._result_t = -1e9
+        self.loaded_mosaic = None
+        self.current_hmosaic = None
         self.simulator_only = simulator_only
         self.replay = replay
 
@@ -259,16 +263,36 @@ class MainWindow(QMainWindow):
 
     def _mosaic_bar(self):
         h = QHBoxLayout()
-        self.chk_hmosaic = QCheckBox("Show 2.5D height mosaic")
-        self.chk_hmosaic.setToolTip("Height patches from every Z-stack, aligned by least-squares offsets in their overlaps")
-        self.chk_hmosaic.toggled.connect(lambda: setattr(self, "last_mosaic_version", -1))
-        h.addWidget(self.chk_hmosaic)
-        h.addWidget(self._btn("Reset mosaic  (R)", self._reset_mosaic, "Start a new mosaic"))
+        self.cmb_mview = QComboBox()
+        self.cmb_mview.addItems(["Image", "Image + height overlay", "Height only"])
+        self.cmb_mview.setCurrentIndex(1)
+        self.cmb_mview.setToolTip("Every height map stays pinned to its place in the mosaic; overlapping maps are "
+                                  "levelled to each other (least squares) and blended")
+        self.cmb_mview.currentIndexChanged.connect(lambda: setattr(self, "last_mosaic_version", -1))
+        h.addWidget(self.cmb_mview)
+        h.addWidget(QLabel("Opacity"))
+        self.sl_hop = QSlider(Qt.Horizontal)
+        self.sl_hop.setRange(10, 100)
+        self.sl_hop.setValue(55)
+        self.sl_hop.setFixedWidth(110)
+        self.sl_hop.valueChanged.connect(lambda: setattr(self, "last_mosaic_version", -1))
+        h.addWidget(self.sl_hop)
+        self.lbl_hlegend = QLabel()
+        self.lbl_hlegend.setObjectName("mono")
+        h.addWidget(self.lbl_hlegend)
+        h.addStretch(1)
+        h2 = QHBoxLayout()  # second row: actions and status, so nothing overlaps on narrow windows
+        h2.addWidget(self._btn("Export height mosaic", self._export_height_mosaic,
+                               "Stitched height mosaic as a Gwyddion .gsf"))
+        h2.addWidget(self._btn("Reset mosaic  (R)", self._reset_mosaic, "Start a new mosaic"))
         self.lbl_mosaic = QLabel()
         self.lbl_mosaic.setObjectName("muted")
-        h.addStretch(1)
-        h.addWidget(self.lbl_mosaic)
-        return h
+        h2.addStretch(1)
+        h2.addWidget(self.lbl_mosaic)
+        v = QVBoxLayout()
+        v.addLayout(h)
+        v.addLayout(h2)
+        return v
 
     def _edf_bar(self):
         h = QHBoxLayout()
@@ -291,6 +315,10 @@ class MainWindow(QMainWindow):
         self.cmb_height.addItems(["Height (form removed, S/L filtered)", "Height (raw fit)", "Confidence"])
         self.cmb_height.currentIndexChanged.connect(self._show_result)
         h.addWidget(self.cmb_height)
+        self.cmb_hist = QComboBox()
+        self.cmb_hist.setToolTip("Every height map of this session (most recent first)")
+        self.cmb_hist.currentIndexChanged.connect(self._pick_history)
+        h.addWidget(self.cmb_hist)
         h.addStretch(1)
         self.lbl_height = QLabel()
         self.lbl_height.setObjectName("muted")
@@ -995,8 +1023,13 @@ class MainWindow(QMainWindow):
         if s.mosaic_version != self.last_mosaic_version and self.tabs.currentIndex() == 1:
             self.last_mosaic_version = s.mosaic_version
             (img, origin), hm, nkf, npatch = self.engine.mosaic_image()
-            if self.chk_hmosaic.isChecked() and hm is not None:
+            if nkf <= 1 and self.loaded_mosaic is not None:  # nothing mapped yet: show the opened session's mosaic
+                (img, origin), hm = self.loaded_mosaic
+            self.current_hmosaic = hm
+            mode = self.cmb_mview.currentIndex()
+            if mode == 2 and hm is not None:
                 self.p_mosaic.set_image(hm[0], um_prev, unit=self._z_unit_label())
+                self.p_mosaic.set_overlay(None)
                 self.mosaic_origin = hm[1]
             else:
                 # display copy: at most 1600 px wide, 8-bit RGBA (empty = transparent); cheap to repaint
@@ -1009,12 +1042,39 @@ class MainWindow(QMainWindow):
                 self.p_mosaic.set_image(rgba, um_prev * img.shape[1] / small.shape[1], rgb=True)
                 self.p_mosaic.data_full = img
                 self.mosaic_origin = origin
+                self._draw_height_overlay(hm if mode == 1 else None, origin, um_prev)
             self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · "
                                     f"{img.shape[1] * um_prev:.0f} × {img.shape[0] * um_prev:.0f} µm")
         if s.seq % 20 == 0:
             self._refresh_checklist()
             if self.diag.isVisible() and self.result is None:
                 self.diag.setPlainText("\n".join(list(self.engine.events)[-40:]))
+
+    def _draw_height_overlay(self, hm, origin, um):
+        """Colour-mapped stitched height mosaic over the image mosaic, at its true position."""
+        if hm is None or not np.isfinite(hm[0]).any():
+            self.p_mosaic.set_overlay(None)
+            self.lbl_hlegend.setText("")
+            return
+        z, (hx, hy) = hm
+        lo, hi = np.nanpercentile(z, [2, 98])
+        norm = np.clip((np.nan_to_num(z, nan=lo) - lo) / max(hi - lo, 1e-9), 0, 1)
+        rgba = pg.colormap.get("viridis").map(norm.ravel(), mode="byte").reshape(z.shape + (4,)).copy()
+        rgba[..., 3] = np.where(np.isfinite(z), int(255 * self.sl_hop.value() / 100), 0)
+        from PySide6.QtCore import QRectF
+        rect = QRectF((hx - origin[0]) * um, (hy - origin[1]) * um, z.shape[1] * um, z.shape[0] * um)
+        self.p_mosaic.set_overlay(rgba, rect)
+        self.lbl_hlegend.setText(f"height {lo:.3g}–{hi:.3g} {self._z_unit_label()} (viridis)")
+
+    def _export_height_mosaic(self):
+        hm = getattr(self, "current_hmosaic", None)
+        if hm is None:
+            self.notify("No height maps in the mosaic yet.", "warning")
+            return
+        p = self._save_path("Export stitched height mosaic", "height_mosaic.gsf", "GSF (*.gsf)")
+        if p:
+            export.write_gwyddion_gsf(p, hm[0], self.um_preview, self._z_unit_label() == "µm", "MicroTopos height mosaic")
+            self.notify(f"Saved {p}", "success")
 
     def _draw_camera_box(self, s, um):
         """Live outline of the camera's field of view on the mosaic (red when tracking is lost)."""
@@ -1069,6 +1129,9 @@ class MainWindow(QMainWindow):
 
     def _on_sweep(self, cap: SweepCapture):
         if cap.completeness < 0.5 and self.engine.sm.override != Override.Z:
+            # a quick refocus, or refocusing right after a successful sweep: not a failed attempt, stay quiet
+            if len(cap.frames) < 45 or time.perf_counter() - self._result_t < 15.0:
+                return
             self.last_ignored = cap.completeness
             self.notify(f"Focus movement ignored: only {cap.completeness:.0%} of the field passed through focus. "
                         "For a height map, sweep from clearly below to clearly above the surface.", "warning")
@@ -1129,6 +1192,8 @@ class MainWindow(QMainWindow):
                 r["warnings"] = r.get("warnings", []) + ["Repeatability not computed: the stage moved, the objective "
                                                          "changed or the size differs between the two sweeps."]
         self.prev_result, self.result = self.result, r
+        self._result_t = time.perf_counter()
+        self._remember(r)
         self.last_ignored = None
         # pin into the mosaic at preview resolution
         s = self.engine.snapshot()
@@ -1144,6 +1209,25 @@ class MainWindow(QMainWindow):
         self.notify(f"Height map ready: {r['valid_fraction']:.0%} of pixels reliable, "
                     f"{r['timings']['total']:.1f} s." + (f"  {len(w)} warning(s) in Report." if w else ""),
                     "warning" if w else "success")
+
+    HISTORY = 10
+
+    def _remember(self, r):
+        self._n_results = getattr(self, "_n_results", 0) + 1
+        r.setdefault("label", f"#{self._n_results}  {str(r.get('timestamp', ''))[11:19]}  "
+                              f"{r['objective'].split(' /')[0]} · {r['valid_fraction']:.0%} reliable")
+        self.history.insert(0, r)
+        del self.history[self.HISTORY:]
+        self.cmb_hist.blockSignals(True)
+        self.cmb_hist.clear()
+        self.cmb_hist.addItems([h["label"] for h in self.history])
+        self.cmb_hist.setCurrentIndex(0)
+        self.cmb_hist.blockSignals(False)
+
+    def _pick_history(self, i):
+        if 0 <= i < len(self.history) and self.history[i] is not self.result:
+            self.result = self.history[i]
+            self._show_result()
 
     def _recompute(self):
         r = self.result
@@ -1407,7 +1491,11 @@ class MainWindow(QMainWindow):
 
     def _save_session(self):
         if self._need_result() and (p := self._save_path("Save session", "session.npz", "Session (*.npz)")):
-            export.save_session(p, {**self.result, "sl_surface": self.result["sl_surface"]},
+            (img, origin), hm, _, _ = self.engine.mosaic_image()
+            extra = {"mosaic_image": img, "mosaic_origin": list(origin), "um_preview": getattr(self, "um_preview", None)}
+            if hm is not None:
+                extra.update(height_mosaic=hm[0], height_mosaic_origin=list(hm[1]))
+            export.save_session(p, {**self.result, **extra},
                                 {"objective": self.obj.name, "measure": self.cmb_measure.currentText()})
             self.notify(f"Saved {p}", "success")
 
@@ -1427,6 +1515,12 @@ class MainWindow(QMainWindow):
             r["warnings"] = m.pop("warnings")
             r.update(m)
             self.result = r
+            self._remember(r)
+            if isinstance(r.get("mosaic_image"), np.ndarray):
+                hm = (r["height_mosaic"], tuple(r["height_mosaic_origin"])) if isinstance(
+                    r.get("height_mosaic"), np.ndarray) else None
+                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"])), hm)
+                self.last_mosaic_version = -1
             self._show_result()
             self.tabs.setCurrentIndex(3)
             self.notify(f"Opened {p}", "success")

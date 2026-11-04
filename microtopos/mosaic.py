@@ -34,6 +34,8 @@ class HeightPatch:
     height: np.ndarray  # in the mosaic's pixel grid (resampled), NaN = invalid
     z_unit: str
     offset: float = 0.0
+    kf: int | None = None  # keyframe the patch is attached to (moves with it when the pose graph relaxes)
+    rel: tuple = (0.0, 0.0)  # patch position minus keyframe position
 
 
 @dataclass
@@ -261,6 +263,19 @@ class Mosaic:
                 self._splat(k.image, k.x, k.y, weight=-1.0)
                 k.x, k.y = float(x), float(y)
                 self._splat(k.image, k.x, k.y)
+        moved = False
+        for p in self.patches:  # height patches follow the keyframe they are attached to
+            if p.kf is None or p.kf >= len(self.keyframes):
+                continue
+            k = self.keyframes[p.kf]
+            nx, ny = k.x + p.rel[0], k.y + p.rel[1]
+            if math.hypot(nx - p.x, ny - p.y) > 0.5:
+                self._splat(p.edf, p.x, p.y, weight=-4.0)
+                p.x, p.y = nx, ny
+                self._splat(p.edf, p.x, p.y, weight=4.0)
+                moved = True
+        if moved:
+            self._solve_offsets()
         self.x, self.y = self.x + dxc, self.y + dyc
         self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
 
@@ -305,7 +320,9 @@ class Mosaic:
 
     # ---------------------------------------------------------------- 2.5D
     def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str) -> None:
-        self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), z_unit))
+        kf = self._nearest(x, y) if self.keyframes else None
+        rel = (x - self.keyframes[kf].x, y - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
+        self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), z_unit, 0.0, kf, rel))
         self._splat(edf.astype(np.float32), x, y, weight=4.0)
         self._solve_offsets()
 
@@ -355,8 +372,11 @@ class Mosaic:
         num = np.zeros((H, W), np.float64)
         den = np.zeros((H, W), np.float64)
         for x, y, p in zip(xs, ys, self.patches):
+            h, w = p.height.shape
+            # feathered blending: patch edges (least reliable, border effects) get less weight
+            fw = np.outer(np.sin(np.linspace(0.05, np.pi - 0.05, h)), np.sin(np.linspace(0.05, np.pi - 0.05, w)))
             ok = np.isfinite(p.height)
-            sl = (slice(y - Y0, y - Y0 + p.height.shape[0]), slice(x - X0, x - X0 + p.height.shape[1]))
-            num[sl] += np.where(ok, p.height + p.offset, 0)
-            den[sl] += ok
-        return np.where(den > 0, num / np.maximum(den, 1), np.nan).astype(np.float32), (X0, Y0)
+            sl = (slice(y - Y0, y - Y0 + h), slice(x - X0, x - X0 + w))
+            num[sl] += np.where(ok, (p.height + p.offset) * fw, 0)
+            den[sl] += np.where(ok, fw, 0)
+        return np.where(den > 1e-6, num / np.maximum(den, 1e-6), np.nan).astype(np.float32), (X0, Y0)

@@ -219,7 +219,7 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
     return files
 
 
-SESSION_ARRAYS = ("edf", "height", "confidence", "height_raw")
+SESSION_ARRAYS = ("edf", "height", "confidence", "height_raw", "mosaic_image", "height_mosaic")
 
 
 def save_session(path: Path | str, result: dict, settings: dict) -> None:

@@ -202,12 +202,15 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         if first or autorange:
             self.plot.setRange(rect, padding=0.02)
 
-    def set_overlay(self, rgba: np.ndarray | None):
+    def set_overlay(self, rgba: np.ndarray | None, rect: QRectF | None = None):
+        """RGBA overlay; by default it covers the image, or `rect` (in um) when given."""
         if rgba is None:
             self.overlay.clear()
         else:
             self.overlay.setImage(rgba, autoLevels=False, levels=(0, 255))
-            if self.data is not None:
+            if rect is not None:
+                self.overlay.setRect(rect)
+            elif self.data is not None:
                 h, w = self.data.shape[:2]
                 self.overlay.setRect(QRectF(0, 0, w * self.um_per_px, h * self.um_per_px))
 

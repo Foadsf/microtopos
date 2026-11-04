@@ -330,15 +330,15 @@ class LiveEngine:
 
 
 def _completeness(tiles: list) -> float:
-    """Fraction of field tiles whose focus energy peaks strictly inside the sweep, with a clear peak."""
+    """Fraction of field tiles that went blurry -> sharp -> blurry at some point during the sweep.
+
+    A tile counts if some frame k is clearly sharper (> 0.3 in log energy) than the blurriest frame before it
+    AND than the blurriest frame after it. Later refocusing (sharp again at the end) does not undo that.
+    """
     if len(tiles) < 5:
         return 0.0
     t = np.log(np.asarray(tiles) + 1e-6)
-    k = np.argmax(t, axis=0)
-    peak = t.max(axis=0)
-    idx = np.arange(len(t))[:, None]
-    # the tile's focus peak must be bracketed: clearly blurred somewhere before it AND somewhere after it
-    before = np.where(idx <= k, t, np.inf).min(axis=0)
-    after = np.where(idx >= k, t, np.inf).min(axis=0)
-    return float(np.mean((peak - before > 0.3) & (peak - after > 0.3)))
-
+    before = np.minimum.accumulate(t, axis=0)
+    after = np.minimum.accumulate(t[::-1], axis=0)[::-1]
+    ok = ((t - before) > 0.3) & ((t - after) > 0.3)
+    return float(np.mean(ok.any(axis=0)))

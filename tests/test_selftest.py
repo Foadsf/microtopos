@@ -26,3 +26,20 @@ def test_gui_smoke():
     from microtopos.gui.smoke import run_gui_smoke
 
     assert run_gui_smoke()
+
+
+def test_sweep_completeness():
+    """A sweep counts once the field went blurry -> sharp -> blurry; refocusing afterwards must not undo it."""
+    import numpy as np
+
+    from microtopos.live import _completeness
+
+    z = np.linspace(-3, 3, 60)
+
+    def tiles(path):
+        return [np.full(36, 1 + 5 * np.exp(-x * x)) for x in path]
+
+    assert _completeness(tiles(z)) == 1.0
+    assert _completeness(tiles(np.r_[z, np.linspace(3, 0, 30), np.zeros(15)])) == 1.0  # sweep, then refocus
+    assert _completeness(tiles(np.r_[np.linspace(-3, 0, 30), np.zeros(20)])) == 0.0  # refocus only
+    assert _completeness(tiles(np.r_[np.zeros(10), np.linspace(0, 0.3, 10), np.zeros(10)])) == 0.0  # wiggle

@@ -260,3 +260,4 @@ a.btn.primary:hover { filter: brightness(1.08); }
 .cards .sidebarblock > .content > .imageblock { order: -1; }
 .cards .sidebarblock > .content > .paragraph:last-child { margin-top: auto; }
 @media (max-width: 600px) { body:not(.home) #preamble > .sectionbody > .paragraph:first-child p, .lead p { font-size: 17px; } }
+.doc code, .doc pre, .doc kbd { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }

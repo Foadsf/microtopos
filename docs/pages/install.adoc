@@ -1,0 +1,92 @@
+= Install
+:description: Download the portable MicroTopos program for Linux, Windows or macOS, or run it from source.
+
+MicroTopos {version} is a single portable program: download it, make it runnable, start it. There is no installer and nothing is written outside your user folder.
+
+== Download
+
+[cols="2,3,3",options="header"]
+|===
+| System | File | Notes
+| Linux, x86-64 (most PCs) | `microtopos-{version}-linux-x86_64` | Ubuntu 22.04 / Linux Mint 21 or newer
+| Linux, ARM64 | `microtopos-{version}-linux-arm64` | needs glibc 2.39 (Ubuntu 24.04 or newer), e.g. Raspberry Pi 5
+| Windows 10/11, x86-64 | `microtopos-{version}-windows-x86_64.exe` | not yet tested on a real Windows desktop
+| macOS, Apple silicon | `microtopos-{version}-macos-arm64.zip` | not yet tested on a real Mac
+| macOS, Intel | `microtopos-{version}-macos-x86_64.zip` | not yet tested on a real Mac
+|===
+
+[.buttons]
+link:{release-url}[Open the {version} release page,role="btn primary"] link:{repo}/releases[All releases,role=btn]
+
+Every release is built and self-tested by GitHub Actions from the tagged source. `SHA256SUMS.txt` lists a checksum for each file.
+
+== Linux
+
+[.steps]
+. Download the file for your processor and open a terminal in the download folder.
+. Check the download and make it runnable:
++
+[source,bash,subs="attributes"]
+----
+sha256sum -c --ignore-missing SHA256SUMS.txt
+chmod +x microtopos-{version}-linux-x86_64
+----
+. Install `v4l-utils`. MicroTopos uses its `v4l2-ctl` tool to lock the exposure and switch off in-camera sharpening:
++
+[source,bash]
+----
+sudo apt install v4l-utils
+----
+. Start it:
++
+[source,bash,subs="attributes"]
+----
+./microtopos-{version}-linux-x86_64
+----
+
+TIP: If the camera is not listed, check that your user may use video devices: `groups` should include `video`. If not, run `sudo usermod -aG video $USER` and log out and back in.
+
+== Windows
+
+[.steps]
+. Download `microtopos-{version}-windows-x86_64.exe`.
+. Double-click it. The program is not code-signed, so Windows SmartScreen may show "Windows protected your PC". Click *More info*, then *Run anyway*.
+. Allow camera access if Windows asks: menu:Settings[Privacy & security > Camera > Let desktop apps access your camera].
+
+NOTE: On Windows and macOS, exposure is set through OpenCV's camera properties. Whether a given camera honours them depends on its driver; the Camera step shows what the device reports back.
+
+== macOS
+
+[.steps]
+. Download the `.zip` for your Mac (Apple menu > About This Mac shows *Apple M…* or *Intel*), then double-click it to unpack `microtopos.app`.
+. The app is not notarised. The first time, right-click it and choose *Open*, then *Open* again. If macOS still refuses, run `xattr -dr com.apple.quarantine microtopos.app` in Terminal.
+. Allow camera access when asked, or later under menu:System Settings[Privacy & Security > Camera].
+
+== Run from source
+
+For development, or on a system without a prebuilt file, run it with https://docs.astral.sh/uv/[uv] and Python 3.11 or newer:
+
+[source,bash]
+----
+git clone https://github.com/Foadsf/microtopos.git
+cd microtopos
+uv run microtopos              # the application
+uv run microtopos --simulator  # start on the synthetic specimen
+uv run microtopos-selftest     # the ground-truth self-test
+----
+
+NOTE: On Linux, Qt needs `libxcb-cursor0` for its X11 window plugin. If you see "Could not load the Qt platform plugin xcb", run `sudo apt install libxcb-cursor0`.
+
+== Command-line options
+
+[cols="1,3",options="header"]
+|===
+| Option | Effect
+| `--simulator` | start on the synthetic specimen; cameras are still listed in step 1
+| `--replay DIR` | play back a raw recording made with *Record raw stream* or `microtopos-record`
+| `-v`, `--verbose` | print the live event log to the console (it is always shown under *Diagnostics*)
+| `--selftest [--quick] [--gui]` | run the ground-truth self-test and exit
+| `--version` | print the version
+|===
+
+Next, try the program without a microscope in the xref:quick-start.adoc[quick start].

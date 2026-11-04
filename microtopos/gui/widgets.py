@@ -151,6 +151,7 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.plot.addItem(self.empty)
         self.readout = pg.TextItem("", anchor=(0, 0))
         self.readout.setZValue(10)
+        self.readout.hide()  # its filled background would show as a small box while empty
         self.plot.addItem(self.readout)
         self.data = None
         self.extra = None  # optional second layer for readout (e.g. confidence)
@@ -236,6 +237,7 @@ class ImagePanel(pg.GraphicsLayoutWidget):
     def _moved(self, pos):
         if self.data is None or not self.plot.sceneBoundingRect().contains(pos):
             self.readout.setText("")
+            self.readout.hide()
             return
         p = self.group.mapFromScene(pos)  # µm in the unrotated image
         x, y = p.x() / self.um_per_px, p.y() / self.um_per_px
@@ -247,10 +249,12 @@ class ImagePanel(pg.GraphicsLayoutWidget):
             if self.extra is not None and self.extra.shape[:2] == (h, w):
                 extra = f"  conf {float(self.extra[int(y), int(x)]):.2f}"
             self.readout.setText(f"x {p.x():.1f} µm  y {p.y():.1f} µm  {val}{extra}")
+            self.readout.show()
             vr = self.plot.vb.viewRect()
             self.readout.setPos(vr.left(), vr.top())
         else:
             self.readout.setText("")
+            self.readout.hide()
 
 
 def section(title: str, *widgets, hint: str | None = None) -> QWidget:

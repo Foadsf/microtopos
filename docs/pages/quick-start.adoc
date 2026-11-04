@@ -1,0 +1,61 @@
+= Quick start
+:description: Five minutes with the built-in simulator: a demo focus sweep, a height map and a stitched mosaic, no microscope needed.
+
+The built-in simulator renders a synthetic metal surface with known heights, using the same optics model the measurement relies on. It is the fastest way to learn the program, and everything below works the same with a real camera.
+
+== 1. Start on the simulator
+
+Start the program with the simulator selected:
+
+[source,bash,subs="attributes"]
+----
+./microtopos-{version}-linux-x86_64 --simulator     # or: uv run microtopos --simulator
+----
+
+On Windows and macOS, start it normally and choose *Simulator (synthetic specimen)* in step 1. The window has three parts:
+
+image::overview-start.png[The window right after start: checklist on the left, coach line and live image in the middle, telemetry on the right]
+
+* *Left: the checklist.* Six steps, each with a status chip. Click a step to open its settings below the list.
+* *Middle: the coach line and the views.* The blue-edged line above the tabs always says what is happening and what to do next. The status chips in the header show the motion state (`DWELL`, `PAN`, `Z_SWEEP`), the source, and the X-Y and Z calibration state.
+* *Right: telemetry.* The sharpness trace, the focus-sweep coverage, reconstruction progress and exports.
+
+== 2. Make a height map
+
+Open step 1, *Camera*. The *Demo* box is shown only for the simulator. Click *Focus sweep*: the simulated focus knob turns from below the surface, through focus, to above it.
+
+image::live-sweep.png[A focus sweep in progress; the header says Z_SWEEP and the coach line counts frames and coverage]
+
+Watch three things:
+
+* the header chip changes to `Z_SWEEP` and counts frames;
+* the coach line reports how much of the field has gone *blurry → sharp → blurry*, which must reach 50 %;
+* the *Focus sweep coverage* map on the right fills in where each pixel has passed through focus.
+
+When the knob stops, the sweep is reconstructed in the background, which takes about 3 seconds here. A notice says when the map is ready. The program stays on the current tab, so open *Height* yourself:
+
+image::tab-height.png[The height map of the synthetic specimen with its colour scale]
+
+Hover over the map to read the height under the cursor. Drag the orange line to see a profile. The *Report* tab lists the roughness parameters, and *3D* shows the surface in perspective.
+
+TIP: The simulator's heights are simulation truth, so the report labels them *SIMULATED*. With a real camera, heights stay in *focus frames* until you calibrate Z (xref:tutorial-calibration.adoc[calibration tutorial]).
+
+== 3. Stitch a mosaic
+
+Back in step 1, click *Pan around*. The simulated stage moves in a loop and the program switches to the *Mosaic* tab. The blue box is the camera's current field of view.
+
+image::tab-mosaic-overlay.png[A stitched mosaic with the height map from step 2 overlaid in colour at its own position]
+
+The height map you just made is pinned to the place where it was measured. Use the menu above the mosaic to choose *Image*, *Image + height overlay* or *Height only*, and the slider to set the overlay's opacity. Overlapping height maps are levelled to each other and blended.
+
+== 4. Save your work
+
+* menu:Telemetry[Save] (kbd:[Ctrl+S]) saves a session: the height map, all-in-focus image, mosaic and report. *Open* (kbd:[Ctrl+O]) restores it.
+* *.gsf* opens in https://gwyddion.net[Gwyddion]; *TIFF* is a 32-bit float height image; *STL* is a 3D mesh for printing or CAD; *Report* (kbd:[Ctrl+E]) writes JSON, CSV and PNG files.
+
+== Next
+
+You have seen the whole workflow. With a real microscope there are two more things to do: calibrate, so lengths and heights come out in µm, and learn the sweep technique by hand.
+
+[.buttons]
+link:tutorial-height-map.html[Tutorial: a real height map →,role="btn primary"] link:manual.html[Full manual,role=btn]

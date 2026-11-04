@@ -1,0 +1,70 @@
+= Metrology
+:description: How MicroTopos computes height maps and ISO 25178-style surface parameters, and what each number means.
+
+MicroTopos reports areal surface-texture parameters in the style of ISO 25178. The implementation follows the standard's definitions but is *not certified*. Every report states the filters, units and calibration status the numbers depend on.
+
+== From frames to heights
+
+[cols="1,3",options="header"]
+|===
+| Stage | Method
+| Sweep | frames between the detected start and end of the focus movement; a turn back through focus (reversal) is detected and only one direction is used
+| Registration | sub-pixel translation between consecutive frames (ECC), chained, so small stage drift is removed
+| Focus measure | difference-of-Gaussians band-pass energy per pixel in a window matched to the objective's resolution
+| Depth | a Gaussian (log-parabola) fit through the five frames around each pixel's focus peak, on the actual z values
+| Confidence | from the peak's prominence and the noise of the focus curve; unreliable pixels are left empty (NaN)
+| Smoothing | confidence-weighted guided filter with outlier rejection; edges are preserved
+| All-in-focus | Laplacian-pyramid fusion with soft weights, at full camera resolution
+|===
+
+== Surface preparation
+
+Before any parameter is computed, the height map is prepared:
+
+. *Form removal*: a least-squares polynomial (order 1 = plane, 2 = quadric; step 6) is subtracted.
+. *S-filter*: a Gaussian low-pass, ISO 16610-61, σ = 0.1874 λ~s~, removes noise below the optical resolution. The default λ~s~ follows the objective's resolution.
+. *L-filter* (optional): a Gaussian high-pass with cut-off λ~c~ removes waviness.
+
+Only valid pixels are used throughout. If fewer than 30 % of the pixels have a reliable depth, the parameters are withheld and the report says why.
+
+== Parameters
+
+[cols="1,1,4",options="header"]
+|===
+| Parameter | Unit | Meaning
+3+| *Height*
+| Sa | z | arithmetic mean of the absolute heights
+| Sq | z | root-mean-square height
+| Sp, Sv, Sz | z | maximum peak height, maximum pit depth, and their sum
+| Ssk | – | skewness: negative for a plateau with pits, positive for peaks on a flat
+| Sku | – | kurtosis: 3 for a Gaussian surface, larger for sharp peaks or pits
+3+| *Hybrid*
+| Sdr | % | developed interfacial area ratio: extra true area over the projected area, from two triangles per pixel cell. Shown only when z is in µm.
+3+| *Functional (material ratio curve)*
+| Sk | z | core height, from the 40 % secant of least slope on the material ratio curve
+| Spk | z | reduced peak height: the peaks above the core, which wear off first
+| Svk | z | reduced valley depth: the valleys below the core, which hold lubricant
+| Smr1, Smr2 | % | material ratios at the top and bottom of the core
+3+| *Spatial*
+| Sal | µm | fastest decay length of the autocorrelation to 0.2
+| Str | – | texture aspect ratio: near 1 isotropic, near 0 strongly directional. Undefined, and not shown, when the autocorrelation does not decay to 0.2 in some direction.
+| Std | ° | texture direction (lay), from the angular power spectrum
+3+| *Other*
+| σ~inst~ | z | repeatability from two sweeps at the same place: std(Δz)/√2
+| PSD slope β, fractal dimension | – | log-log slope of the radial power spectrum; D = (8 − β)/2, given only when 2 < β < 4
+| GLCM contrast, homogeneity, correlation | – | Haralick texture of the all-in-focus image, 64 grey levels
+| Grains, area, max Feret, circularity | –, µm², µm | marker-controlled (h-minima) watershed on the all-in-focus image; grains touching the border are excluded
+| Mean lineal intercept, ASTM E112 G | µm, – | Heyn intercept method on the grain boundaries; G = −3.2877 − 6.6439 log~10~(ℓ in mm)
+|===
+
+_z_ is µm after Z calibration, otherwise focus frames. Lengths in µm are *nominal* until the lateral scale is calibrated.
+
+NOTE: Grain statistics come from the image, not the height, and depend on how visible the boundaries are: an etched metallographic section works best. Check them with *Overlay grain boundaries* on the All-in-focus tab.
+
+== Limits you should know
+
+* *Optical limits.* Lateral resolution is limited by the objective (about 0.61 λ/NA) and by the camera's Bayer sensor and MJPEG compression. Height resolution is a fraction of the depth of field and depends on the texture.
+* *Focus breathing* (magnification changing with focus) is not corrected. The effect is about 1 pixel at the image edges in far-defocused frames.
+* *Manual Z.* Heights scale with the knob speed until calibrated, and an uneven speed distorts them. Shapes are right; the scale is what calibration fixes.
+* *Textureless or mirror-like areas* give no focus signal and are left empty. A light etch, oblique lighting or a higher-NA objective helps.
+* *Accuracy on real samples* has not yet been validated against a certified reference. The figures on the xref:development.adoc#verification[verification] list come from simulation ground truth and from real camera texture with a known synthetic relief.

@@ -5,6 +5,8 @@ the view is stitched into a mosaic. Turn the fine focus through the surface and 
 image and ISO 25178-style roughness, texture and grain statistics are computed automatically. Free software
 (GPL-3.0-or-later); Linux, Windows and macOS.
 
+**Website, manual and tutorials: <https://foadsf.github.io/microtopos/>**
+
 ## Download
 
 Portable executables are attached to each [release](https://github.com/Foadsf/microtopos/releases); no Python
@@ -89,7 +91,7 @@ Simulator ground truth (every instrument parameter randomised per seed):
 - Depth at 40×/0.85 with known z: Pearson r 0.994–0.998, height slope 0.979–0.994, RMSE 0.06–0.08 µm
   (0.1 DOF), 94–97 % valid pixels. At 10×/0.25: r 0.990–0.997, slope 0.973–0.986.
 - Hand sweep with unknown z (variable speed, pause): rank correlation 0.994–0.998.
-- Registration on informative frames: 0.10–0.16 px RMS. Mosaic loop: 0.50–0.77 px RMS.
+- Registration on informative frames: 0.10–0.16 px RMS. Mosaic loop: 0.45–0.89 px RMS.
 - Tracking loss (jump to unmapped ground and back): every tile within about 1 px of its true place.
 - Fast hand pans with motion blur (30 and 60 px/frame at 640 px): no false view changes, one mosaic area, end
   position error 0.5–1.2 px. At 90 px/frame tracking holds but drifts 8–21 px.
@@ -99,7 +101,7 @@ Simulator ground truth (every instrument parameter randomised per seed):
 - No false Z sweeps in 300 still or 200 panning frames; reversals found within 2 frames; objective change detected
   for an instant switch and a turret with dark frames.
 - Textureless patch: 99–100 % masked. ISO Gaussian filter: 0.500 transmission at the cutoff.
-- 48 frames at 1920×1080: 2.8 s end to end on a 4-core laptop (target ≤ 15 s).
+- 48 frames at 1920×1080: 2.8–4.2 s end to end on a 4-core laptop (target ≤ 15 s).
 
 Real specimen (`--real recordings/…`, texture and noise from the Bresser camera on a metallurgical sample):
 - Stitching along a known path: 40/40 frames tracked, 0.21 px RMS.

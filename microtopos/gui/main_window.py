@@ -361,6 +361,7 @@ class MainWindow(QMainWindow):
             self.gl_grid = gl.GLGridItem()
             self.gl.addItem(self.gl_grid)
             self.gl_surf = gl.GLSurfacePlotItem(shader="shaded", smooth=True, computeNormals=True)
+            self.gl_surf.setVisible(False)  # an empty surface has no mesh: drawing it raises in pyqtgraph
             self.gl.addItem(self.gl_surf)
             lay.addWidget(self.gl, 1)
         except Exception:
@@ -639,8 +640,8 @@ class MainWindow(QMainWindow):
         self.btn_lastsweep = self._btn("Reconstruct last sweep", self._reconstruct_last,
                                        "Build a height map from the last captured focus sweep, even an incomplete one")
         self.btn_lastsweep.setEnabled(False)
-        pr2 = QHBoxLayout()
-        pr2.addWidget(self.chk_autorec, 1)
+        pr2 = QVBoxLayout()  # two rows: the telemetry dock is narrow
+        pr2.addWidget(self.chk_autorec)
         pr2.addWidget(self.btn_lastsweep)
         self.lbl_job = QLabel("Idle.")
         self.lbl_job.setObjectName("muted")
@@ -1508,6 +1509,7 @@ class MainWindow(QMainWindow):
             ys = np.arange(zs.shape[0]) * um * step
             self.gl_surf.setData(x=xs - xs.mean(), y=ys - ys.mean(), z=(zf.T - fill) * zscale,
                                  colors=np.transpose(cols, (1, 0, 2)))
+            self.gl_surf.setVisible(True)
             span = max(xs.max(), ys.max())
             self.gl_grid.setSize(span * 1.2, span * 1.2)
             self.gl_grid.setSpacing(span / 10, span / 10)

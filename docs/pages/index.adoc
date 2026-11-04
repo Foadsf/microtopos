@@ -1,0 +1,124 @@
+= MicroTopos
+:description: Free software that turns a manual microscope and an eyepiece camera into a stitching, height-mapping and surface-metrology instrument.
+:notitle:
+
+[.hero]
+--
+[.intro]
+====
+[.kicker]
+Free software · Linux, Windows, macOS
+
+[.display]
+Your manual microscope, now a surface-measuring instrument.
+
+[.lead]
+MicroTopos watches the eyepiece camera while you work the knobs as usual. Move the stage and it stitches a mosaic. Turn the fine focus through the sample and it builds a height map, an all-in-focus image and an ISO 25178-style roughness report. No motors, no encoders, no extra hardware.
+
+[.buttons]
+link:install.html[Download {version},role="btn primary"] link:quick-start.html[Try it in 5 minutes,role=btn]
+
+[.fineprint]
+Portable single-file programs; nothing to install. Try it first with the built-in simulator, no microscope needed.
+====
+
+image::overview-dark.png[The MicroTopos window with a height map and its profile]
+--
+
+== What it does
+
+[.center]
+Everything is detected from the video alone, so you keep the microscope you already have and the way you already use it.
+
+[.cards]
+--
+.Stitch while you move
+****
+image::view-mosaic.png[A stitched mosaic]
+
+Pan the X-Y stage and the field of view joins the mosaic in real time. A blue box shows where the camera is. If tracking is lost, it picks up again by itself when you come back to an area already mapped.
+****
+
+.Height maps from a focus sweep
+****
+image::view-height.png[A height map]
+
+Turn the fine focus slowly from blurry through sharp to blurry again. The sweep is detected, checked and reconstructed in the background, typically in a few seconds.
+****
+
+.A metrology report
+****
+image::view-report.png[The surface report]
+
+Sa, Sq, Sz, Sdr, Sk, Spk, Svk, Sal, Str, grain size (ASTM E112) and more, with ISO 16610 Gaussian filters and every assumption printed next to the numbers.
+****
+--
+
+== How a session goes
+
+[.center]
+A checklist on the left walks you through it, and a one-line coach above the image always says what to do next.
+
+[.flow]
+--
+.Connect
+****
+Pick the camera. Exposure is locked and in-camera sharpening is switched off automatically.
+****
+
+.Set up
+****
+Choose the objective, and optionally record dark and flat frames for even illumination.
+****
+
+.Calibrate
+****
+Drag a line over a stage micrometer for µm per pixel; calibrate the focus knob for heights in µm.
+****
+
+.Inspect
+****
+Pan to map, sweep focus to measure. Height maps stay pinned to their place in the mosaic.
+****
+--
+
+== Built to be honest
+
+[.cards.two]
+--
+.Every number says where it comes from
+****
+Uncalibrated lengths are labelled *NOMINAL*, uncalibrated heights are in *focus frames*, and simulator results are labelled *SIMULATED*. Pixels without a reliable depth are left empty instead of guessed.
+****
+
+.Verified against ground truth
+****
+A built-in self-test (`microtopos-selftest`, 101 checks) runs the whole pipeline on randomised synthetic specimens with known heights. A quick version runs on every release build on every platform. link:development.html#verification[See the measured numbers].
+****
+--
+
+== Start now
+
+[.cards]
+--
+.1. Download
+****
+One file for Linux (x86-64, ARM64), Windows or macOS (Apple silicon, Intel).
+
+link:install.html[Installation guide →]
+****
+
+.2. Try the simulator
+****
+Run a demo pan and a demo focus sweep on a synthetic specimen in five minutes.
+
+link:quick-start.html[Quick start →]
+****
+
+.3. Use your microscope
+****
+Step-by-step tutorials for height maps, mosaics and calibration.
+
+link:tutorials.html[Tutorials →]
+****
+--

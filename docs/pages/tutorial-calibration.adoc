@@ -1,0 +1,56 @@
+= Calibration for real units
+:description: Dark and flat frames, lateral scale from a stage micrometer, and the Z scale of a manual focus knob.
+
+Out of the box, MicroTopos measures lateral lengths with the objective's *nominal* scale and heights in *focus frames*. The checklist shows this with yellow chips (*Nominal*, *Frames*). Three calibrations turn them into real units. Each is stored per objective, so you do it once.
+
+== Dark and flat frames (step 3, optional)
+
+image::step-darkflat.png[Step 3: dark and flat frame buttons,role=narrow]
+
+Uneven illumination and sensor offset show up as fake height and roughness gradients. Correcting them is recommended before measuring roughness:
+
+Record dark (lamp off):: block the light completely and click. 24 frames are averaged; keep still.
+Record flat (blank, defocused):: put a featureless, highly reflective area under the objective, such as a mirror or a polished blank, defocus it so no texture is visible, and click.
+
+Both are stored per objective, capture size and exposure. Change any of these and the correction switches off until you record again for the new setting. The header chip `DARK/FLAT` shows the state.
+
+== Lateral scale (step 4)
+
+You need a *stage micrometer*: a slide with a ruled scale, typically 1 mm in 100 divisions of 10 µm.
+
+image::step-lateral.png[Step 4: lateral scale,role=narrow]
+
+[.steps]
+. Put the micrometer under the objective and focus on the ruling.
+. Open step 4. A blue line appears on the *Live* view.
+. Drag the line's two ends onto two graduation marks as far apart as the field allows. A longer interval gives a smaller relative error.
+. Click *Use the blue line on Live…* and enter the interval's true length in µm.
+
+image::live-lateral.png[Step 4 open: the blue calibration line on the Live view, with a handle at each end]
+
+The chip turns green and every length, area and µm axis now uses the calibrated scale. The scale is stored for full resolution and converted automatically for the other capture size, which has the same field of view.
+
+TIP: Place the line along the ruling as precisely as you can: the scale comes straight from its length in pixels. Zoom with the mouse wheel on the Live view to place the ends more accurately.
+
+== Z scale (step 5)
+
+The fine-focus knob has no encoder, so the program cannot know how far the stage moved between frames. Heights stay in *focus frames* until you tell it.
+
+image::step-zscale.png[Step 5: Z scale,role=narrow]
+
+From last sweep's knob travel (recommended):: Most fine-focus knobs carry a scale, often 1 or 2 µm per division. Make a sweep at an *even speed* and note the scale reading at its start and end. Then click the button and enter the travel in µm. The program divides it by the frames used in that sweep: an even speed is assumed, so keep using the same speed in later sweeps.
+Apply DOF ruler estimate (experimental):: Estimates µm per frame by comparing the measured width of the focus curves with the objective's theoretical depth of field. It needs no knob scale but is only indicative: in simulation it was off by −34 % to +13 %. It is labelled experimental wherever it is used.
+Clear:: back to focus-frame units.
+
+== What the chips mean
+
+[cols="1,3",options="header"]
+|===
+| Chip | Meaning
+| *Nominal* (yellow) | lateral scale from the objective's nominal magnification; lengths are indicative
+| *Calibrated* (green) | lateral scale or Z scale from your own calibration
+| *Frames* (yellow) | heights in focus-frame units, not µm
+| *Optional* / *Partial* / *Done* | dark/flat: none, one of the two, or both recorded for the current objective, capture size and exposure
+|===
+
+Calibrations live in a `calibration.json` file in the program's data folder, so they survive updates. The simulator never writes to it.

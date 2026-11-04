@@ -1,0 +1,36 @@
+= Tutorials
+:description: Step-by-step tutorials for MicroTopos with a real microscope: height maps, mosaics and calibration.
+
+Each tutorial assumes the program is running with your camera selected in step 1 and the lamp on. If you have not used MicroTopos before, do the five-minute xref:quick-start.adoc[quick start] with the simulator first.
+
+[.cards]
+--
+.A height map from a focus sweep
+****
+image::view-height.png[A height map]
+
+The sweep technique by hand, what the coach line tells you, reading the map, profiles and the 3D view, and repeatability.
+
+xref:tutorial-height-map.adoc[Start →]
+****
+
+.Mapping with the X-Y stage
+****
+image::view-mosaic-overlay.png[Mosaic with height overlay]
+
+Growing a mosaic, what to do when tracking is lost, pinning height maps into it, and rotating the views for a camera that sits askew.
+
+xref:tutorial-mosaic.adoc[Start →]
+****
+
+.Calibration for real units
+****
+image::step-lateral.png[The lateral calibration step]
+
+Dark and flat frames, µm per pixel from a stage micrometer, and µm per focus frame from the knob scale.
+
+xref:tutorial-calibration.adoc[Start →]
+****
+--
+
+TIP: The order that works best on a new microscope: *calibration* once per objective, then *height maps* and *mosaics* as often as you like. Calibrations are remembered per objective.

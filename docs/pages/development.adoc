@@ -1,0 +1,89 @@
+= Develop
+:description: MicroTopos source code, architecture, the ground-truth self-test with its measured results, building the binaries and this website.
+
+MicroTopos is free software under the GNU General Public License, version 3 or later. The source, issues and releases are on link:{repo}[GitHub].
+
+== Run and test from source
+
+[source,bash]
+----
+git clone https://github.com/Foadsf/microtopos.git
+cd microtopos
+uv run microtopos --simulator           # the application on the synthetic specimen
+uv run microtopos-selftest              # ground-truth self-test, 3 seeds (about 5 minutes)
+uv run microtopos-selftest --quick --gui  # one seed plus an offscreen GUI run
+uv run --group dev pytest               # the same checks as unit tests
+----
+
+`microtopos-record OUTDIR` records raw MJPEG frames from the camera for offline work, and `--replay OUTDIR` plays them back through the full live pipeline. `microtopos-selftest --real OUTDIR` adds checks on a recording of a lit specimen.
+
+== Architecture
+
+[cols="1,3",options="header"]
+|===
+| Module | Responsibility
+| `camera` | capture threads (V4L2/OpenCV, latest-frame pull, raw recording, reconnect), camera controls, simulator and replay sources
+| `kinematics` | motion state machine: DWELL, PAN, Z_SWEEP, OBJECTIVE_CHANGE, from noise-normalised video features with hysteresis
+| `live` | the engine thread: state, sweep capture and completeness, pre-roll, mosaic updates, lock-free snapshots for the GUI
+| `mosaic` | band-pass phase correlation refined by ECC, NCC verification, keyframe pose graph with loop closure, relocalisation, height patches
+| `registration`, `focus`, `sff`, `zstack` | sweep registration, focus measures, depth fitting and refinement, all-in-focus fusion, the reconstruction pipeline
+| `metrology`, `export` | ISO 25178-style parameters, filters and grains; GSF, TIFF, STL, report bundle and sessions
+| `optics`, `calibration`, `simulator` | objective model, calibration store and radiometric correction, synthetic specimen renderer
+| `gui` | the Qt (PySide6) window, built on pyqtgraph
+|===
+
+The GUI never waits for the engine: the engine publishes an immutable snapshot after each frame and the GUI draws the latest one. Reconstruction runs in worker threads.
+
+[#verification]
+== Verification
+
+The self-test renders a synthetic specimen with the same optics model the measurement relies on. Every instrument parameter is randomised per seed. It checks the pipeline against the known truth: 101 checks pass, 0 fail, and 30 are informational.
+
+[cols="2,3",options="header"]
+|===
+| Check | Result (seeds 11, 22, 33)
+| Depth at 40×/0.85, known z | Pearson r 0.994–0.998, slope 0.979–0.994, RMSE 0.06–0.08 µm (0.1 DOF), 94–97 % valid
+| Depth at 10×/0.25 | r 0.990–0.997, slope 0.973–0.986
+| Hand sweep, unknown z (variable speed, pause) | rank correlation 0.994–0.998
+| Registration on informative frames | 0.10–0.16 px RMS
+| Mosaic around a closed loop | 0.45–0.89 px RMS
+| Tracking loss and return | every tile within about 1 px of its true place
+| Fast pans with motion blur, 30 and 60 px/frame | no false view changes, one area, end error 0.5–1.2 px
+| False detections | no false sweeps in 300 still or 200 panning frames
+| Objective change | detected for an instant switch and a turret with dark frames
+| Textureless patch | 99–100 % masked instead of guessed
+| ISO 16610-61 Gaussian filter | 0.500 transmission at the cut-off
+| Metrology on synthetic surfaces | grain count within 25 %, 50 µm grid intercept within 5 µm, Sdr exact on a tilted plane, groove direction and Str as expected
+| 48 frames at 1920×1080 | 2.8–4.2 s end to end on a 4-core laptop
+|===
+
+On real camera data (Bresser MikrOkular Full HD on a metallurgical sample): stitching along a known path tracked 40/40 frames at 0.21 px RMS. Depth over a known synthetic relief, with real texture blurred by the optical model, gave r 0.986, slope 0.993 and RMSE 0.91 µm (0.09 DOF). A 3-minute still recording of 2,236 frames produced no false detections.
+
+IMPORTANT: Real-sample accuracy against a certified roughness or step-height standard has *not* been measured yet. Contributions of such measurements are very welcome.
+
+== Builds and releases
+
+`packaging/build.py` builds a single-file executable with PyInstaller. Pushing a tag `v*` runs the release workflow:
+
+* builds for Linux x86-64 (on Ubuntu 22.04, for the oldest glibc) and ARM64, Windows x86-64, and macOS ARM64 and x86-64;
+* runs `--selftest --quick --gui` with each built program on its runner;
+* publishes the files with `SHA256SUMS.txt`.
+
+Linux builds deliberately leave out the system's graphics, X11, font and C++ runtime libraries, so the program uses the user's own drivers.
+
+== This website
+
+The site is written in AsciiDoc (`docs/pages/*.adoc`) and built with Asciidoctor.js into one shared template (`docs/build.mjs`, `docs/assets/`). The screenshots are taken from the real application running on the simulator, so they can be regenerated after any GUI change:
+
+[source,bash]
+----
+uv run python docs/tools/screenshots.py                    # all shots, offscreen
+uv run python docs/tools/screenshots.py --platform xcb --only tab-3d   # 3D needs a real display
+cd docs && npm ci && npm run build                         # -> docs/_site
+----
+
+A workflow builds the site on every push to `main` that changes `docs/` and publishes it on the `gh-pages` branch.
+
+== Contributing
+
+Bug reports with a raw recording are the most useful contribution: they replay exactly. For code, run the self-test and `pytest` before a pull request, and keep the numbers honest: a claim in the README or here needs a check that measures it.

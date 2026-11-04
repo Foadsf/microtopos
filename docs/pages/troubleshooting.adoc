@@ -1,0 +1,70 @@
+= Help
+:description: Solutions to common problems with MicroTopos: camera not found, dark or frozen image, ignored sweeps, tracking and start-up errors.
+
+[.lead]
+Most problems show up on the coach line or as a chip in the header first. If the answer is not here, open *Diagnostics* on the right, copy the event log and link:{repo}/issues[report the problem].
+
+== Camera
+
+No camera in the list::
+* Linux: check `ls /dev/video*` and that your user is in the `video` group (see xref:install.adoc#linux[install]).
+* Close other programs that use the camera: only one program can stream from it at a time.
+* Unplug and replug it, then restart MicroTopos.
+
+The image is black or very dark::
+Check the lamp first. Then raise the exposure or click *Set once* in step 1. *Device reports* shows the exposure the camera actually accepted.
+
+The image is frozen, or the coach line says the camera stopped sending frames::
+The USB connection stalled. MicroTopos tries to reconnect every few seconds and re-applies your exposure when it does. If it does not recover, replug the cable; avoid unpowered USB hubs.
+
+Exposure does not change (Windows, macOS)::
+There, exposure is set through OpenCV's camera properties, and some drivers ignore them. Use the camera's own settings tool to fix the exposure, and keep *Automatic exposure* off in MicroTopos.
+
+Lower frame rate than advertised::
+Many eyepiece cameras deliver fewer frames than they advertise; the Bresser MikrOkular Full HD, for example, gives 12.5 fps at 1920×1080 instead of 25. Long exposures lower it further.
+
+== Height maps
+
+My focus sweep was ignored::
+The coach line gives the percentage of the field that went *blurry → sharp → blurry*; 50 % is needed. Start further out of focus and keep turning until everything is blurry again. See xref:tutorial-height-map.adoc[the tutorial].
+
+A sweep starts when I only refocus::
+Short refocusing is ignored automatically. To decide yourself, switch off *Reconstruct sweeps automatically* and use *Reconstruct last sweep*, or use *Mode: Pause* in step 6.
+
+Big holes in the height map::
+Those pixels have no clear focus peak: no texture, or saturation. Lower the exposure until the magenta stripes disappear, record a flat frame, or use a higher-NA objective.
+
+The heights are in "frames"::
+Calibrate the Z scale in step 5 (xref:tutorial-calibration.adoc#z-scale-step-5[how]).
+
+== Mosaic
+
+The mosaic says "tracking lost" or starts a new area::
+The view jumped too far between frames. Move back over mapped ground; next time move more slowly (the coach line says *Move slower* when needed).
+
+Moving one stage knob moves the view diagonally::
+The camera sits rotated in the eyepiece tube. Use *View rotation › Measure from X pan* in step 1 (xref:tutorial-mosaic.adoc#rotating-the-views[how]).
+
+"The view changed abruptly" while panning::
+This happens when a scene change (objective turned, light blocked) is suspected. Fast, blurred pans are checked for motion first and should not trigger it. If it happens during normal panning, please report it with a recording (*Record raw stream*).
+
+== Start-up
+
+Linux: "Could not initialize GLX" or the program aborts at start::
+Use version 0.6.0 or newer: test builds made before that release bundled an old C++ runtime that clashed with the system's graphics drivers.
+
+Linux: "Could not load the Qt platform plugin xcb"::
+`sudo apt install libxcb-cursor0`.
+
+Windows: "Windows protected your PC"::
+The program is not code-signed: *More info › Run anyway*.
+
+macOS: "cannot be opened because the developer cannot be verified"::
+Right-click the app › *Open*, or run `xattr -dr com.apple.quarantine microtopos.app`.
+
+The 3D tab is empty or shows a message::
+3D needs OpenGL. If none is available (some virtual machines and remote desktops), MicroTopos shows a flat relief image instead; all measurements are unaffected.
+
+== Reporting a problem
+
+Useful in a bug report: the version (`microtopos --version`), your system and camera, the *Diagnostics* log, and ideally a short raw recording (*Record raw stream* on the Live tab), which replays exactly with `--replay`.

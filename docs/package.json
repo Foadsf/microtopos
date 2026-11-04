@@ -1,0 +1,13 @@
+{
+  "name": "microtopos-docs",
+  "private": true,
+  "description": "MicroTopos website: AsciiDoc sources compiled with Asciidoctor.js",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "serve": "node build.mjs && npx --yes http-server@14.1.1 _site -p 8085 -c-1"
+  },
+  "devDependencies": {
+    "@asciidoctor/core": "3.0.4"
+  }
+}

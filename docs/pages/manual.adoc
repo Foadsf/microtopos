@@ -1,0 +1,123 @@
+= Manual
+:description: Reference for every part of the MicroTopos window: header, checklist steps, views, telemetry, exports, shortcuts and files.
+
+This is the reference for every control. For a guided introduction, see the xref:quick-start.adoc[quick start] and the xref:tutorials.adoc[tutorials].
+
+image::overview-dark.png[The main window: checklist (left), coach line, tabs and views (middle), telemetry (right)]
+
+== Header and coach line
+
+The header chips summarise the state at a glance:
+
+[cols="1,3",options="header"]
+|===
+| Chip | Meaning
+| `DWELL` / `PAN` / `Z_SWEEP` / `OBJECTIVE_CHANGE` | the motion state detected from the video: still, stage moving, focus moving, or the view changed abruptly
+| `● REC` | raw camera frames are being recorded
+| source | the camera, the recording being replayed, or `SIMULATOR`
+| `XY …` | lateral scale in µm per pixel and whether it is NOMINAL or CALIBRATED
+| `Z …` | height unit: `FRAMES` until Z is calibrated
+| `DARK/FLAT` | radiometric correction state for the current setting
+| `CLIPPING` | more than 1 % of the pixels are saturated
+| fps | frames per second received from the camera and processed
+|===
+
+The *coach line* under the header always describes the current situation and the next useful action. It changes with the state, for example during a sweep, after an ignored sweep, when tracking is lost or when you pan too fast. If you are unsure what to do, read it first.
+
+The motion state is detected automatically. Every feature is compared with its own noise level measured while the view was still, so the detection adapts to the scene, objective and exposure. Hysteresis keeps a short wobble from starting a sweep or a pan.
+
+== The checklist (left)
+
+Each step has a status chip; click a step to open its settings.
+
+=== 1. Camera
+
+image::step-camera.png[Step 1,role=narrow]
+
+Source:: a camera, *Simulator (synthetic specimen)*, or a recording given with `--replay`. A microscope camera is preferred over a laptop webcam at start-up.
+Capture size:: 1920×1080 or 1280×720. Both have the same field of view; Z-stacks use the full capture size, and live analysis uses a 640 px preview.
+Automatic exposure:: off by default and for all measurements.
+Exposure slider:: manual exposure in milliseconds. It applies while you drag, and its range is the one the camera reports. *Set once* adjusts it until the brightest areas are just below saturation, then keeps it locked.
+View rotation:: rotates the 2D views (Live, Mosaic, All-in-focus, Height, coverage) for a camera that sits rotated in the eyepiece. *Measure from X pan* sets it from a movement of the X knob alone. Display only: see xref:tutorial-mosaic.adoc#rotating-the-views[rotating the views].
+Linearise gamma:: converts the camera's gamma-encoded output to linear luminance before analysis. Off: Rec.601 luma of the camera's output.
+Device reports:: the values the camera actually accepted, read back after setting them.
+Demo:: simulator only: *Pan around*, *Focus sweep*, *Sweep + reversal*.
+
+MicroTopos sets the camera after the stream has started and again after a reconnect, because many cameras ignore settings made earlier. On Linux it switches off automatic exposure, in-camera sharpening and backlight compensation. When the camera has them, it also locks automatic white balance, automatic gain and the dynamic frame rate.
+
+=== 2. Objective
+
+Choose the objective in use (kbd:[1] 4×/0.10, kbd:[2] 10×/0.25, kbd:[3] 40×/0.85, kbd:[4] 100×/1.25 oil). The numerical aperture sets the focus window size, the depth of field used by the reconstruction, and the default roughness S-filter (λ~s~). Change it whenever you turn the nosepiece. A detected objective change asks you to confirm.
+
+=== 3. Dark & flat
+
+Records averaged dark and flat frames for the current objective, capture size and exposure. See xref:tutorial-calibration.adoc#dark-and-flat-frames-step-3-optional[calibration].
+
+=== 4. Lateral scale
+
+Calibrates µm per pixel with the blue line on a stage micrometer. See xref:tutorial-calibration.adoc#lateral-scale-step-4[calibration].
+
+=== 5. Z scale
+
+Sets µm per focus frame from the knob's travel or, experimentally, from the depth of field. See xref:tutorial-calibration.adoc#z-scale-step-5[calibration].
+
+=== 6. Inspect
+
+image::step-inspect.png[Step 6,role=narrow]
+
+Mode:: *Auto* detects pans and sweeps; *Pan* and *Z capture* force a state; *Pause* stops detection.
+Focus measure:: *DoG band-pass* (default, robust to noise); Tenengrad, SML, Vollath F4 and F5 for comparison.
+Form removal order:: polynomial order removed before roughness: 1 = tilt, 2 = curvature.
+S-filter λs / L-filter λc:: the ISO 16610-61 Gaussian filter cut-offs in µm. The S-filter removes noise below λs; the optional L-filter removes waviness above λc.
+Start Z capture:: (kbd:[Space]) starts and stops a manual sweep capture.
+Repeat sweep here:: the next sweep at the same place is compared with the last for repeatability, σ~inst~.
+Recompute metrology:: recomputes the report with the current filter settings without a new sweep.
+Super-resolve current view:: experimental: drizzles several still frames with sub-pixel shifts into a sharper image.
+
+== The views (middle)
+
+The tool bar of each view sits above the image. Every 2D view has µm axes; hover for the value under the cursor, scroll to zoom, drag to pan, and click the small *A* button in the corner (or right-click › *View All*) to show everything again.
+
+Live:: the camera preview. *Outline in-focus regions* marks the areas that are currently at their sharpest during a sweep. *Show clipped pixels* stripes saturated areas in magenta. *Record raw stream* saves the camera's exact MJPEG frames for replay with `--replay`.
+Mosaic:: the stitched map, with the camera box. *Image*, *Image + height overlay* or *Height only*; opacity slider; *Export height mosaic*; *Reset mosaic* (kbd:[R]).
+All-in-focus:: the extended-depth-of-field image at full resolution; *Overlay grain boundaries*.
+Height:: filtered height, raw height or confidence; history of the last 10 maps; profile line and plot.
+3D:: the surface in perspective; *Z exaggeration* and colour map (viridis, cividis, inferno, plasma, magma, turbo).
+Report:: parameters, warnings and provenance (kbd:[F1] opens it).
+
+image::tab-edf-grains.png[All-in-focus image with grain boundaries]
+
+image::tab-report.png[The report: parameters with units and meaning, then provenance]
+
+== Telemetry (right)
+
+image::telemetry-sweep.png[The telemetry panel during a sweep,role=narrow]
+
+Sharpness:: the image sharpness over time. A sweep shows as a rise and fall.
+Focus sweep coverage:: per pixel, how strongly it has been in focus during the current sweep.
+Motion line:: frame-to-frame shift in pixels, correlation and the sharpness trend as a z-score.
+Reconstruction:: progress, *Cancel*, *Reconstruct sweeps automatically* and *Reconstruct last sweep*.
+Export:: *.gsf* (Gwyddion), *TIFF* (32-bit float heights), *STL* (binary mesh), *Report* (folder with `report.json`, `summary.csv`, `edf.png`, `confidence.png`), *Save* / *Open* session.
+Diagnostics:: the live event log, for bug reports.
+
+== Keyboard shortcuts
+
+[cols="1,3",options="header"]
+|===
+| Key | Action
+| kbd:[1] – kbd:[4] | select objective 4×, 10×, 40×, 100×
+| kbd:[Space] | start / stop a manual Z capture
+| kbd:[R] | reset the mosaic
+| kbd:[Ctrl+S] / kbd:[Ctrl+O] | save / open a session
+| kbd:[Ctrl+E] | export the report bundle
+| kbd:[F1] | open the Report tab
+|===
+
+Shortcuts are ignored while you type in a field.
+
+== Files and settings
+
+* *Calibrations* (`calibration.json` and dark/flat frames) are kept in the program's data folder, for example `~/.local/share/MicroTopos/MicroTopos` on Linux. On Windows the folder is under `%APPDATA%`, and on macOS under `~/Library/Application Support`.
+* *Settings* (window layout, theme, exposure, view rotation, last folders) use Qt's settings store, for example `~/.config/MicroTopos/MicroTopos.conf` on Linux.
+* *Recordings* go to a `recordings` folder in the current directory.
+* *Sessions* (`.npz`) contain the height map, all-in-focus image, confidence, mosaic, height mosaic and all report values.

@@ -18,3 +18,8 @@ release/
 build.spec
 packaging/build/
 packaging/dist/
+
+# website build
+docs/node_modules/
+docs/_site/
+.claude/

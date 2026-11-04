@@ -198,11 +198,24 @@ class CameraSource(FrameSource):
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # receive MJPEG bytes; decode here (and record them if asked)
         self.recording = False
         t0, n = time.perf_counter(), 0
+        last_ok = time.perf_counter()
         while self._running:
             ok, raw = cap.read()
             if not ok or raw is None:
+                if time.perf_counter() - last_ok > 3.0:  # stalled or unplugged: say so and try to reopen
+                    self.error = "no frames from the camera for 3 s; reconnecting (check the USB cable)"
+                    cap.release()
+                    time.sleep(1.0)
+                    try:
+                        cap = self.open()
+                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                    except RuntimeError:
+                        pass
+                    last_ok = time.perf_counter()
                 time.sleep(0.01)
                 continue
+            last_ok = time.perf_counter()
+            self.error = None
             if raw.ndim == 3:  # backend already decoded
                 frame = raw
             else:

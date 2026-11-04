@@ -19,11 +19,12 @@ from .camera import FrameSource
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
 from .mosaic import Mosaic
-from .optics import OBJECTIVES, Objective
+from .optics import Objective
 
 PREVIEW_W = 640
 MAX_SWEEP_FRAMES = 240  # beyond this, the sweep is thinned 2:1 (keeps the full z range)
 PREROLL = 12
+HOLD_FRAMES = 50  # ~4 s at 12.5 fps
 
 
 @dataclass
@@ -84,9 +85,12 @@ class LiveEngine:
         self._n_preroll = 0
         self._sweep_tiles: list = []
         self._stride, self._zcount = 1, 0
+        self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
         self._pending_patches: list = []
         self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0)), None, 0, 0)
         self._view_version = -1
+        self._view_t = 0.0
+        self._areas_seen = 1
         self._cov = None
         self._dwell = collections.deque(maxlen=16)
         self._avg = collections.deque(maxlen=8)
@@ -114,6 +118,8 @@ class LiveEngine:
         with self._lock:
             self.source = src
             self._reset_motion()
+            self.mosaic.reset()  # a different source shows a different specimen or scale
+            self.mosaic_version += 1
 
     def set_objective(self, obj: Objective):
         with self._lock:
@@ -128,10 +134,15 @@ class LiveEngine:
     def reset_mosaic(self):
         with self._lock:
             self.mosaic.reset()
+            self._areas_seen = 1
             self.mosaic_version += 1
 
     def _reset_motion(self):
         self.sm.reset()
+        self._held = None
+        self._preroll.clear()
+        self._sweep_tiles = []
+        self._n_preroll = 0
         self._sweep.clear()
         self._sweep_z.clear()
         self._cov = None
@@ -153,6 +164,13 @@ class LiveEngine:
 
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
+
+    def _emit(self, frames, zs, tiles, pose, n_pre, shape, simulated):
+        if len(frames) - n_pre < 8 or not self.on_sweep:
+            return
+        z = None if any(v is None for v in zs) else np.array(zs)
+        cap = SweepCapture(list(frames), z, pose, self.objective.name, shape, simulated, _completeness(tiles))
+        threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
 
     def log(self, text: str, seq: int = 0):
         line = f"{time.perf_counter() - self._t0:7.1f}s #{seq:<5d} {text}"
@@ -218,6 +236,8 @@ class LiveEngine:
         fm = focus_map(prev, "DoG band-pass", 9, self.objective.psf_sigma_px(um))
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
+        if self.sm.state == State.Z_SWEEP:
+            self.sm.sweep_complete = _completeness(self._sweep_tiles + [tiles]) >= 0.5
         state, feat, events = self.sm.update(prev)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
@@ -226,28 +246,40 @@ class LiveEngine:
         z_true = getattr(truth, "focus_z_um", None)
         for ev in events:
             if ev.kind == "sweep_started":
-                self._sweep = [f for f, _, _ in self._preroll]
-                self._sweep_z = [z for _, z, _ in self._preroll]
-                self._sweep_tiles = [t for _, _, t in self._preroll]  # the blurry start is part of the sweep
-                self._n_preroll = len(self._sweep)
+                if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it
+                    self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll = self._held[:5]
+                    self._held = None
+                    self.log("sweep resumed (merged with the previous incomplete part)", seq)
+                else:
+                    self._sweep = [f for f, _, _ in self._preroll]
+                    self._sweep_z = [z for _, z, _ in self._preroll]
+                    self._sweep_tiles = [t for _, _, t in self._preroll]  # the blurry start is part of the sweep
+                    self._n_preroll = len(self._sweep)
+                    self._sweep_pose = (self.mosaic.x, self.mosaic.y)
+                    self._cov = None
                 self._stride, self._zcount = 1, 0
-                self._sweep_pose = (self.mosaic.x, self.mosaic.y)
-                self._cov = None
             elif ev.kind == "sweep_ended":
                 comp = _completeness(self._sweep_tiles)
                 self.log(f"sweep ended: {len(self._sweep)} frames ({self._n_preroll} pre-roll), completeness "
                          f"{comp:.2f}{', ABORTED by motion' if ev.detail.get('aborted') else ''}", seq)
-                if not ev.detail.get("aborted") and len(self._sweep) - self._n_preroll >= 8 and self.on_sweep:
-                    zs = None if any(z is None for z in self._sweep_z) else np.array(self._sweep_z)
-                    cap = SweepCapture(list(self._sweep), zs, self._sweep_pose, self.objective.name, (h, w),
-                                       truth is not None, _completeness(self._sweep_tiles))
-                    threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
+                if ev.detail.get("aborted"):
+                    self._held = None
+                elif comp < 0.5:  # incomplete: hold it for a few seconds in case focusing resumes
+                    self._held = (self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
+                                  seq + HOLD_FRAMES, (h, w), truth is not None)
+                else:
+                    self._emit(self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
+                               (h, w), truth is not None)
                 self._sweep, self._sweep_z = [], []
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
         self._preroll.append((full_u8, z_true, tiles))
+        if self._held is not None and (seq > self._held[5] or state == State.PAN):
+            held, self._held = self._held, None
+            if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
+                self._emit(*held[:5], held[6], held[7])
 
         in_focus = None
         if state == State.Z_SWEEP:
@@ -263,10 +295,10 @@ class LiveEngine:
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov
-        if state in (State.PAN, State.DWELL) and self.sm.override != Override.PAUSE:
+        if state in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE) and self.sm.override != Override.PAUSE:
             was_lost = self.mosaic.lost
             added, _ = self.mosaic.track(prev)
-            if added and self.mosaic.areas != getattr(self, "_areas_seen", 1):
+            if added and self.mosaic.areas != self._areas_seen:
                 self._areas_seen = self.mosaic.areas
                 self.log(f"mosaic: started separate area {self.mosaic.areas} (position of this view unknown)", seq)
             if self.mosaic.lost != was_lost:
@@ -274,7 +306,7 @@ class LiveEngine:
             if added:
                 self.mosaic_version += 1
         now = time.perf_counter()
-        if self.mosaic_version != self._view_version and now - getattr(self, "_view_t", 0) > 0.5:
+        if self.mosaic_version != self._view_version and now - self._view_t > 0.5:
             # render the mosaic here (not in the GUI thread), at most twice a second
             self._view_version, self._view_t = self.mosaic_version, now
             self._mosaic_view = (self.mosaic.image(), self.mosaic.height_mosaic(), len(self.mosaic.keyframes),
@@ -310,6 +342,3 @@ def _completeness(tiles: list) -> float:
     after = np.where(idx >= k, t, np.inf).min(axis=0)
     return float(np.mean((peak - before > 0.3) & (peak - after > 0.3)))
 
-
-def objective_names() -> list[str]:
-    return list(OBJECTIVES)

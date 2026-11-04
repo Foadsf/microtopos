@@ -52,6 +52,8 @@ class Mosaic:
     areas: int = 1
     recent_b: collections.deque = field(default_factory=lambda: collections.deque(maxlen=12))
     edges: list = field(default_factory=list)  # (i, j, dx, dy, weight): position of j minus position of i
+    lost_frames: int = 0
+    lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
 
     def reset(self) -> None:
         self.tiles.clear()
@@ -63,6 +65,10 @@ class Mosaic:
         self.edges.clear()
         self.ref = 0
         self.areas = 1
+        self.lost_frames = 0
+        self.lost_view = None
+        self.prev_bp = None
+        self.recent_b.clear()
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -125,13 +131,15 @@ class Mosaic:
             rel, q = None, pm[2]
         else:
             self.lost = True
-            self.lost_frames = getattr(self, "lost_frames", 0) + 1
+            self.lost_frames += 1
             if self.lost_frames % 3 == 0 and self._relocalize(f, fb, win):
                 self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
             elif self.lost_frames >= self.NEW_AREA_AFTER and self._steady_view(f, fb, win, b):
                 self._new_area(f, fb, b)
                 return True, q
-            self.prev_frame, self.prev_bp = f, fb
+            # the position of a lost frame is unknown: it must not seed dead reckoning, only the steady-view test
+            self.prev_frame, self.prev_bp = None, None
+            self.lost_view = (f, fb)
             return False, q
         speed = math.hypot(self.x - self.prev_xy[0], self.y - self.prev_xy[1]) if self.prev_frame is not None else 0.0
         self.lost, self.lost_frames = False, 0
@@ -156,9 +164,9 @@ class Mosaic:
 
     def _steady_view(self, f, fb, win, b) -> bool:
         """The view is still and sharp (matches the previous frame closely), so it can seed a new area."""
-        if self.prev_frame is None:
+        if self.lost_view is None:
             return False
-        dx, dy, q = self._match(self.prev_frame, self.prev_bp, f, fb, win)
+        dx, dy, q = self._match(self.lost_view[0], self.lost_view[1], f, fb, win)
         self.recent_b.append(b)
         return q > 0.8 and math.hypot(dx, dy) < 2.0 and b >= 0.8 * float(np.median(self.recent_b))
 
@@ -171,6 +179,7 @@ class Mosaic:
         self.ref = len(self.keyframes) - 1
         self.x, self.y = x, y
         self.areas += 1
+        self.lost_view = None
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (x, y)
 
@@ -193,7 +202,7 @@ class Mosaic:
         k = self.keyframes[i]
         self.ref = i
         self.x, self.y = k.x - dx, k.y - dy
-        self.lost, self.lost_frames = False, 0
+        self.lost, self.lost_frames, self.lost_view = False, 0, None
         return True
 
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
@@ -230,13 +239,16 @@ class Mosaic:
 
     def _relax(self) -> None:
         n = len(self.keyframes)
-        rows = len(self.edges) + 1
+        rows = len(self.edges) + n
         A = np.zeros((rows, n))
         bx = np.zeros(rows)
         by = np.zeros(rows)
-        A[0, 0] = 10.0
-        bx[0], by[0] = 10 * self.keyframes[0].x, 10 * self.keyframes[0].y
-        for r, (i, j, ex, ey, wt) in enumerate(self.edges, 1):
+        # weak prior on every node's current position: keeps unconnected areas where they are, and fixes the
+        # gauge freedom of each connected component (keyframe 0 gets a strong prior)
+        for i, k in enumerate(self.keyframes):
+            wp = 10.0 if i == 0 else 0.01
+            A[i, i], bx[i], by[i] = wp, wp * k.x, wp * k.y
+        for r, (i, j, ex, ey, wt) in enumerate(self.edges, n):
             A[r, i], A[r, j], bx[r], by[r] = -wt, wt, wt * ex, wt * ey
         sx = np.linalg.lstsq(A, bx, rcond=None)[0]
         sy = np.linalg.lstsq(A, by, rcond=None)[0]
@@ -245,14 +257,12 @@ class Mosaic:
             return
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
         for k, x, y in zip(self.keyframes, sx, sy):
-            k.x, k.y = float(x), float(y)
+            if math.hypot(k.x - x, k.y - y) > 0.5:  # move only what changed: remove old splat, add new
+                self._splat(k.image, k.x, k.y, weight=-1.0)
+                k.x, k.y = float(x), float(y)
+                self._splat(k.image, k.x, k.y)
         self.x, self.y = self.x + dxc, self.y + dyc
         self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
-        self.tiles.clear()
-        for k in self.keyframes:
-            self._splat(k.image, k.x, k.y)
-        for p in self.patches:
-            self._splat(p.edf, p.x, p.y, weight=4.0)
 
     # ---------------------------------------------------------------- canvas
     def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0) -> None:

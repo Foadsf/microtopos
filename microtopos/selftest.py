@@ -290,6 +290,41 @@ def check_mosaic(seed):
              f"< {THRESH['mosaic_rms_px']}", rms < THRESH["mosaic_rms_px"])]
 
 
+def check_mosaic_jump(seed):
+    """Tracking loss: a sudden jump back over mapped ground must re-locate, never stitch at the old position.
+    Also: relaxing the pose graph must leave an unconnected (separate) area where it is."""
+    obj = OBJECTIVES["10x / 0.25"]
+    sim = SpecimenSimulator(seed, obj, world_margin=5.0)  # large enough that the jump stays on real specimen
+    fov = sim.out_w * sim.um_per_px
+    m = Mosaic()
+    strip = [(0.4 * fov * a / np.pi, 0.0) for a in np.linspace(0, np.pi, 60)]  # map a strip to the right
+    away = [(0.4 * fov, 2.0 * fov + 0.3 * fov * t) for t in np.linspace(0, 1, 20)]  # jump to unmapped ground, pan
+    back = [(0.05 * fov, 0.02 * fov)] * 25  # jump back over mapped ground
+    kf_err = []
+    for x, y in strip + away + back:
+        sim.stage_x_um, sim.stage_y_um = x, y
+        n0 = len(m.keyframes)
+        m.track(bgr_to_luma(sim.render()[0]))
+        if len(m.keyframes) > n0 and m.areas == 1:  # a tile was placed in the mapped area: check where
+            k = m.keyframes[-1]
+            kf_err.append(math.hypot(k.x - x / sim.um_per_px, k.y - y / sim.um_per_px))
+    final = math.hypot(m.x - back[-1][0] / sim.um_per_px, m.y - back[-1][1] / sim.um_per_px)
+    worst = max(kf_err) if kf_err else 0.0
+    rows = [("mosaic: tiles placed during/after tracking loss (max error, px)", seed,
+             f"{worst:.2f} ({len(kf_err)} tiles), final {final:.2f}", "< 3", worst < 3 and final < 3 and not m.lost)]
+    m2 = Mosaic()
+    img = bgr_to_luma(sim.render()[0])
+    fb = m2._bp(img)
+    m2._add_keyframe(img, fb, 1.0, 0.0, 0.0, None, (0, 0))
+    m2._add_keyframe(img, fb, 1.0, 100.0, 0.0, 0, (90.0, 0.0))  # edge disagrees by 10 px -> relax moves it
+    m2._add_keyframe(img, fb, 1.0, 2000.0, 500.0, None, (0, 0))  # separate area, no edges
+    m2._relax()
+    k3 = m2.keyframes[2]
+    rows.append(("pose graph: unconnected area stays in place", seed, f"({k3.x:.1f}, {k3.y:.1f})", "(2000, 500)",
+                 abs(k3.x - 2000) < 0.5 and abs(k3.y - 500) < 0.5))
+    return rows
+
+
 def check_sfilter(_seed):
     um, lam = 0.5, 20.0
     x = np.arange(512) * um
@@ -379,7 +414,8 @@ def check_timing(seed):
 
 CHECKS = [check_conventions, check_focus_measures, check_registration, check_sff,
           lambda s: check_sff(s, "10x / 0.25"), check_hand_sweep, check_reversal, check_textureless,
-          check_state_machine, check_objective_change, check_mosaic, check_superres]
+          check_state_machine, check_objective_change, check_mosaic, check_mosaic_jump,
+          check_superres]
 ONCE = [check_sfilter, check_exports, check_timing]
 
 

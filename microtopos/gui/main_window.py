@@ -416,7 +416,8 @@ class MainWindow(QMainWindow):
         self.cmb_source = QComboBox()
         self.cmb_source.currentIndexChanged.connect(self._on_source)
         self.cmb_res = QComboBox()
-        self.cmb_res.addItems(["1920x1080", "1280x1024", "1280x720"])
+        # 16:9 modes only: lateral calibration is scaled between modes, which assumes the same field of view
+        self.cmb_res.addItems(["1920x1080", "1280x720"])
         self.cmb_res.setToolTip("Capture size. Full resolution is used for Z-stacks; live analysis uses a 640 px preview")
         self.cmb_res.currentIndexChanged.connect(lambda: self._on_source(self.cmb_source.currentIndex()))
         self.chk_autoexp = QCheckBox("Automatic exposure")
@@ -960,6 +961,16 @@ class MainWindow(QMainWindow):
         self.chip_state.set(label, kinds[s.state])
         self.chip_fps.set(f"{s.fps_in:.1f} fps in · {s.fps_proc:.1f} processed", "neutral")
         self.chip_sat.setVisible(s.saturation > 0.01)
+        item = self.source.latest() if self.source is not None else None
+        stale = item is not None and time.perf_counter() - item[1] > 2.0 and not getattr(self.source, "done", False)
+        if stale or getattr(self.source, "error", None):
+            self.chip_src.set("NO FRAMES", "danger", getattr(self.source, "error", None) or "No new frames for 2 s")
+            self.guide.setText("<b>The camera stopped sending frames.</b> Check the USB cable and the lamp; "
+                               "MicroTopos reconnects automatically.")
+            self._stale = True
+        elif getattr(self, "_stale", False):
+            self._stale = False
+            self._refresh_checklist()
         rec = getattr(self.source, "recording", False)
         self.chip_rec.setVisible(rec)
         if rec:

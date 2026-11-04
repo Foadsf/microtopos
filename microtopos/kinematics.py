@@ -70,6 +70,7 @@ class StateMachine:
         self.quiet_db = collections.deque(maxlen=120)
         self.quiet_resp = collections.deque(maxlen=120)
         self.cut_before = None
+        self.sweep_complete = True  # set by the caller each frame during a sweep (live completeness >= 0.5)
         self.trend = collections.deque(maxlen=6)
         self.enter_count = 0
         self.exit_count = 0
@@ -189,7 +190,9 @@ class StateMachine:
                 self.state, self.exit_count, self.enter_count = State.PAN, 0, 0
             elif not moving:
                 self.exit_count = self.exit_count + 1 if abs(dlb) < 3 * sd_db + 0.01 else 0
-                if self.exit_count >= 16:
+                # an incomplete sweep (field not yet sharp-then-blurry) stays open longer: in the blank,
+                # fully defocused zone the image barely changes even while the knob is still turning
+                if self.exit_count >= (16 if self.sweep_complete else 40):
                     events.append(Event("sweep_ended", {}))
                     self.state, self.exit_count = State.DWELL, 0
                     self.trend.clear()

@@ -34,7 +34,11 @@ def phase_shift(a: np.ndarray, b: np.ndarray, window: np.ndarray | None = None) 
     to copies here and phaseCorrelate is called without one.
     """
     win = _hann(*a.shape) if window is None else window
-    (dx, dy), resp = cv2.phaseCorrelate(a.astype(np.float32) * win, b.astype(np.float32) * win)
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    # zero mean before windowing: otherwise the window's own spectrum (identical in both images) adds a
+    # spurious zero-shift peak that biases the estimate toward (0, 0)
+    (dx, dy), resp = cv2.phaseCorrelate((a - a.mean()) * win, (b - b.mean()) * win)
     return float(dx), float(dy), float(resp)
 
 

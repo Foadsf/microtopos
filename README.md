@@ -34,7 +34,7 @@ uv run microtopos-record DIR   # save the camera's raw MJPEG stream (also: "Reco
 uv run microtopos --replay DIR # analyse a recording offline, exactly as it was captured
 ```
 
-## Status (v0.6, November 2026)
+## Status (v0.7, November 2026)
 
 Early but working. Tested with a Bresser MikrOkular Full HD eyepiece camera on Linux Mint: live capture,
 automatic focus-sweep detection, height maps and stitching all run on real specimens. The algorithms are
@@ -46,8 +46,11 @@ checked visually. Windows and macOS should work (OpenCV capture fallback) but ha
 
 The left panel is a checklist; each step shows a status chip.
 
-1. **Camera**: exposure is locked (manual) and in-camera sharpening is switched off, because both corrupt focus
-   measurement. The device's actual settings are read back and shown.
+1. **Camera**: exposure is locked (manual) and in-camera sharpening, automatic white balance and gain are switched
+   off, because they corrupt focus measurement. The settings are re-applied by the capture thread after the stream
+   starts and after a reconnect, and the device's actual values are read back and shown. "Set once" picks a manual
+   exposure just below saturation. **View rotation** turns the 2D views when the camera sits rotated in the
+   eyepiece tube; "Measure from X pan" sets it from a move of the X knob alone (display only).
 2. **Objective** (keys 1–4): sets NA, depth of field, focus window and the roughness S-filter.
 3. **Dark & flat** (optional): 24-frame averages, stored per objective, capture size and exposure.
 4. **Lateral scale**: drag the blue line over a stage micrometer interval and enter its length. Until then all
@@ -55,10 +58,12 @@ The left panel is a checklist; each step shows a status chip.
 5. **Z scale**: the knob has no encoder, so heights are in *focus frames* until you calibrate (knob travel during a
    sweep) or apply the experimental DOF ruler.
 6. **Inspect**: move X-Y to grow the mosaic; turn the fine focus slowly from clearly below to clearly above the
-   surface and stop. The sweep is detected, checked for completeness and reconstructed in the background.
+   surface and stop. The sweep is detected, checked for completeness and reconstructed in the background
+   (or only kept, with "Reconstruct sweeps automatically" off; "Reconstruct last sweep" builds it on demand).
+   The view stays on the current tab; a notice says when the map is ready.
    Space starts/stops a manual capture. "Repeat sweep here" measures repeatability (σ_inst).
 
-Tabs: Live (with in-focus outlines), Mosaic (image mosaic with the stitched height maps as an adjustable colour
+Tabs: Live (with in-focus outlines and magenta stripes on clipped pixels; "Move slower" hint on fast pans), Mosaic (image mosaic with the stitched height maps as an adjustable colour
 overlay, or heights alone; live camera box), All-in-focus (with grain boundaries,
 experimental super-resolution), Height (height / raw / confidence, profile tool), 3D, Report.
 Exports: Gwyddion `.gsf`, 32-bit TIFF, binary STL, report bundle (JSON, CSV, PNG), session save/open.
@@ -68,17 +73,17 @@ Exports: Gwyddion `.gsf`, 32-bit TIFF, binary STL, report bundle (JSON, CSV, PNG
 | Stage | Method |
 |---|---|
 | Capture | MJPG via V4L2 (Linux, `v4l2-ctl` for controls) or OpenCV; latest-frame pull model, no backlog |
-| Motion state | phase correlation + sharpness trend on a 320 px copy, every feature normalised by its own quiet-time noise, entry/exit hysteresis, scene-cut detection |
-| Mosaic | phase correlation verified by normalised cross-correlation, keyframe pose graph with consistency-checked loop closures, unbounded 512 px tiles, relocalisation after tracking loss, separate areas when a view cannot be placed |
+| Motion state | phase correlation + sharpness trend on a 320 px copy, every feature normalised by its own quiet-time noise, entry/exit hysteresis, scene-cut detection that first checks for a fast (blurred) pan with a band-pass match |
+| Mosaic | band-pass phase correlation refined by ECC (motion blur splits the phase-only peak), verified by normalised cross-correlation, motion-predicted acceptance of weaker matches, keyframe pose graph with consistency-checked loop closures, unbounded 512 px tiles, relocalisation after tracking loss, separate areas when a view cannot be placed |
 | Height mosaic | every height map pinned to its keyframe (moves with pose-graph corrections), least-squares levelling of overlapping maps, feathered blending, .gsf export, saved with the session |
 | Sweep | monotonic segmentation from z labels or from tiles that come into focus twice (reversal); pause removal when z is unknown |
 | Registration | translation-only ECC between consecutive frames (parallel), chained; failed pairs inherit neighbour motion |
 | Depth | focus volume (DoG band-pass default), Gaussian peak fit (log-parabola, 5 samples) on the actual z values, confidence from peak prominence and curve noise, NaN where unreliable, confidence-weighted guided filter with outlier rejection |
 | All-in-focus | streaming Laplacian-pyramid fusion with softmax weights at full capture resolution |
-| Metrology | polynomial form removal, ISO 16610-61 Gaussian S/L filters (σ = 0.1874 λ), Sa Sq Sp Sv Sz Ssk Sku Sdr, radial PSD slope and fractal dimension (only for 2 < β < 4), 64-level GLCM, watershed grains with true max Feret; withheld when < 30 % of pixels are reliable |
+| Metrology | polynomial form removal, ISO 16610-61 Gaussian S/L filters (σ = 0.1874 λ), Sa Sq Sp Sv Sz Ssk Sku, triangulated Sdr, Sk Spk Svk Smr1 Smr2 (40 % secant), Sal Str Std, radial PSD slope and fractal dimension (only for 2 < β < 4), 64-level GLCM, h-minima watershed grains with true max Feret, Heyn mean intercept and ASTM E112 G; withheld when < 30 % of pixels are reliable |
 | Super-resolution | drizzle (true drop-overlap weights) of still frames with ECC sub-pixel shifts, Richardson–Lucy with a discrepancy stop; experimental |
 
-## Verified (`microtopos-selftest`, seeds 11/22/33: 83 checks passed, 0 failed, 30 informational)
+## Verified (`microtopos-selftest`, seeds 11/22/33: 101 checks passed, 0 failed, 30 informational)
 
 Simulator ground truth (every instrument parameter randomised per seed):
 - Depth at 40×/0.85 with known z: Pearson r 0.994–0.998, height slope 0.979–0.994, RMSE 0.06–0.08 µm
@@ -86,6 +91,11 @@ Simulator ground truth (every instrument parameter randomised per seed):
 - Hand sweep with unknown z (variable speed, pause): rank correlation 0.994–0.998.
 - Registration on informative frames: 0.10–0.16 px RMS. Mosaic loop: 0.50–0.77 px RMS.
 - Tracking loss (jump to unmapped ground and back): every tile within about 1 px of its true place.
+- Fast hand pans with motion blur (30 and 60 px/frame at 640 px): no false view changes, one mosaic area, end
+  position error 0.5–1.2 px. At 90 px/frame tracking holds but drifts 8–21 px.
+- Metrology on synthetic surfaces: Voronoi grain count within 25 %, 50 µm grid intercept within 5 µm, Sdr exact on a
+  tilted plane, Std of grooves along their direction, Str < 0.3 for grooves and > 0.5 isotropic, plateau surface
+  Svk > 3 Spk.
 - No false Z sweeps in 300 still or 200 panning frames; reversals found within 2 frames; objective change detected
   for an instant switch and a turret with dark frames.
 - Textureless patch: 99–100 % masked. ISO Gaussian filter: 0.500 transmission at the cutoff.

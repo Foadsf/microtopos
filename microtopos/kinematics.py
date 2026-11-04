@@ -112,6 +112,13 @@ class StateMachine:
 
         base_resp, _ = self._robust(self.quiet_resp, 0.01)
         cut = resp < max(0.08, 0.25 * (base_resp or 0.5))  # the view decorrelated from one frame to the next
+        if cut:
+            # a fast, motion-blurred pan also lowers the phase peak: if the band-passed frames still match well
+            # at some shift, the stage moved; only a view that matches nowhere is a cut
+            mdx, mdy, q = motion_match(before, s)
+            if q > 0.2:  # unrelated views score |q| < 0.1
+                cut, dx, dy, resp = False, mdx, mdy, max(resp, 0.081)
+                shift = math.hypot(dx, dy)
         _, sd_db = self._robust(self.quiet_db, 0.004)
         sd_db = sd_db or 0.02
         if cut or dl > 0.05:
@@ -201,6 +208,30 @@ class StateMachine:
 
 def _phase(a: np.ndarray, b: np.ndarray):
     return phase_shift(a, b)
+
+
+def _band(img: np.ndarray) -> np.ndarray:
+    f = img.astype(np.float32)
+    return cv2.GaussianBlur(f, (0, 0), 2.5) - cv2.GaussianBlur(f, (0, 0), 10.0)
+
+
+def motion_match(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
+    """Shift of b relative to a from band-passed phase correlation, and the NCC of the overlap there.
+    Returns q = 0 when the overlap is under 40 % of the frame (too fast to tell motion from a cut)."""
+    h, w = a.shape
+    ba, bb = _band(a), _band(b)
+    win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+    dx, dy, _ = phase_shift(ba, bb, win)
+    ix, iy = int(round(dx)), int(round(dy))
+    ow, oh = w - abs(ix), h - abs(iy)
+    if ow * oh < 0.4 * w * h:
+        return dx, dy, 0.0
+    # phase_shift convention: b(x) = a(x - dx)
+    pa = ba[max(0, -iy):max(0, -iy) + oh, max(0, -ix):max(0, -ix) + ow]
+    pb = bb[max(0, iy):max(0, iy) + oh, max(0, ix):max(0, ix) + ow]
+    pa, pb = pa - pa.mean(), pb - pb.mean()
+    q = float((pa * pb).sum() / (math.sqrt(float((pa * pa).sum()) * float((pb * pb).sum())) + 1e-9))
+    return dx, dy, q
 
 
 def guess_objective(current_mag: float, ratio: float | None, magnifications: list[float]) -> int | None:

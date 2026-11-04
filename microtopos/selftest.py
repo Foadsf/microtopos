@@ -276,6 +276,34 @@ def check_objective_change(seed):
     return rows + [("objective guess from texture scale (heuristic)", seed, str(guess), "info", None)]
 
 
+def check_fast_pan(seed, speeds=(30, 60)):
+    """Hand-speed pans with motion blur (30 ms exposure / 80 ms frame period): no false view changes, no separate
+    areas, mosaic position error small. Speeds in preview pixels per frame (640 px wide)."""
+    obj = OBJECTIVES["10x / 0.25"]
+    rows = []
+    for v in speeds:
+        sim = SpecimenSimulator(seed, obj, world_margin=5.0)
+        _, hz = sim.truth_patch()
+        sim.focus_z_um = float(np.median(hz))
+        sm, m = StateMachine(), Mosaic()
+        cuts = 0
+        n = int(2.5 * sim.out_w / v)
+        xs = list(np.zeros(15)) + list(np.arange(1, n + 1) * v) + [n * v] * 20
+        for i, xp in enumerate(xs):
+            vel = (xs[i] - xs[i - 1]) if i else 0.0
+            sim.stage_x_um = xp * sim.um_per_px
+            luma = bgr_to_luma(sim.render(motion_px=(-0.4 * vel, 0.0))[0])
+            st, _, ev = sm.update(luma)
+            cuts += sum(e.kind == "objective_change" for e in ev)
+            if st in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE):
+                m.track(luma)
+        err = math.hypot(m.x - xs[-1], m.y)
+        ok = cuts == 0 and m.areas == 1 and err < 3 and not m.lost
+        rows.append((f"fast pan {v} px/frame + motion blur: view changes / areas / end error", seed,
+                     f"{cuts} / {m.areas} / {err:.1f} px", "0 / 1 / < 3 px", ok))
+    return rows
+
+
 def check_mosaic(seed):
     obj = OBJECTIVES["10x / 0.25"]
     sim = SpecimenSimulator(seed, obj)
@@ -355,6 +383,64 @@ def check_height_mosaic(seed):
     follows = abs(p.x - (m.keyframes[1].x + p.rel[0])) < 1e-6 and abs(m.keyframes[1].x - shift_px) > 1.0
     rows.append(("height mosaic: patch follows its keyframe after relaxation", seed,
                  f"keyframe moved {m.keyframes[1].x - shift_px:+.2f} px", "patch moved with it", follows))
+    return rows
+
+
+def check_metrology_extra(seed):
+    """Ground truth for grains, ASTM grain size, Sdr, lay direction, texture aspect ratio and Svk/Spk."""
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(seed)
+    rows = []
+    # grains: Voronoi microstructure with a known number of cells not touching the border
+    h, w, n = 360, 640, 60
+    pts = rng.uniform(0, 1, (n, 2)) * [h, w]
+    gy, gx = np.mgrid[0:h, 0:w]
+    _, gid = cKDTree(pts).query(np.column_stack([gy.ravel(), gx.ravel()]))
+    gid = gid.reshape(h, w)
+    edge = np.zeros((h, w), bool)
+    edge[:, 1:] |= gid[:, 1:] != gid[:, :-1]
+    edge[1:, :] |= gid[1:, :] != gid[:-1, :]
+    img = rng.uniform(90, 170, n)[gid] - 60 * cv2.GaussianBlur(edge.astype(np.float32), (0, 0), 1.0)
+    img = np.clip(img + rng.normal(0, 3, (h, w)), 0, 255).astype(np.float32)
+    border = set(gid[0]) | set(gid[-1]) | set(gid[:, 0]) | set(gid[:, -1])
+    truth = n - len(border)
+    g = metrology.grains(img, 1.0)
+    rows.append(("grains: interior grains found vs truth (Voronoi)", seed, f"{g['grain_count']} vs {truth}",
+                 "within 25%", abs(g["grain_count"] - truth) <= 0.25 * truth))
+    # ASTM E112: squares of side L um have mean lineal intercept L
+    L = 50.0
+    sq = ((np.arange(800)[:, None] // 50) + (np.arange(800)[None, :] // 50)) % 2 * 100.0 + 60.0
+    gs = metrology.grains(sq.astype(np.float32), 1.0)
+    rows.append(("ASTM E112: mean intercept on a 50 um square grid", seed,
+                 f"{gs.get('mean_intercept_um', float('nan')):.1f} um, G={gs.get('ASTM_E112_G', float('nan')):.2f}",
+                 "50 +/- 5 um", abs(gs.get("mean_intercept_um", 0) - L) <= 5))
+    # Sdr: a plane tilted by slope a has Sdr = (sqrt(1 + a^2) - 1) x 100 exactly
+    a_sl = 0.3
+    plane = (np.arange(200)[None, :] * a_sl * 0.5 + np.zeros((100, 1))).astype(np.float32)
+    sdr = metrology.developed_area_ratio(plane, 0.5)
+    exact = (math.sqrt(1 + a_sl**2) - 1) * 100
+    rows.append(("Sdr on a tilted plane (triangulated)", seed, f"{sdr:.4f} vs {exact:.4f} %", "rel. error < 1e-3",
+                 abs(sdr - exact) / exact < 1e-3))
+    # lay direction and aspect ratio: grooves running along x vs an isotropic surface
+    yy = np.arange(256)[:, None] + np.zeros((1, 256))
+    groove = (np.sin(2 * np.pi * yy / 24.0) + 0.05 * rng.normal(0, 1, (256, 256))).astype(np.float32)
+    sp = metrology.spatial_parameters(groove, 1.0)
+    iso = cv2.GaussianBlur(rng.normal(0, 1, (256, 256)).astype(np.float32), (0, 0), 3.0)
+    si = metrology.spatial_parameters(iso, 1.0)
+    rows.append(("Std: lay of grooves along x (deg)", seed, f"{sp.get('Std_deg')}", "0 or 180 +/- 4",
+                 min(sp.get("Std_deg", 99), 180 - sp.get("Std_deg", 99)) <= 4))
+    # ISO 25178: Str is undefined when the autocorrelation never decays along the lay (strongly anisotropic)
+    s_g = sp.get("Str")
+    rows.append(("Str: grooves (anisotropic) vs isotropic surface", seed,
+                 f"{'undefined' if s_g is None else f'{s_g:.2f}'} vs {si.get('Str', 0):.2f}",
+                 "grooves undefined or < 0.3; isotropic > 0.5", (s_g is None or s_g < 0.3) and si.get("Str", 0) > 0.5))
+    # functional parameters: a plateau surface with deep valleys has Svk >> Spk
+    v = np.concatenate([rng.normal(0, 0.2, 90_000), rng.normal(-3, 0.5, 10_000)]).astype(np.float32).reshape(250, 400)
+    fp = metrology.functional_parameters(v)
+    rows.append(("Svk/Spk on a plateau surface with deep valleys", seed,
+                 f"Svk {fp['Svk']:.2f}, Spk {fp['Spk']:.2f}, Smr2 {fp['Smr2_pct']:.0f}%", "Svk > 3 Spk, Smr2 80..95%",
+                 fp["Svk"] > 3 * fp["Spk"] and 80 <= fp["Smr2_pct"] <= 95))
     return rows
 
 
@@ -498,9 +584,9 @@ def check_real_recording(folder: str) -> list:
 
 CHECKS = [check_conventions, check_focus_measures, check_registration, check_sff,
           lambda s: check_sff(s, "10x / 0.25"), check_hand_sweep, check_reversal, check_textureless,
-          check_state_machine, check_objective_change, check_mosaic, check_mosaic_jump, check_height_mosaic,
+          check_state_machine, check_objective_change, check_fast_pan, check_mosaic, check_mosaic_jump, check_height_mosaic,
           check_superres]
-ONCE = [check_sfilter, check_exports, check_timing]
+ONCE = [check_metrology_extra, check_sfilter, check_exports, check_timing]
 
 
 def run(seeds=(11, 22, 33), out=print, real: str | None = None) -> bool:

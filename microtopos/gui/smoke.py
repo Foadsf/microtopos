@@ -73,6 +73,30 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     got2 = wait_result(2)
     log.append(f"{'ok' if got2 else 'FAIL'}    reversal sweep reconstructed")
     pump(app, 2)
+
+    def rotate():
+        w.sp_rot.setValue(30.0)
+        app.processEvents()
+        assert abs(w.p_mosaic.group.rotation() - 30.0) < 1e-6 and abs(w.p_live.group.rotation() - 30.0) < 1e-6
+        # the cursor readout must still report unrotated image coordinates
+        pt = w.p_live.group.mapToScene(w.p_live.img.mapToParent(w.p_live.img.boundingRect().center()))
+        back = w.p_live.group.mapFromScene(pt)
+        c = w.p_live.img.mapToParent(w.p_live.img.boundingRect().center())
+        assert abs(back.x() - c.x()) < 1e-6 and abs(back.y() - c.y()) < 1e-6
+        w.sp_rot.setValue(0.0)
+
+    step("rotate views", rotate)
+    n_before = len(results)
+    step("sweep kept, not reconstructed", lambda: (w.chk_autorec.setChecked(False), w._demo("sweep")))
+    cap_before, t0 = getattr(w, "last_cap", None), time.time()
+    while getattr(w, "last_cap", None) is cap_before and time.time() - t0 < 60:
+        pump(app, 0.5)
+    pump(app, 2)
+    log.append(f"{'ok' if len(results) == n_before else 'FAIL'}    auto-reconstruct off: no automatic map")
+    step("reconstruct last sweep", w._reconstruct_last)
+    got3 = wait_result(n_before + 1)
+    log.append(f"{'ok' if got3 else 'FAIL'}    manual reconstruction of the last sweep")
+    w.chk_autorec.setChecked(True)
     step("super-resolution", w._run_sr)
     pump(app, 8)
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
@@ -92,7 +116,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     w.close()
     pump(app, 0.5)
     sys.excepthook = old_hook
-    ok = got1 and got2 and not errors and not contaminated
+    ok = got1 and got2 and not errors and not contaminated and not any(x.startswith("FAIL") for x in log)
     for line in log:
         out("  " + line)
     for e in errors[:5]:

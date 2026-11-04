@@ -104,7 +104,9 @@ class SpecimenSimulator:
             cy, cx = wh // 2, ww // 2
             hh, hw = self.out_h // 3, self.out_w // 3  # in world px this is a 1/3 x 1/3 FOV region
             alb[cy - hh:cy + hh, cx - hw:cx + hw] = 0.7
-        slope = cv2.Sobel(self.world_height, cv2.CV_32F, 1, 1, ksize=3) / (8 * px)
+        # directional relief shading: dh/dx + dh/dy (a single Sobel with dx=dy=1 would be the mixed derivative)
+        slope = (cv2.Sobel(self.world_height, cv2.CV_32F, 1, 0, ksize=3)
+                 + cv2.Sobel(self.world_height, cv2.CV_32F, 0, 1, ksize=3)) / (8 * px)
         alb = alb * np.clip(1.0 + 0.1 * slope, 0.6, 1.4)
         self.world_albedo = np.clip(alb * 200.0, 10.0, 240.0).astype(np.float32)
         # anti-alias prefilter for the 2:1 world->camera resampling
@@ -152,7 +154,8 @@ class SpecimenSimulator:
 
     # ------------------------------------------------------------------ rendering
     def render(self, tremor: bool = True, noise: bool = True, breathing: bool = True,
-               blur: bool = True) -> tuple[np.ndarray, FrameTruth]:
+               blur: bool = True, motion_px: tuple[float, float] = (0.0, 0.0)) -> tuple[np.ndarray, FrameTruth]:
+        """motion_px: stage motion during the exposure, in output pixels (adds linear motion blur)."""
         r = self.rng
         shift = (float(r.normal(0, self.tremor_px)), float(r.normal(0, self.tremor_px))) if tremor else (0.0, 0.0)
         scale = 1.0 + self.breathing_per_um * self.focus_z_um if breathing else 1.0
@@ -164,6 +167,15 @@ class SpecimenSimulator:
             img = _variable_blur(alb, sig)
         else:
             img = alb
+        mlen = math.hypot(*motion_px)
+        if mlen >= 1.0:  # linear motion blur along the direction of stage travel
+            k = int(math.ceil(mlen)) | 1
+            ker = np.zeros((k, k), np.float32)
+            c = k // 2
+            ux, uy = motion_px[0] / mlen, motion_px[1] / mlen
+            for t in np.linspace(-mlen / 2, mlen / 2, 4 * k):
+                ker[int(round(c + t * uy)), int(round(c + t * ux))] = 1.0
+            img = cv2.filter2D(img, -1, ker / ker.sum(), borderType=cv2.BORDER_REFLECT)
         flick = 1.0 + (float(r.normal(0, self.flicker)) if noise else 0.0)
         img = img * self.vignette * self.gain * flick + self.dark_level
         if noise:

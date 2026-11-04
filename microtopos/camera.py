@@ -7,6 +7,7 @@ causes a backlog, it just skips frames. `latest()` returns (frame_bgr, timestamp
 from __future__ import annotations
 
 import glob
+import math
 import os
 import re
 import shutil
@@ -153,8 +154,28 @@ class CameraSource(FrameSource):
         }
         return cap
 
+    def exposure_range(self) -> tuple[int, int] | None:
+        """(min, max) of exposure_time_absolute in device units, when the driver reports it."""
+        if self.controls.available:
+            c = self.controls.list().get("exposure_time_absolute")
+            if c and "min" in c and "max" in c:
+                return int(c["min"]), int(c["max"])
+        return None
+
     def set_manual_exposure(self, exposure: int | None, sharpness_off: bool = True) -> dict:
-        """exposure in the device's units (UVC: 100 us). None = automatic exposure."""
+        """exposure in the device's units (UVC: 100 us). None = automatic exposure.
+
+        Remembered and re-applied by the capture thread after the first frame and after every reconnect,
+        because many UVC drivers reset or ignore controls set before streaming starts."""
+        self._want = (exposure, sharpness_off)
+        self._apply_pending = True
+        return self._apply_controls()
+
+    def _apply_controls(self, cap=None) -> dict:
+        want = getattr(self, "_want", None)
+        if want is None:
+            return {}
+        exposure, sharpness_off = want
         if self.controls.available:
             vals = {}
             ctrls = self.controls.list()
@@ -167,7 +188,27 @@ class CameraSource(FrameSource):
                 vals["sharpness"] = ctrls["sharpness"].get("min", 0)
             if "backlight_compensation" in ctrls:
                 vals["backlight_compensation"] = 0
+            # anything else that changes brightness or colour between frames is locked during measurement
+            if exposure is not None:
+                for k in ("exposure_dynamic_framerate", "exposure_auto_priority", "white_balance_automatic",
+                          "white_balance_temperature_auto", "gain_automatic", "autogain"):
+                    if k in ctrls:
+                        vals[k] = 0
             return self.controls.set(**vals)
+        if cap is not None:  # no v4l2-ctl (Windows, macOS): best-effort OpenCV properties, from the capture thread
+            got = {}
+            if exposure is None:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if sys.platform.startswith("linux") else 1)
+            else:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if sys.platform.startswith("linux") else 0)
+                # DirectShow / MSMF take log2 seconds; 100 us units -> seconds
+                v = math.log2(max(exposure, 1) * 1e-4) if sys.platform == "win32" else float(exposure)
+                cap.set(cv2.CAP_PROP_EXPOSURE, v)
+                cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+            if sharpness_off:
+                cap.set(cv2.CAP_PROP_SHARPNESS, 0)
+            got["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE)
+            return got
         return {}
 
     def start_recording(self, folder) -> None:
@@ -197,7 +238,7 @@ class CameraSource(FrameSource):
             return
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # receive MJPEG bytes; decode here (and record them if asked)
         self.recording = False
-        t0, n = time.perf_counter(), 0
+        t0, n, n_total = time.perf_counter(), 0, 0
         last_ok = time.perf_counter()
         while self._running:
             ok, raw = cap.read()
@@ -209,6 +250,7 @@ class CameraSource(FrameSource):
                     try:
                         cap = self.open()
                         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                        n_total = 0  # re-apply exposure and sharpness on the reopened device
                     except RuntimeError:
                         pass
                     last_ok = time.perf_counter()
@@ -216,6 +258,13 @@ class CameraSource(FrameSource):
                 continue
             last_ok = time.perf_counter()
             self.error = None
+            if getattr(self, "_apply_pending", False) or n_total == 0:
+                self._apply_pending = False
+                try:
+                    self.applied = self._apply_controls(cap)
+                except Exception as e:  # a missing control must not stop the stream
+                    self.applied = {"error": str(e)}
+            n_total += 1
             if raw.ndim == 3:  # backend already decoded
                 frame = raw
             else:

@@ -75,6 +75,7 @@ class LiveEngine:
         self.on_objective_hint = None  # callback(ratio)
         self._lock = threading.Lock()
         self._snap = Snapshot()
+        self.verbose = False  # also print the event log to stdout (--verbose)
         self._running = False
         self._thread = None
         self._last_seq = -1
@@ -174,8 +175,9 @@ class LiveEngine:
 
     def log(self, text: str, seq: int = 0):
         line = f"{time.perf_counter() - self._t0:7.1f}s #{seq:<5d} {text}"
-        self.events.append(line)
-        print(line, flush=True)
+        self.events.append(line)  # shown in Diagnostics
+        if self.verbose:
+            print(line, flush=True)
 
     def mosaic_image(self):
         """Latest mosaic rendering, prepared by the engine thread: ((image, origin), height_mosaic, n_kf, n_patch)."""

@@ -55,6 +55,8 @@ class Mosaic:
     recent_b: collections.deque = field(default_factory=lambda: collections.deque(maxlen=12))
     edges: list = field(default_factory=list)  # (i, j, dx, dy, weight): position of j minus position of i
     lost_frames: int = 0
+    velocity: tuple | None = None  # last per-frame camera motion (constant-velocity prediction)
+    last_good: tuple | None = None  # (frame, band-pass, position) of the latest frame with a known position
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
 
     def reset(self) -> None:
@@ -69,15 +71,18 @@ class Mosaic:
         self.areas = 1
         self.lost_frames = 0
         self.lost_view = None
+        self.velocity = None
+        self.last_good = None
         self.prev_bp = None
         self.recent_b.clear()
 
     # ---------------------------------------------------------------- matching
     @staticmethod
     def _bp(img: np.ndarray) -> np.ndarray:
-        """Half-resolution band-pass copy: brightness- and vignetting-insensitive, used to verify matches."""
-        s = cv2.resize(img, (img.shape[1] // 2, img.shape[0] // 2), interpolation=cv2.INTER_AREA)
-        return cv2.GaussianBlur(s, (0, 0), 1.0) - cv2.GaussianBlur(s, (0, 0), 4.0)
+        """Half-resolution band-pass copy (structures ~3-24 px): removes the mean, illumination gradients and the
+        static vignette (which would bias phase correlation toward zero shift) and survives moderate motion blur."""
+        s = cv2.resize(img.astype(np.float32), (img.shape[1] // 2, img.shape[0] // 2), interpolation=cv2.INTER_AREA)
+        return cv2.GaussianBlur(s, (0, 0), 1.5) - cv2.GaussianBlur(s, (0, 0), 6.0)
 
     @staticmethod
     def _ncc(a_bp: np.ndarray, b_bp: np.ndarray, dx: float, dy: float) -> float:
@@ -85,10 +90,16 @@ class Mosaic:
 
         This is the geometric check that rejects false phase-correlation peaks (e.g. from specular specks).
         """
-        ix, iy = int(round(dx / 2)), int(round(dy / 2))
+        a_bp = a_bp.astype(np.float32, copy=False)
+        b_bp = b_bp.astype(np.float32, copy=False)
         h, w = a_bp.shape
+        hx, hy = dx / 2, dy / 2
+        ix, iy = int(math.floor(hx)), int(math.floor(hy))
         if abs(ix) > 0.75 * w or abs(iy) > 0.75 * h:
             return -1.0
+        fx, fy = hx - ix, hy - iy
+        if fx > 1e-3 or fy > 1e-3:  # sub-pixel part: shift b so that the remaining offset is integer
+            b_bp = cv2.warpAffine(b_bp, np.float32([[1, 0, -fx], [0, 1, -fy]]), (w, h), borderMode=cv2.BORDER_REFLECT)
         # b(x) = a(x - d): compare a(x) with b(x + d)
         a = a_bp[max(0, -iy):h + min(0, -iy), max(0, -ix):w + min(0, -ix)]
         b = b_bp[max(0, iy):h + min(0, iy), max(0, ix):w + min(0, ix)]
@@ -99,11 +110,37 @@ class Mosaic:
         return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
 
     def _match(self, a_img, a_bp, f, f_bp, win):
-        dx, dy, r = phase_shift(a_img, f, win)
-        return dx, dy, self._ncc(a_bp, f_bp, dx, dy)
+        """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check."""
+        a32 = a_bp.astype(np.float32, copy=False)
+        f32 = f_bp.astype(np.float32, copy=False)
+        hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
+        dx, dy, r = phase_shift(a32, f32, hwin)
+        # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
+        # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
+        try:
+            crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+            _, W = cv2.findTransformECC(a32, f32, np.float32([[1, 0, dx], [0, 1, dy]]), cv2.MOTION_TRANSLATION,
+                                        crit, None, 1)
+            if np.isfinite(W).all() and math.hypot(W[0, 2] - dx, W[1, 2] - dy) < 8:
+                dx, dy = float(W[0, 2]), float(W[1, 2])
+        except cv2.error:
+            pass
+        dx, dy = 2 * dx, 2 * dy
+        return dx, dy, self._ncc(a32, f32, dx, dy)
+
+    def _accept(self, dx, dy, q, base_xy, h, w) -> bool:
+        """Strong matches are accepted; weaker ones (motion blur) only if they agree with the constant-velocity
+        prediction of where the camera is now (a standard tracking gate)."""
+        if q >= self.TRACK_NCC:
+            return True
+        if q < self.WEAK_NCC or self.velocity is None:
+            return False
+        px, py = self.prev_xy[0] + self.velocity[0], self.prev_xy[1] + self.velocity[1]
+        return math.hypot(base_xy[0] - dx - px, base_xy[1] - dy - py) < 0.025 * min(h, w)
 
     # ---------------------------------------------------------------- tracking
     TRACK_NCC = 0.5
+    WEAK_NCC = 0.25  # accepted only when consistent with the predicted motion
     LOOP_NCC = 0.65
 
     def track(self, frame: np.ndarray) -> tuple[bool, float]:
@@ -124,25 +161,41 @@ class Mosaic:
         win = cv2.createHanningWindow((w, h), cv2.CV_32F)
         kf = self.keyframes[self.ref]
         dx, dy, q = self._match(kf.image, kf.bp, f, fb, win)
-        if q >= self.TRACK_NCC:
+        old_xy = (self.x, self.y)
+        if self._accept(dx, dy, q, (kf.x, kf.y), h, w):
             self.x, self.y = kf.x - dx, kf.y - dy  # anchored to the reference keyframe
             rel = (-dx, -dy)
-        elif self.prev_frame is not None and (pm := self._match(self.prev_frame, self.prev_bp, f, fb, win))[2] \
-                >= self.TRACK_NCC:
+        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win)),
+                                                          self.prev_xy, h, w):
             self.x, self.y = self.prev_xy[0] - pm[0], self.prev_xy[1] - pm[1]  # frame-to-frame dead reckoning
             rel, q = None, pm[2]
         else:
             self.lost = True
             self.lost_frames += 1
+            # the last frame with a KNOWN position (motion-blurred like the current one) is the best reference
+            if self.last_good is not None:
+                gf, gb, gxy = self.last_good
+                gdx, gdy, gq = self._match(gf, gb, f, fb, win)
+                if gq >= self.WEAK_NCC and math.hypot(gdx, gdy) < 0.5 * min(h, w):
+                    self.x, self.y = gxy[0] - gdx, gxy[1] - gdy
+                    self.lost, self.lost_frames, self.lost_view = False, 0, None
+                    self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
+                    self.velocity = None
+                    self.last_good = (f, fb, (self.x, self.y))
+                    return False, gq
             if self.lost_frames % 3 == 0 and self._relocalize(f, fb, win):
                 self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
+                self.last_good = (f, fb, (self.x, self.y))
             elif self.lost_frames >= self.NEW_AREA_AFTER and self._steady_view(f, fb, win, b):
                 self._new_area(f, fb, b)
                 return True, q
             # the position of a lost frame is unknown: it must not seed dead reckoning, only the steady-view test
             self.prev_frame, self.prev_bp = None, None
+            self.velocity = None
             self.lost_view = (f, fb)
             return False, q
+        self.velocity = (self.x - old_xy[0], self.y - old_xy[1])
+        self.last_good = (f, fb, (self.x, self.y))
         speed = math.hypot(self.x - self.prev_xy[0], self.y - self.prev_xy[1]) if self.prev_frame is not None else 0.0
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
@@ -208,7 +261,8 @@ class Mosaic:
         return True
 
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
-        self.keyframes.append(Keyframe(x, y, f.copy(), b, fb))
+        # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
+        self.keyframes.append(Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16)))
         if parent is not None:
             self.edges.append((parent, len(self.keyframes) - 1, rel[0], rel[1], weight))
         self._splat(f, x, y)

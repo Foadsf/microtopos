@@ -86,7 +86,7 @@ def _sr_job(frames, psf, progress=None, cancelled=None):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, simulator_only: bool = False, replay: str | None = None):
+    def __init__(self, simulator_only: bool = False, replay: str | None = None, verbose: bool = False):
         super().__init__()
         opencv_threads()
         self.settings = QSettings("MicroTopos", "MicroTopos")
@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
             if self.settings.value("objective", "10x / 0.25") in OBJECTIVES else OBJECTIVES["10x / 0.25"]
         self.engine = LiveEngine(self.store, self.obj)
         self.bridge = Bridge()
+        self.engine.verbose = verbose
         self.engine.on_sweep = self.bridge.sweep.emit
         self.engine.on_objective_hint = self.bridge.objective_hint.emit
         self.bridge.sweep.connect(self._on_sweep)
@@ -122,8 +123,9 @@ class MainWindow(QMainWindow):
         self._build()
         self._shortcuts()
         self.engine.start()
-        self.cameras = [] if simulator_only else list_cameras()
+        self.cameras = [] if replay else list_cameras()  # --simulator still lists cameras, it only starts on the sim
         self._fill_sources()
+        self._set_rotation(self.sp_rot.value())
         self._apply_theme()
         g = self.settings.value("geometry")
         if g is not None:
@@ -184,18 +186,18 @@ class MainWindow(QMainWindow):
         self.p_live = ImagePanel(t, "No camera frames yet.\nChoose a source in step 1 (Camera).")
         self.lat_line = pg.LineSegmentROI([[20, 20], [120, 20]], pen=pg.mkPen(t["overlay_line"], width=2))
         self.lat_line.hide()
-        self.p_live.plot.addItem(self.lat_line)
+        self.p_live.add_item(self.lat_line)
         self.p_mosaic = ImagePanel(t, "The mosaic grows as you move the X-Y stage.")
         from PySide6.QtWidgets import QGraphicsRectItem
         self.cam_box = QGraphicsRectItem()
         self.cam_box.setZValue(20)
-        self.p_mosaic.plot.addItem(self.cam_box)
+        self.p_mosaic.add_item(self.cam_box)
         self.mosaic_origin = (0, 0)
         self.p_edf = ImagePanel(t, "No Z-stack yet.\nTurn the fine focus slowly through the sample, or press Space.")
         self.p_height = ImagePanel(t, "No height map yet.\nTurn the fine focus slowly through the sample.", "height")
         self.prof_roi = pg.LineSegmentROI([[0, 0], [1, 1]], pen=pg.mkPen(t["overlay_profile"], width=2))
         self.prof_roi.hide()
-        self.p_height.plot.addItem(self.prof_roi)
+        self.p_height.add_item(self.prof_roi)
         self.prof_roi.sigRegionChanged.connect(self._update_profile)
         self.prof_plot = pg.PlotWidget()
         self.prof_plot.setMaximumHeight(180)
@@ -225,6 +227,8 @@ class MainWindow(QMainWindow):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
+        # tool bars (layouts) above the image, everything else in the given order
+        ws = [x for x in ws if not isinstance(x, QWidget)] + [x for x in ws if isinstance(x, QWidget)]
         for x in ws:
             if isinstance(x, QWidget):
                 lay.addWidget(x, 1 if isinstance(x, ImagePanel) else 0)
@@ -248,6 +252,10 @@ class MainWindow(QMainWindow):
         self.chk_focus.setToolTip("During a focus sweep, outlines the areas that are currently at (or near) their sharpest")
         self.chk_focus.setChecked(False)
         h.addWidget(self.chk_focus)
+        self.chk_zebra = QCheckBox("Show clipped pixels")
+        self.chk_zebra.setToolTip("Magenta stripes where the image is saturated (≥ 250): lower the exposure there")
+        self.chk_zebra.setChecked(True)
+        h.addWidget(self.chk_zebra)
         self.btn_rec = QPushButton("● Record raw stream")
         self.btn_rec.setCheckable(True)
         self.btn_rec.setFocusPolicy(Qt.TabFocus)
@@ -371,7 +379,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.sl_exag, 1)
         bar.addWidget(QLabel("Colour map"))
         self.cmb_cmap = QComboBox()
-        self.cmb_cmap.addItems(["viridis", "cividis", "inferno", "plasma"])
+        self.cmb_cmap.addItems(["viridis", "cividis", "inferno", "plasma", "magma", "turbo"])
         self.cmb_cmap.currentIndexChanged.connect(self._update_3d)
         bar.addWidget(self.cmb_cmap)
         bar.addWidget(self.lbl_3d)
@@ -456,8 +464,14 @@ class MainWindow(QMainWindow):
         self.lbl_exp = QLabel()
         self.lbl_exp.setObjectName("mono")
         self.chk_autoexp.toggled.connect(self._apply_exposure)
-        self.sl_exp.sliderReleased.connect(self._apply_exposure)
-        self.sl_exp.valueChanged.connect(lambda v: self.lbl_exp.setText(f"{v / 10:.1f} ms"))
+        self._exp_timer = QTimer(self)
+        self._exp_timer.setSingleShot(True)
+        self._exp_timer.setInterval(250)  # debounce: keyboard, wheel and drags all apply, at most 4 times a second
+        self._exp_timer.timeout.connect(self._apply_exposure)
+        self.sl_exp.valueChanged.connect(lambda v: (self.lbl_exp.setText(f"{v / 10:.1f} ms"), self._exp_timer.start()))
+        self.btn_autoexp_once = self._btn("Set once", self._auto_exposure_once,
+                                          "Adjust the manual exposure once so the brightest areas are just below "
+                                          "saturation, then keep it locked")
         self.lbl_exp.setText(f"{self.sl_exp.value() / 10:.1f} ms")
         self.chk_linear = QCheckBox("Linearise gamma (radiometric luminance)")
         self.chk_linear.setToolTip("Off: Rec.601 luma of the camera's gamma-encoded output. On: inverts gamma 2.2 first.")
@@ -468,6 +482,24 @@ class MainWindow(QMainWindow):
         exp = QHBoxLayout()
         exp.addWidget(self.sl_exp, 1)
         exp.addWidget(self.lbl_exp)
+        exp.addWidget(self.btn_autoexp_once)
+        self.sp_rot = QDoubleSpinBox()
+        self.sp_rot.setRange(-180.0, 180.0)
+        self.sp_rot.setSingleStep(0.5)
+        self.sp_rot.setDecimals(1)
+        self.sp_rot.setSuffix(" °")
+        self.sp_rot.setToolTip("Rotate the Live, Mosaic, All-in-focus and Height views, e.g. when the camera sits "
+                               "rotated in the eyepiece tube. Display only: measurements are unaffected.")
+        self.sp_rot.setValue(float(self.settings.value("view_rotation", 0.0)))
+        self.sp_rot.valueChanged.connect(self._set_rotation)
+        self.btn_rot_measure = self._btn("Measure from X pan", self._measure_rotation,
+                                         "Click, move only the stage's X knob for a few field widths, click again: "
+                                         "the views are rotated so stage X is horizontal")
+        self.btn_rot_measure.setCheckable(True)
+        rot = QHBoxLayout()
+        rot.addWidget(QLabel("View rotation"))
+        rot.addWidget(self.sp_rot, 1)
+        rot.addWidget(self.btn_rot_measure)
         demo = QGridLayout()
         demo.addWidget(self._btn("Pan around", lambda: self._demo("pan"), "Simulator: move the stage in a loop"), 0, 0)
         demo.addWidget(self._btn("Focus sweep", lambda: self._demo("sweep"), "Simulator: hand-like focus sweep"), 0, 1)
@@ -475,7 +507,7 @@ class MainWindow(QMainWindow):
                                  "Simulator: sweep that turns back through focus"), 1, 0, 1, 2)
         self.demo_box = section("Demo (simulator only)", demo,
                                 hint="Synthetic specimen. Its heights are simulation truth and are labelled SIMULATED.")
-        return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, self.chk_linear,
+        return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
                        self.lbl_readback, self.demo_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
                             "because both would corrupt focus measurements.")
@@ -600,6 +632,16 @@ class MainWindow(QMainWindow):
         pr = QHBoxLayout()
         pr.addWidget(self.prog, 1)
         pr.addWidget(self.btn_cancel)
+        self.chk_autorec = QCheckBox("Reconstruct sweeps automatically")
+        self.chk_autorec.setToolTip("Off: focus sweeps are only kept; press 'Reconstruct last sweep' to build a map")
+        self.chk_autorec.setChecked(self.settings.value("auto_reconstruct", True, type=bool))
+        self.chk_autorec.toggled.connect(lambda c: self.settings.setValue("auto_reconstruct", c))
+        self.btn_lastsweep = self._btn("Reconstruct last sweep", self._reconstruct_last,
+                                       "Build a height map from the last captured focus sweep, even an incomplete one")
+        self.btn_lastsweep.setEnabled(False)
+        pr2 = QHBoxLayout()
+        pr2.addWidget(self.chk_autorec, 1)
+        pr2.addWidget(self.btn_lastsweep)
         self.lbl_job = QLabel("Idle.")
         self.lbl_job.setObjectName("muted")
         self.lbl_job.setWordWrap(True)
@@ -621,7 +663,7 @@ class MainWindow(QMainWindow):
                                                  self.btn_diag.setText("Diagnostics ▴" if c else "Diagnostics ▾")))
         self.diag.hide()
         for x in (section("Sharpness", self.spark), section("Focus sweep coverage", self.coverage), self.lbl_motion,
-                  section("Reconstruction", pr, self.lbl_job), section("Export", ex), self.btn_diag, self.diag):
+                  section("Reconstruction", pr, pr2, self.lbl_job), section("Export", ex), self.btn_diag, self.diag):
             lay.addWidget(x) if isinstance(x, QWidget) else lay.addLayout(x)
         lay.addStretch(1)
         sc = QScrollArea()
@@ -701,7 +743,7 @@ class MainWindow(QMainWindow):
         # prefer a microscope camera over a laptop webcam
         pick = 1 if self.replay else 0
         for i, c in enumerate(self.cameras, 1):
-            if "okular" in c.name.lower() or "microscope" in c.name.lower():
+            if not self.simulator_only and ("okular" in c.name.lower() or "microscope" in c.name.lower()):
                 pick = i
         self.cmb_source.setCurrentIndex(pick)
         self.cmb_source.blockSignals(False)
@@ -724,11 +766,80 @@ class MainWindow(QMainWindow):
             self.source = CameraSource(info, w, h, 25)
         self.source.start()
         self.engine.set_source(self.source)
+        if isinstance(self.source, CameraSource):
+            rng = self.source.exposure_range()
+            if rng:  # use the device's own limits (the defaults are the Bresser's)
+                v = self.sl_exp.value()
+                self.sl_exp.blockSignals(True)
+                self.sl_exp.setRange(*rng)
+                self.sl_exp.setValue(int(np.clip(v, *rng)))
+                self.sl_exp.blockSignals(False)
+                self.lbl_exp.setText(f"{self.sl_exp.value() / 10:.1f} ms")
+        self.btn_autoexp_once.setEnabled(isinstance(self.source, CameraSource))
         self.demo_box.setVisible(self.sim_source is not None)
         self.cmb_res.setVisible(self.sim_source is None)
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()
+
+    def _rot_panels(self):
+        return (self.p_live, self.p_mosaic, self.p_edf, self.p_height, self.coverage)
+
+    def _set_rotation(self, deg: float):
+        self.settings.setValue("view_rotation", float(deg))
+        for p in self._rot_panels():
+            p.set_rotation(deg)
+
+    def _measure_rotation(self, on: bool):
+        s = self.engine.snapshot()
+        if on:
+            self._rot_start = s.mosaic_xy
+            self.btn_rot_measure.setText("Finish (after an X-only move)")
+            self.notify("Move only the stage's X knob for at least a field width, then click 'Finish'.")
+            return
+        self.btn_rot_measure.setText("Measure from X pan")
+        x0, y0 = getattr(self, "_rot_start", (0.0, 0.0))
+        dx, dy = s.mosaic_xy[0] - x0, s.mosaic_xy[1] - y0
+        if math.hypot(dx, dy) < 40 or s.mosaic_lost:
+            self.notify("Not enough tracked X movement to measure the angle; move further while the mosaic tracks.",
+                        "warning")
+            return
+        a = math.degrees(math.atan2(dy, dx))
+        a = (a + 90.0) % 180.0 - 90.0  # direction of the axis, not of travel
+        self.sp_rot.setValue(round(-a, 1))
+        self.notify(f"Stage X runs at {a:+.1f}° in the camera image; views rotated by {-a:+.1f}°.", "success")
+
+    def _auto_exposure_once(self):
+        """Software one-shot exposure: scale the manual exposure until the 99.5th percentile is ~220/255."""
+        if not isinstance(self.source, CameraSource):
+            self.notify("One-shot exposure needs a real camera.", "warning")
+            return
+        self.chk_autoexp.setChecked(False)
+        self._ae_steps = 0
+        self._ae_seq = -1
+        self.btn_autoexp_once.setEnabled(False)
+        QTimer.singleShot(600, self._auto_exposure_step)
+
+    def _auto_exposure_step(self):
+        s = self.engine.snapshot()
+        if s.preview is None or s.seq == self._ae_seq:
+            QTimer.singleShot(300, self._auto_exposure_step)
+            return
+        self._ae_seq = s.seq
+        p = float(np.percentile(s.preview, 99.5))
+        lo, hi = self.sl_exp.minimum(), self.sl_exp.maximum()
+        cur = self.sl_exp.value()
+        new = int(np.clip(round(cur * 220.0 / max(p, 1.0)) if p < 250 else cur * 0.6, lo, hi))
+        self._ae_steps += 1
+        if abs(new - cur) <= max(2, 0.03 * cur) or self._ae_steps >= 8 or new == cur:
+            self.btn_autoexp_once.setEnabled(True)
+            note = "" if 150 < p < 250 else " The lamp may be too dim or too bright for the exposure range."
+            self.notify(f"Exposure set to {cur / 10:.1f} ms (brightest areas {p:.0f}/255).{note}",
+                        "success" if not note else "warning")
+            return
+        self.sl_exp.setValue(new)
+        self._apply_exposure()
+        QTimer.singleShot(700, self._auto_exposure_step)  # let a few frames with the new exposure arrive
 
     def _apply_exposure(self):
         auto = self.chk_autoexp.isChecked()
@@ -972,15 +1083,22 @@ class MainWindow(QMainWindow):
         um_prev = self.obj.nominal_um_per_px(pw) if self.sim_source is not None else cal.um_per_px(pw)
         self.um_preview = um_prev
         self.p_live.set_image(s.preview, um_prev, levels=(0, 255), unit="DN")
+        ov = None
         if self.chk_focus.isChecked() and s.in_focus is not None:
             r, g, b = hex_rgb(self.t["overlay_focus"])
             m = s.in_focus.astype(np.uint8)
             edge = cv2.morphologyEx(cv2.medianBlur(m * 255, 5), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
             ov = np.zeros(s.in_focus.shape + (4,), np.uint8)
             ov[edge] = (r, g, b, 200)
-            self.p_live.set_overlay(ov)
-        else:
-            self.p_live.set_overlay(None)
+        if self.chk_zebra.isChecked():
+            clip = s.preview >= 250  # saturated: no focus contrast there, and heights there are unreliable
+            if clip.any():
+                hh, ww = clip.shape
+                yy, xx = np.ogrid[:hh, :ww]
+                stripes = clip & (((xx + yy + (s.seq % 8)) // 4) % 2 == 0)
+                ov = np.zeros(clip.shape + (4,), np.uint8) if ov is None else ov
+                ov[stripes] = (255, 40, 200, 230)
+        self.p_live.set_overlay(ov)
         if s.coverage is not None:
             self.coverage.set_image(np.log1p(s.coverage), um_prev)
         self._update_guide(s)
@@ -1104,6 +1222,9 @@ class MainWindow(QMainWindow):
                    + (" (enough)" if pct >= 0.5 else " (needs 50%)"))
         elif s.state == State.OBJECTIVE_CHANGE:
             txt = "<b>The view changed abruptly</b> — if you turned the nosepiece, pick the objective in the banner."
+        elif s.state == State.PAN and s.shift_px > 0.18 * self.engine.sm.analysis_width and not s.mosaic_lost:
+            txt = ("<b>Move slower</b> — the view moves more than a fifth of its width per frame; the mosaic may lose "
+                   "track and the frames are blurred.")
         elif s.state == State.PAN:
             txt = ("<b>Mapping</b> — move slowly and pause briefly now and then: sharp, steady views become mosaic "
                    "tiles. The blue box on the Mosaic tab is the camera."
@@ -1128,7 +1249,22 @@ class MainWindow(QMainWindow):
         return (self.result or {}).get("z_unit", "frames")
 
     def _on_sweep(self, cap: SweepCapture):
-        if cap.completeness < 0.5 and self.engine.sm.override != Override.Z:
+        self.last_cap = cap
+        self.btn_lastsweep.setEnabled(True)
+        self.btn_lastsweep.setText(f"Reconstruct last sweep ({len(cap.frames)} frames)")
+        if not self.chk_autorec.isChecked():
+            self.notify(f"Focus sweep kept ({len(cap.frames)} frames, {cap.completeness:.0%} of the field through "
+                        "focus). Press 'Reconstruct last sweep' to build its height map.")
+            return
+        self._reconstruct(cap)
+
+    def _reconstruct_last(self):
+        cap = getattr(self, "last_cap", None)
+        if cap is not None:
+            self._reconstruct(cap, force=True)
+
+    def _reconstruct(self, cap: SweepCapture, force: bool = False):
+        if cap.completeness < 0.5 and self.engine.sm.override != Override.Z and not force:
             # a quick refocus, or refocusing right after a successful sweep: not a failed attempt, stay quiet
             if len(cap.frames) < 45 or time.perf_counter() - self._result_t < 15.0:
                 return
@@ -1203,10 +1339,9 @@ class MainWindow(QMainWindow):
             h_p = cv2.resize(r["height"], (pw, ph), interpolation=cv2.INTER_NEAREST)
             self.engine.add_height_patch(r["pose"], edf_p, h_p, r["z_unit"])
             self.last_mosaic_version = -1
-        self._show_result()
-        self.tabs.setCurrentIndex(3)
+        self._show_result()  # stay on the current tab: the user may be mapping; the toast says where to look
         w = r.get("warnings") or []
-        self.notify(f"Height map ready: {r['valid_fraction']:.0%} of pixels reliable, "
+        self.notify(f"Height map ready (Height tab): {r['valid_fraction']:.0%} of pixels reliable, "
                     f"{r['timings']['total']:.1f} s." + (f"  {len(w)} warning(s) in Report." if w else ""),
                     "warning" if w else "success")
 
@@ -1237,7 +1372,8 @@ class MainWindow(QMainWindow):
                               OBJECTIVES[r["objective"]].lateral_cutoff_um, self.sp_form.value(),
                               self.sp_ls.value() or None, self.sp_lc.value())
         r["warnings"] = [x for x in r.get("warnings", []) if "reliable depth" not in x] + m.pop("warnings")
-        for k in ("Sa", "Sq", "Sp", "Sv", "Sz", "Ssk", "Sku", "Sdr_pct", "PSD_beta", "fractal_dimension"):
+        for k in ("Sa", "Sq", "Sp", "Sv", "Sz", "Ssk", "Sku", "Sdr_pct", "PSD_beta", "fractal_dimension", "Sk", "Spk",
+                  "Svk", "Smr1_pct", "Smr2_pct", "Sal_um", "Str", "Std_deg"):
             r.pop(k, None)
         r.update(m)
         self._show_result()
@@ -1413,6 +1549,13 @@ class MainWindow(QMainWindow):
             ("Sp", "Sp", zu, "Maximum peak height"), ("Sv", "Sv", zu, "Maximum pit depth"),
             ("Sz", "Sz", zu, "Maximum height (Sp + Sv)"), ("Ssk", "Ssk", "", "Skewness"), ("Sku", "Sku", "", "Kurtosis"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)"),
+            ("Sk", "Sk", zu, "Core height (40% secant of the material ratio curve)"),
+            ("Spk", "Spk", zu, "Reduced peak height"), ("Svk", "Svk", zu, "Reduced valley depth"),
+            ("Smr1", "Smr1_pct", "%", "Material ratio at the top of the core"),
+            ("Smr2", "Smr2_pct", "%", "Material ratio at the bottom of the core"),
+            ("Sal", "Sal_um", "µm", "Fastest autocorrelation decay length (to 0.2)"),
+            ("Str", "Str", "", "Texture aspect ratio: ~1 isotropic, ~0 strongly directional"),
+            ("Std", "Std_deg", "°", "Texture direction (lay), from the angular spectrum"),
             ("σ_inst", "sigma_inst", zu, "Repeatability from two sweeps, std(Δz)/√2"),
             ("PSD slope β", "PSD_beta", "", "Log-log slope of the radial power spectrum"),
             ("Fractal dimension", "fractal_dimension", "", "(8−β)/2, only when 2 < β < 4"),
@@ -1421,6 +1564,8 @@ class MainWindow(QMainWindow):
             ("Grains", "grain_count", "", "Watershed regions not touching the border", "{:d}"),
             ("Mean grain area", "mean_grain_area_um2", "µm²", ""), ("Mean max Feret", "mean_max_feret_um", "µm", ""),
             ("Mean circularity", "mean_circularity", "", "4πA/P²"),
+            ("Mean lineal intercept", "mean_intercept_um", "µm", "Heyn intercept on the grain boundaries"),
+            ("ASTM E112 G", "ASTM_E112_G", "", "Grain size number from the mean intercept (calibrated X-Y needed)"),
         ]
         body = "".join(row(*x) for x in rows)
         prov = [("Objective", r["objective"]), ("Frames used", f"{r['frames_used']} of {r['frames_in']}"),

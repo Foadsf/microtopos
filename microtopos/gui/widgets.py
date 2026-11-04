@@ -133,11 +133,16 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.plot.setLabel("left", "y", units="µm")
         self.plot.getAxis("bottom").enableAutoSIPrefix(False)
         self.plot.getAxis("left").enableAutoSIPrefix(False)
+        # image, overlay and annotations live in one group so the whole view can be rotated (a camera that is not
+        # square to the stage axes); item coordinates stay in µm of the unrotated image
+        self.group = pg.ItemGroup()
+        self.plot.addItem(self.group)
+        self.rotation = 0.0
         self.img = pg.ImageItem()
-        self.plot.addItem(self.img)
+        self.img.setParentItem(self.group)
         self.overlay = pg.ImageItem()
         self.overlay.setZValue(5)
-        self.plot.addItem(self.overlay)
+        self.overlay.setParentItem(self.group)
         self.bar = None
         if colorbar_label is not None:
             self.bar = pg.ColorBarItem(colorMap=pg.colormap.get(cmap), label=colorbar_label, interactive=False, width=14)
@@ -200,7 +205,21 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.img.setRect(rect)
         self.overlay.setRect(rect)
         if first or autorange:
-            self.plot.setRange(rect, padding=0.02)
+            self.plot.setRange(self.group.mapRectToParent(rect), padding=0.02)
+
+    def add_item(self, item):
+        """Add an annotation in image µm coordinates; it rotates with the image."""
+        item.setParentItem(self.group)
+
+    def set_rotation(self, deg: float):
+        """Rotate the displayed image about its origin (clockwise on screen, degrees)."""
+        self.rotation = float(deg)
+        self.group.setRotation(self.rotation)
+        lab = "" if abs(self.rotation) < 1e-6 else f"  (view rotated {self.rotation:+.1f}°)"
+        self.plot.setLabel("bottom", "x" + lab, units="µm")
+        if self.data is not None:
+            self.plot.setRange(self.group.mapRectToParent(self.img.mapRectToParent(self.img.boundingRect())),
+                               padding=0.02)
 
     def set_overlay(self, rgba: np.ndarray | None, rect: QRectF | None = None):
         """RGBA overlay; by default it covers the image, or `rect` (in um) when given."""
@@ -218,7 +237,7 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         if self.data is None or not self.plot.sceneBoundingRect().contains(pos):
             self.readout.setText("")
             return
-        p = self.plot.vb.mapSceneToView(pos)
+        p = self.group.mapFromScene(pos)  # µm in the unrotated image
         x, y = p.x() / self.um_per_px, p.y() / self.um_per_px
         h, w = self.data.shape[:2]
         if 0 <= x < w and 0 <= y < h:

@@ -75,7 +75,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     step("segment", 0.02, "Analysing sweep direction...")
     small_w = 320
     sw, sh = small_w, int(round(H * small_w / W))
-    tiles = np.array([tile_scores(cv2.resize(fr.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA), grid=6)
+    tiles = np.array([tile_scores(cv2.resize(fr, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32), grid=6)
                       for fr in frames])
     n_in = len(frames)
     reversal_at = None
@@ -107,7 +107,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
 
     # 2 ---- registration at processing resolution -------------------------------------------------------
     step("register", 0.08, "Registering frames...")
-    proc = [cv2.resize(frames[i].astype(np.float32), (pw, ph), interpolation=cv2.INTER_AREA) for i in idx]
+    proc = [cv2.resize(frames[i], (pw, ph), interpolation=cv2.INTER_AREA).astype(np.float32) for i in idx]
     reg_factor = 2 if pw >= 480 else 1
     warps, pairs = register_sweep(proc, factor=reg_factor, workers=st.workers,
                                   progress=(lambda q: progress(0.08 + 0.3 * q, "Registering frames...")) if progress else None)

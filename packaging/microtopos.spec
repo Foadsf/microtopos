@@ -16,9 +16,8 @@ a = Analysis(
 )
 
 if sys.platform.startswith("linux"):
-    # Never bundle the host's graphics, X11, font or system-bus libraries: they must match the user's own
-    # drivers and desktop (AppImage "excludelist" practice). Bundling Ubuntu 22.04's libX11/libxcb/libGL
-    # made Mesa's GLX fail to initialise on newer systems.
+    # Never bundle the host's graphics, X11, font, system-bus or compiler-runtime libraries: they must match
+    # the user's own drivers and desktop (AppImage "excludelist" practice).
     SYSTEM = (
         "libGL.so", "libGLX.so", "libGLdispatch.so", "libOpenGL.so", "libEGL.so", "libGLESv2.so", "libgbm.so",
         "libdrm.so", "libX11.so", "libX11-xcb.so", "libxcb.so", "libxcb-glx.so", "libxcb-dri2.so", "libxcb-dri3.so",
@@ -26,6 +25,10 @@ if sys.platform.startswith("linux"):
         "libfontconfig.so", "libfreetype.so", "libexpat.so", "libdbus-1.so", "libasound.so", "libwayland-",
         "libglib-2.0.so", "libgobject-2.0.so", "libgio-2.0.so", "libgmodule-2.0.so", "libgthread-2.0.so",
         "libpcre.so", "libpcre2-8.so", "libuuid.so", "libsystemd.so", "libudev.so",
+        # compiler runtime and compression libraries that Mesa's drivers also link: an older bundled
+        # libstdc++ from the build host made the system's LLVM-based GL driver fail to load (GLX abort).
+        # The build host is the oldest supported Ubuntu, so the user's versions are always new enough.
+        "libstdc++.so", "libgcc_s.so", "libz.so", "libzstd.so",
     )
     a.binaries = [b for b in a.binaries if not b[0].split("/")[-1].startswith(SYSTEM)]
 

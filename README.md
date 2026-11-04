@@ -58,7 +58,8 @@ The left panel is a checklist; each step shows a status chip.
    surface and stop. The sweep is detected, checked for completeness and reconstructed in the background.
    Space starts/stops a manual capture. "Repeat sweep here" measures repeatability (σ_inst).
 
-Tabs: Live (with in-focus overlay), Mosaic (2D and 2.5D height mosaic), All-in-focus (with grain boundaries,
+Tabs: Live (with in-focus outlines), Mosaic (image mosaic with the stitched height maps as an adjustable colour
+overlay, or heights alone; live camera box), All-in-focus (with grain boundaries,
 experimental super-resolution), Height (height / raw / confidence, profile tool), 3D, Report.
 Exports: Gwyddion `.gsf`, 32-bit TIFF, binary STL, report bundle (JSON, CSV, PNG), session save/open.
 
@@ -68,7 +69,8 @@ Exports: Gwyddion `.gsf`, 32-bit TIFF, binary STL, report bundle (JSON, CSV, PNG
 |---|---|
 | Capture | MJPG via V4L2 (Linux, `v4l2-ctl` for controls) or OpenCV; latest-frame pull model, no backlog |
 | Motion state | phase correlation + sharpness trend on a 320 px copy, every feature normalised by its own quiet-time noise, entry/exit hysteresis, scene-cut detection |
-| Mosaic | keyframe-relative tracking, sharpness gating, unbounded 512 px tiles, loop-closure least squares, relocalisation after tracking loss |
+| Mosaic | phase correlation verified by normalised cross-correlation, keyframe pose graph with consistency-checked loop closures, unbounded 512 px tiles, relocalisation after tracking loss, separate areas when a view cannot be placed |
+| Height mosaic | every height map pinned to its keyframe (moves with pose-graph corrections), least-squares levelling of overlapping maps, feathered blending, .gsf export, saved with the session |
 | Sweep | monotonic segmentation from z labels or from tiles that come into focus twice (reversal); pause removal when z is unknown |
 | Registration | translation-only ECC between consecutive frames (parallel), chained; failed pairs inherit neighbour motion |
 | Depth | focus volume (DoG band-pass default), Gaussian peak fit (log-parabola, 5 samples) on the actual z values, confidence from peak prominence and curve noise, NaN where unreliable, confidence-weighted guided filter with outlier rejection |

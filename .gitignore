@@ -14,3 +14,5 @@ Gemini v5 response.md
 Manual zoom microscope video analysis.md
 Microscope Metrology Software Specifications.md
 Microscope video focus stacking.md
+release/
+*.spec

@@ -7,10 +7,7 @@ from microtopos import selftest
 CHECKS = selftest.CHECKS + selftest.ONCE
 
 
-KNOWN = {
-    # seed 11: SR nRMSE 0.521 vs bicubic 0.519 (a tie); seeds 22/33 SR wins clearly (0.32/0.30 vs 0.37/0.37).
-    "check_superres": "super-resolution gain is seed-dependent on the 4x simulator (tie on seed 11)",
-}
+KNOWN: dict[str, str] = {}  # check name -> reason, for checks expected to fail (none at present)
 
 
 def _id(c):

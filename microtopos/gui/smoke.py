@@ -142,6 +142,9 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
 
         from .. import objectives as objlib
 
+        # XDG_* only redirects the data folder on Linux: on Windows and macOS write the list (and the calibration
+        # file the edit re-saves) to the temporary folder, never over the user's own
+        w.data_dir = w.store.directory = Path(tmp) / "data"
         dlg = w._edit_objectives()
         app.processEvents()
         assert dlg.isVisible()

@@ -43,6 +43,9 @@ Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Pyth
 
 ## Status (v0.8, November 2026)
 
+v0.8.1 adds a user-editable objective list (step 2, "Edit objectives…") with presets, including the Leitz NPL
+5×/0.09, 10×/0.20, 20×/0.40 and Fluotar 50×/0.85 set.
+
 Early but working. Tested with a Bresser MikrOkular Full HD eyepiece camera on Linux Mint: live capture,
 automatic focus-sweep detection, height maps and stitching all run on real specimens. The algorithms are
 validated against simulator ground truth (below); on real specimens they are **not yet validated

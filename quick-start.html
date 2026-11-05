@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quick start · MicroTopos</title>
+<meta name="description" content="Five minutes with the built-in simulator: a demo focus sweep, a height map and a stitched mosaic, no microscope needed.">
+<meta property="og:title" content="Quick start · MicroTopos">
+<meta property="og:description" content="Five minutes with the built-in simulator: a demo focus sweep, a height map and a stitched mosaic, no microscope needed.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-quick-start">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html" aria-current="page">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Quick start</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>The built-in simulator renders a synthetic metal surface with known heights, using the same optics model the measurement relies on. It is the fastest way to learn the program, and everything below works the same with a real camera.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="1-start-on-the-simulator"><a class="anchor" href="#1-start-on-the-simulator"></a>1. Start on the simulator</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Start the program with the simulator selected:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">./microtopos-0.8.1-linux-x86_64 --simulator     # or: uv run microtopos --simulator</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>On Windows and macOS, start it normally and choose <strong>Simulator (synthetic specimen)</strong> in step 1. The window has three parts:</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/overview-start.png" alt="The window right after start: checklist on the left" width="coach line and live image in the middle" height="telemetry on the right">
+</div>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Left: the checklist.</strong> Six steps, each with a status chip. Click a step to open its settings below the list.</p>
+</li>
+<li>
+<p><strong>Middle: the coach line and the views.</strong> The blue-edged line above the tabs always says what is happening and what to do next. The status chips in the header show the motion state (<code>DWELL</code>, <code>PAN</code>, <code>Z_SWEEP</code>), the source, and the X-Y and Z calibration state.</p>
+</li>
+<li>
+<p><strong>Right: telemetry.</strong> The sharpness trace, the focus-sweep coverage, reconstruction progress and exports.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="2-make-a-height-map"><a class="anchor" href="#2-make-a-height-map"></a>2. Make a height map</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Open step 1, <strong>Camera</strong>. The <strong>Demo</strong> box is shown only for the simulator. Click <strong>Focus sweep</strong>: the simulated focus knob turns from below the surface, through focus, to above it.</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/live-sweep.png" alt="A focus sweep in progress; the header says Z_SWEEP and the coach line counts frames and coverage">
+</div>
+</div>
+<div class="paragraph">
+<p>Watch three things:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>the header chip changes to <code>Z_SWEEP</code> and counts frames;</p>
+</li>
+<li>
+<p>the coach line reports how much of the field has gone <strong>blurry → sharp → blurry</strong>, which must reach 50 %;</p>
+</li>
+<li>
+<p>the <strong>Focus sweep coverage</strong> map on the right fills in where each pixel has passed through focus.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>When the knob stops, the sweep is reconstructed in the background, which takes about 3 seconds here. A notice says when the map is ready. The program stays on the current tab, so open <strong>Height</strong> yourself:</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-height.png" alt="The height map of the synthetic specimen with its colour scale">
+</div>
+</div>
+<div class="paragraph">
+<p>Hover over the map to read the height under the cursor. Drag the orange line to see a profile. The <strong>Report</strong> tab lists the roughness parameters, and <strong>3D</strong> shows the surface in perspective.</p>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+The simulator&#8217;s heights are simulation truth, so the report labels them <strong>SIMULATED</strong>. With a real camera, a hand sweep&#8217;s heights are relative focus frames until you state that sweep&#8217;s knob travel and direction with <strong>Set Z…</strong> (<a href="tutorial-calibration.html#z-scale-step-5">calibration tutorial</a>).
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="3-stitch-a-mosaic"><a class="anchor" href="#3-stitch-a-mosaic"></a>3. Stitch a mosaic</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Back in step 1, click <strong>Pan around</strong>. The simulated stage moves in a loop and the program switches to the <strong>Mosaic</strong> tab. The blue box is the camera&#8217;s current field of view.</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-mosaic-overlay.png" alt="A stitched mosaic with the height map from step 2 overlaid in colour at its own position">
+</div>
+</div>
+<div class="paragraph">
+<p>The height map you just made is pinned to the place where it was measured. Use the menu above the mosaic to choose <strong>Image</strong>, <strong>Image + height overlay</strong> or <strong>Height only</strong>, and the slider to set the overlay&#8217;s opacity. Overlapping height maps are levelled to each other and blended.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="4-save-your-work"><a class="anchor" href="#4-save-your-work"></a>4. Save your work</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><span class="menuseq"><b class="menu">Telemetry</b>&#160;<b class="caret">&#8250;</b> <b class="menuitem">Save</b></span> (<span class="keyseq"><kbd>Ctrl</kbd>+<kbd>S</kbd></span>) saves a session: the height map, all-in-focus image, mosaic and report. <strong>Open</strong> (<span class="keyseq"><kbd>Ctrl</kbd>+<kbd>O</kbd></span>) restores it.</p>
+</li>
+<li>
+<p><strong>.gsf</strong> opens in <a href="https://gwyddion.net">Gwyddion</a>; <strong>TIFF</strong> is a 32-bit float height image; <strong>STL</strong> is a 3D mesh for printing or CAD; <strong>Report</strong> (<span class="keyseq"><kbd>Ctrl</kbd>+<kbd>E</kbd></span>) writes JSON, CSV and PNG files.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="next"><a class="anchor" href="#next"></a>Next</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You have seen the whole workflow. With a real microscope there are two more things to do: calibrate, so lengths and heights come out in µm, and learn the sweep technique by hand.</p>
+</div>
+<div class="paragraph buttons">
+<p><a href="tutorial-height-map.html" class="btn primary">Tutorial: a real height map →</a> <a href="manual.html" class="btn">Full manual</a></p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="install.html"><small>Previous</small>Install</a><a class="next" href="tutorials.html"><small>Next</small>Tutorials</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#1-start-on-the-simulator">1. Start on the simulator</a></li><li class="l1"><a href="#2-make-a-height-map">2. Make a height map</a></li><li class="l1"><a href="#3-stitch-a-mosaic">3. Stitch a mosaic</a></li><li class="l1"><a href="#4-save-your-work">4. Save your work</a></li><li class="l1"><a href="#next">Next</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

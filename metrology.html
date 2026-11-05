@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metrology · MicroTopos</title>
+<meta name="description" content="How MicroTopos computes height maps and ISO 25178-style surface parameters, and what each number means.">
+<meta property="og:title" content="Metrology · MicroTopos">
+<meta property="og:description" content="How MicroTopos computes height maps and ISO 25178-style surface parameters, and what each number means.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-metrology">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html" aria-current="page">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Metrology</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>MicroTopos reports areal surface-texture parameters in the style of ISO 25178. The implementation follows the standard&#8217;s definitions but is <strong>not certified</strong>. Every report states the filters, units and calibration status the numbers depend on.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="from-frames-to-heights"><a class="anchor" href="#from-frames-to-heights"></a>From frames to heights</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Stage</th>
+<th class="tableblock halign-left valign-top">Method</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sweep</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">frames between the detected start and end of the focus movement; a turn back through focus (reversal) is detected and only one direction is used</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Registration</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">sub-pixel translation between consecutive frames (ECC), chained, so small stage drift is removed</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Focus measure</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">difference-of-Gaussians band-pass energy per pixel in a window matched to the objective&#8217;s resolution</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Depth</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">a Gaussian (log-parabola) fit through the five frames around each pixel&#8217;s focus peak, on the actual z values</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Confidence</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">from the peak&#8217;s prominence and the noise of the focus curve; unreliable pixels are left empty (NaN)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Smoothing</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">confidence-weighted guided filter with outlier rejection; edges are preserved</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">All-in-focus</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Laplacian-pyramid fusion with soft weights, at full camera resolution</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+<div class="sect1">
+<h2 id="surface-preparation"><a class="anchor" href="#surface-preparation"></a>Surface preparation</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Before any parameter is computed, the height map is prepared:</p>
+</div>
+<div class="olist arabic">
+<ol class="arabic">
+<li>
+<p><strong>Form removal</strong>: a least-squares polynomial (order 1 = plane, 2 = quadric; step 6) is subtracted.</p>
+</li>
+<li>
+<p><strong>S-filter</strong>: a Gaussian low-pass, ISO 16610-61, σ = 0.1874 λ<sub>s</sub>, removes noise below the optical resolution. The default λ<sub>s</sub> follows the objective&#8217;s resolution.</p>
+</li>
+<li>
+<p><strong>L-filter</strong> (optional): a Gaussian high-pass with cut-off λ<sub>c</sub> removes waviness.</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>Only valid pixels are used throughout. If fewer than 30 % of the pixels have a reliable depth, the parameters are withheld and the report says why.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="parameters"><a class="anchor" href="#parameters"></a>Parameters</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 16.6666%;">
+<col style="width: 16.6666%;">
+<col style="width: 66.6668%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Parameter</th>
+<th class="tableblock halign-left valign-top">Unit</th>
+<th class="tableblock halign-left valign-top">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top" colspan="3"><p class="tableblock"><strong>Height</strong></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sa</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">arithmetic mean of the absolute heights</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sq</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">root-mean-square height</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sp, Sv, Sz</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">maximum peak height, maximum pit depth, and their sum</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Ssk</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">skewness: negative for a plateau with pits, positive for peaks on a flat</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sku</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">kurtosis: 3 for a Gaussian surface, larger for sharp peaks or pits</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top" colspan="3"><p class="tableblock"><strong>Hybrid</strong></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sdr</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">%</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">developed interfacial area ratio: extra true area over the projected area, from two triangles per pixel cell. Shown only when z is in µm.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top" colspan="3"><p class="tableblock"><strong>Functional (material ratio curve)</strong></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sk</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">core height, from the 40 % secant of least slope on the material ratio curve</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Spk</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">reduced peak height: the peaks above the core, which wear off first</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Svk</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">reduced valley depth: the valleys below the core, which hold lubricant</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Smr1, Smr2</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">%</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">material ratios at the top and bottom of the core</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top" colspan="3"><p class="tableblock"><strong>Spatial</strong></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Sal</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">µm</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">fastest decay length of the autocorrelation to 0.2</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Str</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">texture aspect ratio: near 1 isotropic, near 0 strongly directional. Undefined, and not shown, when the autocorrelation does not decay to 0.2 in some direction.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Std</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">°</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">texture direction (lay), from the angular power spectrum</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top" colspan="3"><p class="tableblock"><strong>Other</strong></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">σ<sub>inst</sub></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">relative shape repeatability from two sweeps at the same place: std(Δz − mean)/√2, with the mean offset and the overlap reported beside it. Computed only when both maps share objective, size, position and a calibrated, signed height scale</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">PSD slope β, fractal dimension</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">log-log slope of the radial power spectrum; D = (8 − β)/2, given only when 2 &lt; β &lt; 4</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">GLCM contrast, homogeneity, correlation</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Haralick texture of the all-in-focus image, 64 grey levels</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Grains, area, max Feret, circularity</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">–, µm², µm</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">marker-controlled (h-minima) watershed on the all-in-focus image; grains touching the border are excluded</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Mean lineal intercept, ASTM E112 G</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">µm, –</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Heyn intercept method on the grain boundaries; G = −3.2877 − 6.6439 log<sub>10</sub>(ℓ in mm)</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p><em>z</em> is µm when Z is known (simulator, a stated knob travel, or a stored estimate), otherwise relative focus frames. Lengths in µm are <strong>nominal</strong> until the lateral scale is calibrated.</p>
+</div>
+<div class="sect2">
+<h3 id="when-a-value-is-withheld"><a class="anchor" href="#when-a-value-is-withheld"></a>When a value is withheld</h3>
+<div class="paragraph">
+<p>Every report states the surface operator it used (form removal, S- and L-filter, valid fraction) before the numbers, and each group says why a value shows "—":</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Height, material-ratio, spatial and spectral</strong> parameters need at least 30 % valid depth pixels.</p>
+</li>
+<li>
+<p><strong>Sdr</strong> needs heights in µm.</p>
+</li>
+<li>
+<p><strong>Sal and Str</strong> are withheld when the autocorrelation has too few valid pixel pairs in some direction, for example with patterned or clustered missing pixels. An unsupported lag is unknown, not zero correlation. <strong>Std</strong> is withheld for a flat surface or a spectrum without a dominant direction.</p>
+</li>
+<li>
+<p><strong>Gaussian filters</strong> are applied only when the cut-off spans at least 4 pixels. Below that, a sampled Gaussian does not have the standard&#8217;s 50 % transmission: it is 0.89 at 2 px and 0.56 at 3 px, against 0.502 at 4 px. The default λ<sub>s</sub> (the optical cut-off) is skipped with a note when the pixels are too coarse for it. A value you entered yourself is refused with a warning.</p>
+</li>
+<li>
+<p><strong>Form removal order</strong> 0 removes the mean only, 1 a plane, 2 a quadratic, 3 a cubic.</p>
+</li>
+<li>
+<p><strong>Smr1 and Smr2</strong> are where the material-ratio curve crosses the core limits. On a flat plateau (tied heights) this gives the same answer as on a slightly perturbed one.</p>
+</li>
+<li>
+<p><strong>Texture (GLCM) and grains</strong> come from the all-in-focus image, not from the heights, and are labelled image-based. Watershed regions are not verified metallurgical grains.</p>
+</li>
+</ul>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+Grain statistics come from the image, not the height, and depend on how visible the boundaries are: an etched metallographic section works best. Check them with <strong>Overlay grain boundaries</strong> on the All-in-focus tab.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="limits-you-should-know"><a class="anchor" href="#limits-you-should-know"></a>Limits you should know</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Optical limits.</strong> Lateral resolution is limited by the objective (about 0.61 λ/NA) and by the camera&#8217;s Bayer sensor and MJPEG compression. Height resolution is a fraction of the depth of field and depends on the texture.</p>
+</li>
+<li>
+<p><strong>Focus breathing</strong> (magnification changing with focus) is not corrected. The effect is about 1 pixel at the image edges in far-defocused frames.</p>
+</li>
+<li>
+<p><strong>Manual Z.</strong> A hand sweep gives relative focus progression: an uneven knob speed distorts it, a different speed gives a different scale, and its direction is unknown unless you state it, so the relief can be inverted. A knob travel stated for a sweep calibrates that sweep only, assuming an even speed. Only a measured Z (an encoder or motorised drive) removes this limit.</p>
+</li>
+<li>
+<p><strong>Textureless or mirror-like areas</strong> give no focus signal and are left empty. A light etch, oblique lighting or a higher-NA objective helps.</p>
+</li>
+<li>
+<p><strong>Accuracy on real samples</strong> has not yet been validated against a certified reference. The figures on the <a href="development.html#verification">verification</a> list come from simulation ground truth and from real camera texture with a known synthetic relief.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="manual.html"><small>Previous</small>Manual</a><a class="next" href="troubleshooting.html"><small>Next</small>Help</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#from-frames-to-heights">From frames to heights</a></li><li class="l1"><a href="#surface-preparation">Surface preparation</a></li><li class="l1"><a href="#parameters">Parameters</a></li><li class="l2"><a href="#when-a-value-is-withheld">When a value is withheld</a></li><li class="l1"><a href="#limits-you-should-know">Limits you should know</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

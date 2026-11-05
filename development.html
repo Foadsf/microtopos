@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Develop · MicroTopos</title>
+<meta name="description" content="MicroTopos source code, architecture, the ground-truth self-test with its measured results, building the binaries and this website.">
+<meta property="og:title" content="Develop · MicroTopos">
+<meta property="og:description" content="MicroTopos source code, architecture, the ground-truth self-test with its measured results, building the binaries and this website.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-development">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html" aria-current="page">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Develop</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>MicroTopos is free software under the GNU General Public License, version 3 or later. The source, issues and releases are on <a href="https://github.com/Foadsf/microtopos">GitHub</a>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="run-and-test-from-source"><a class="anchor" href="#run-and-test-from-source"></a>Run and test from source</h2>
+<div class="sectionbody">
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">git clone https://github.com/Foadsf/microtopos.git
+cd microtopos
+uv run microtopos --simulator           # the application on the synthetic specimen
+uv run microtopos-selftest              # ground-truth self-test, 3 seeds (about 5 minutes)
+uv run microtopos-selftest --quick --gui  # one seed plus an offscreen GUI run
+uv run --group dev pytest               # the same checks as unit tests</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p><code>microtopos-record OUTDIR</code> records raw MJPEG frames from the camera for offline work, and <code>--replay OUTDIR</code> plays them back through the full live pipeline. <code>microtopos-selftest --real OUTDIR</code> adds checks on a recording of a lit specimen.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="architecture"><a class="anchor" href="#architecture"></a>Architecture</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Module</th>
+<th class="tableblock halign-left valign-top">Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>camera</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">capture threads (V4L2/OpenCV, latest-frame pull, reconnect), camera controls, simulator and replay sources (real-time, or ordered with back-pressure)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>recording</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">one recording writer for the GUI and <code>microtopos-record</code> (MJPEG bytes or lossless PNG, checked writes, a manifest kept current) and the validated manifest reader</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>batch</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">deterministic offline reconstruction of a whole recording (<code>microtopos-batch</code>)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>backend</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">optional OpenCL focus measure with the CPU as reference, parity checks and the benchmark (<code>microtopos-bench</code>)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>units</code>, <code>verdict</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">canonical unit ids; typed self-test verdicts shared by the CLI, pytest and the JSON log</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>kinematics</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">motion state machine: DWELL, PAN, Z_SWEEP, OBJECTIVE_CHANGE, from noise-normalised video features with hysteresis</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>live</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">the engine thread: state, sweep capture with source sequence numbers and times, completeness, pre-roll, mosaic updates, source and mosaic generations, snapshots for the GUI</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>mosaic</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">band-pass phase correlation refined by ECC, NCC verification, keyframe pose graph with loop closure, relocalisation, height patches</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>registration</code>, <code>focus</code>, <code>sff</code>, <code>zstack</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">sweep registration, focus measures, depth fitting and refinement, all-in-focus fusion, the reconstruction pipeline</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>metrology</code>, <code>export</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">ISO 25178-style parameters, filters and grains; GSF, TIFF, STL, report bundle and sessions</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>optics</code>, <code>calibration</code>, <code>simulator</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">objective model, calibration store and radiometric correction, synthetic specimen renderer</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>objectives</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">the user&#8217;s objective list (<code>objectives.json</code>): presets, validation, the one name→optics resolver (also for objectives no longer in the list), edits that carry calibrations across renames</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>gui</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">the Qt (PySide6) window, built on pyqtgraph</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Reading the live state never blocks: the engine publishes an immutable snapshot after each frame and the GUI draws the latest one. Controls that change the engine (source, objective, mode, mosaic reset) take its lock briefly; mosaic rendering happens outside that lock, at display size. Reconstruction, metrology recomputation, rescaling and super-resolution run as jobs that the window owns. Closing the window cancels them and waits until they have stopped. One bad frame does not stop the engine: the error is counted, logged and shown.</p>
+</div>
+<div class="sect2">
+<h3 id="measurement-identity"><a class="anchor" href="#measurement-identity"></a>Measurement identity</h3>
+<div class="paragraph">
+<p>Every sweep carries the source id and generation, the mosaic generation, the objective, the calibration revision and the source sequence number and time of each frame. A finished height map is pinned only into the mosaic it was captured in. A calibration is written to the result&#8217;s own objective. Dark and flat averages are cancelled if the source, size, exposure, gamma setting or objective changes before they are complete. Results compare (repeatability) or blend (mosaic) only when their height quantity agrees: same unit, a known sign, and the same scale basis.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="verification"><a class="anchor" href="#verification"></a>Verification</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The self-test renders a synthetic specimen with the same optics model the measurement relies on. Every instrument parameter is randomised per seed. It checks the pipeline against the known truth: 130 checks pass, 0 fail, and 30 are informational (measured 2026-11-05 on an i5-8365U laptop). The signed-step check uses a blur law that is independent of the optics model. <code>--json FILE</code> records every row, the thresholds and the versions.</p>
+</div>
+<div class="paragraph">
+<p>The gate itself is tested. Every verdict goes through one normalisation, so a NumPy <code>False</code> counts as a failure. A non-boolean verdict, an exception or an empty check is an error. The totals and the exit code come from the same records. A subprocess test makes sure an injected failing row exits 1.</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 40%;">
+<col style="width: 60%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Check</th>
+<th class="tableblock halign-left valign-top">Result (seeds 11, 22, 33)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Depth at 40×/0.85, known z</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Pearson r 0.994–0.998, slope 0.979–0.994, RMSE 0.07–0.08 µm (0.1 DOF), 94–97 % valid</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Depth at 10×/0.25</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">r 0.990–0.996, slope 0.972–0.985</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Signed step +1.60 µm: known z up/down, hand sweep stated, reversed, thinned 2:1</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">all +1.60 µm (±0.003); the old index spacing gives +0.80 µm (negative control)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Hand sweep, direction stated (variable speed, pause)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">signed rank correlation 0.994–0.998</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Registration on informative frames</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">0.09–0.16 px RMS; blank frames give no motion</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Mosaic around a closed loop</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">0.45–0.89 px RMS</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Tracking loss and return</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">every tile within about 1.1 px of its true place</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Fast pans with motion blur, 30 and 60 px/frame</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">no false view changes, one area, end error 0.5–1.2 px</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">False detections</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">no false sweeps in 300 still or 200 panning frames</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Objective change</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">detected for an instant switch and a turret with dark frames</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Textureless patch</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">91–97 % masked instead of guessed</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">ISO 16610-61 Gaussian filter</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">0.500 at the cut-off; 0.502 at 4 px, refused below 4 px</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Metrology on synthetic surfaces</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">grain count within 25 %, 50 µm grid intercept within 5 µm, Sdr exact on a tilted plane, groove direction and Str as expected</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Metrology edge cases</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">patterned missing pixels withhold Sal/Str; flat field: no Std; form order 0 keeps tilt; plateau ties stable; no Vollath wrap-around</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">48 frames at 1920×1080</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">4.1 s end to end (target ≤ 15 s)</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p><code>pytest</code> adds 83 tests, among them recording, replay, engine-error, calibration-ownership, objective-list (persistence, validation, old sessions, calibrations across edits, presets), late-result, export and session tests, and a check that two batch runs of the same recording give identical results.</p>
+</div>
+<div class="paragraph">
+<p>On real camera data (Bresser MikrOkular Full HD on a metallurgical sample): stitching along a known path tracked 40/40 frames at 0.21 px RMS. Depth over a known synthetic relief, with real texture blurred by the optical model, gave r 0.986, slope 0.993 and RMSE 0.91 µm (0.09 DOF). A 3-minute still recording of 2,236 frames produced no false detections.</p>
+</div>
+<div class="admonitionblock important">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Important</div>
+</td>
+<td class="content">
+Real-sample accuracy against a certified roughness or step-height standard has <strong>not</strong> been measured yet. Contributions of such measurements are very welcome.
+</td>
+</tr>
+</table>
+</div>
+<div class="sect2">
+<h3 id="compute-backends"><a class="anchor" href="#compute-backends"></a>Compute backends</h3>
+<div class="paragraph">
+<p>The CPU is the reference and the default. <code>ZSettings.backend = "opencl"</code> runs the DoG focus measure through OpenCV&#8217;s OpenCL path, falls back to the CPU on any error, and the result records which backend ran. <code>microtopos-bench</code> measures both, synchronised and after warm-up, with a parity check and a negative control. On the development laptop (Intel UHD 620): relative L2 difference 1.1e-7, 3.4 ms with transfers against 3.6 ms on the CPU for one 960×540 frame. That is too small a gain to change the default; a GPU backend has to show an end-to-end improvement first.</p>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="builds-and-releases"><a class="anchor" href="#builds-and-releases"></a>Builds and releases</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p><code>packaging/build.py</code> builds a single-file executable with PyInstaller. Pushing a tag <code>v*</code> runs the release workflow:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>builds for Linux x86-64 (on Ubuntu 22.04, for the oldest glibc) and ARM64, Windows x86-64, and macOS ARM64 and x86-64;</p>
+</li>
+<li>
+<p>runs <code>--selftest --quick --gui --json</code> with each built program on its runner (on macOS, the app extracted from the published zip), and attaches each runner&#8217;s JSON rows to the release;</p>
+</li>
+<li>
+<p>publishes the files with <code>SHA256SUMS.txt</code>. PyInstaller is pinned to an exact version.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Linux builds deliberately leave out the system&#8217;s graphics, X11, font and C++ runtime libraries, so the program uses the user&#8217;s own drivers.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="this-website"><a class="anchor" href="#this-website"></a>This website</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The site is written in AsciiDoc (<code>docs/pages/*.adoc</code>) and built with Asciidoctor.js into one shared template (<code>docs/build.mjs</code>, <code>docs/assets/</code>). The screenshots are taken from the real application running on the simulator, so they can be regenerated after any GUI change:</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">uv run python docs/tools/screenshots.py                    # all shots, offscreen
+uv run python docs/tools/screenshots.py --platform xcb --only tab-3d   # 3D needs a real display
+cd docs &amp;&amp; npm ci &amp;&amp; npm run build                         # -&gt; docs/_site</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>A workflow builds the site on every push to <code>main</code> that changes <code>docs/</code> and publishes it on the <code>gh-pages</code> branch.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="contributing"><a class="anchor" href="#contributing"></a>Contributing</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Bug reports with a raw recording are the most useful contribution: they replay exactly. For code, run the self-test and <code>pytest</code> before a pull request, and keep the numbers honest: a claim in the README or here needs a check that measures it.</p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="troubleshooting.html"><small>Previous</small>Help</a><span></span></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#run-and-test-from-source">Run and test from source</a></li><li class="l1"><a href="#architecture">Architecture</a></li><li class="l2"><a href="#measurement-identity">Measurement identity</a></li><li class="l1"><a href="#verification">Verification</a></li><li class="l2"><a href="#compute-backends">Compute backends</a></li><li class="l1"><a href="#builds-and-releases">Builds and releases</a></li><li class="l1"><a href="#this-website">This website</a></li><li class="l1"><a href="#contributing">Contributing</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

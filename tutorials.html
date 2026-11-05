@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tutorials · MicroTopos</title>
+<meta name="description" content="Step-by-step tutorials for MicroTopos with a real microscope: height maps, mosaics and calibration.">
+<meta property="og:title" content="Tutorials · MicroTopos">
+<meta property="og:description" content="Step-by-step tutorials for MicroTopos with a real microscope: height maps, mosaics and calibration.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-tutorials">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html" aria-current="page">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Tutorials</h1>
+<div class="paragraph">
+<p>Each tutorial assumes the program is running with your camera selected in step 1 and the lamp on. If you have not used MicroTopos before, do the five-minute <a href="quick-start.html">quick start</a> with the simulator first.</p>
+</div>
+<div class="openblock cards">
+<div class="content">
+<div class="sidebarblock">
+<div class="content">
+<div class="title">A height map from a focus sweep</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/view-height.png" alt="A height map">
+</div>
+</div>
+<div class="paragraph">
+<p>The sweep technique by hand, what the coach line tells you, reading the map, profiles and the 3D view, and repeatability.</p>
+</div>
+<div class="paragraph">
+<p><a href="tutorial-height-map.html">Start →</a></p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Mapping with the X-Y stage</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/view-mosaic-overlay.png" alt="Mosaic with height overlay">
+</div>
+</div>
+<div class="paragraph">
+<p>Growing a mosaic, what to do when tracking is lost, pinning height maps into it, and rotating the views for a camera that sits askew.</p>
+</div>
+<div class="paragraph">
+<p><a href="tutorial-mosaic.html">Start →</a></p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Calibration for real units</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/step-lateral.png" alt="The lateral calibration step">
+</div>
+</div>
+<div class="paragraph">
+<p>Dark and flat frames, µm per pixel from a stage micrometer, and µm per focus frame from the knob scale.</p>
+</div>
+<div class="paragraph">
+<p><a href="tutorial-calibration.html">Start →</a></p>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+The order that works best on a new microscope: <strong>calibration</strong> once per objective, then <strong>height maps</strong> and <strong>mosaics</strong> as often as you like. Calibrations are remembered per objective.
+</td>
+</tr>
+</table>
+</div>
+<nav class="prev-next"><a class="prev" href="quick-start.html"><small>Previous</small>Quick start</a><a class="next" href="tutorial-height-map.html"><small>Next</small>A height map from a focus sweep</a></nav>
+</main>
+
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

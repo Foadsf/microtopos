@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration for real units · MicroTopos</title>
+<meta name="description" content="Dark and flat frames, lateral scale from a stage micrometer, and the Z scale of a manual focus knob.">
+<meta property="og:title" content="Calibration for real units · MicroTopos">
+<meta property="og:description" content="Dark and flat frames, lateral scale from a stage micrometer, and the Z scale of a manual focus knob.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-tutorial-calibration">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html" aria-current="page">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Calibration for real units</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Out of the box, MicroTopos measures lateral lengths with the objective&#8217;s <strong>nominal</strong> scale and heights in <strong>focus frames</strong>. The checklist shows this with yellow chips (<strong>Nominal</strong>, <strong>Frames</strong>). Three calibrations turn them into real units. Each is stored per objective, so you do it once.</p>
+</div>
+<div class="paragraph">
+<p>Before you start, make sure step 2 lists the objectives that are really on your nosepiece (<strong>Edit objectives…</strong>, see <a href="manual.html#objective-step">the manual</a>). Calibrations are stored under the objective&#8217;s name, so set up the list first; renaming an objective later takes its calibration along.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="dark-and-flat-frames-step-3-optional"><a class="anchor" href="#dark-and-flat-frames-step-3-optional"></a>Dark and flat frames (step 3, optional)</h2>
+<div class="sectionbody">
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-darkflat.png" alt="Step 3: dark and flat frame buttons">
+</div>
+</div>
+<div class="paragraph">
+<p>Uneven illumination and sensor offset show up as fake height and roughness gradients. Correcting them is recommended before measuring roughness:</p>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Record dark (lamp off)</dt>
+<dd>
+<p>block the light completely and click. 24 frames are averaged; keep still.</p>
+</dd>
+<dt class="hdlist1">Record flat (blank, defocused)</dt>
+<dd>
+<p>put a featureless, highly reflective area under the objective, such as a mirror or a polished blank, defocus it so no texture is visible, and click.</p>
+</dd>
+</dl>
+</div>
+<div class="paragraph">
+<p>Both are stored per objective, capture size and exposure. Change any of these and the correction switches off until you record again for the new setting. The header chip <code>DARK/FLAT</code> shows the state.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="lateral-scale-step-4"><a class="anchor" href="#lateral-scale-step-4"></a>Lateral scale (step 4)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>You need a <strong>stage micrometer</strong>: a slide with a ruled scale, typically 1 mm in 100 divisions of 10 µm.</p>
+</div>
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-lateral.png" alt="Step 4: lateral scale">
+</div>
+</div>
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Put the micrometer under the objective and focus on the ruling.</p>
+</li>
+<li>
+<p>Open step 4. A blue line appears on the <strong>Live</strong> view.</p>
+</li>
+<li>
+<p>Drag the line&#8217;s two ends onto two graduation marks as far apart as the field allows. A longer interval gives a smaller relative error.</p>
+</li>
+<li>
+<p>Click <strong>Use the blue line on Live…</strong> and enter the interval&#8217;s true length in µm.</p>
+</li>
+</ol>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/live-lateral.png" alt="Step 4 open: the blue calibration line on the Live view" width="with a handle at each end">
+</div>
+</div>
+<div class="paragraph">
+<p>The chip turns green and every length, area and µm axis now uses the calibrated scale. The scale is stored for full resolution and converted automatically for the other capture size, which has the same field of view.</p>
+</div>
+<div class="paragraph">
+<p>Repeat this for <strong>every</strong> objective. The nominal scale is the nameplate magnification divided into an assumed 3 µm sensor pixel, but neither the camera&#8217;s real pixel pitch nor the magnification of any relay lens in the camera adapter is known. Even with an infinity-corrected objective and a 1× tube, the true scale can differ from the nominal one by a large factor, and only a stage micrometer measures it.</p>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+Place the line along the ruling as precisely as you can: the scale comes straight from its length in pixels. Zoom with the mouse wheel on the Live view to place the ends more accurately.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="z-scale-step-5"><a class="anchor" href="#z-scale-step-5"></a>Z scale (step 5)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The fine-focus knob has no encoder, so the program cannot know how far, or which way, the focal plane moved between frames. A hand sweep&#8217;s heights are therefore <strong>relative focus progression</strong>: the number of camera frames of knob movement, assuming an even speed while the knob turns. Two things turn them into signed micrometres, and both belong to <strong>one particular sweep</strong>:</p>
+</div>
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-zscale.png" alt="Step 5: Z scale">
+</div>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Sweep direction</dt>
+<dd>
+<p>which way the focal plane moved during the sweep: <strong>Up</strong> (toward the objective) or <strong>Down</strong>. With <strong>Unknown</strong> the relief may be upside down, and the result says so. Set it here once if you always turn the knob the same way; it is used for new sweeps.</p>
+</dd>
+<dt class="hdlist1">Set Z of the selected result…</dt>
+<dd>
+<p>Most fine-focus knobs carry a scale, often 1 or 2 µm per division. Note the reading at the start and end of a sweep. Then select that sweep&#8217;s result and enter the travel in µm and the direction. Only that result becomes <strong>CALIBRATED</strong>. The spacing comes from the camera&#8217;s own frame numbers, so thinning a long sweep or dropping frames under load does not change the scale. Pauses add no travel.</p>
+</dd>
+<dt class="hdlist1">Keep as an estimate</dt>
+<dd>
+<p>The same dialog can store the µm-per-frame value for later sweeps with that objective. Those sweeps are labelled <strong>ESTIMATED</strong>, not calibrated, because a different knob speed gives a different scale.</p>
+</dd>
+<dt class="hdlist1">Apply DOF ruler estimate (experimental)</dt>
+<dd>
+<p>Estimates µm per frame by comparing the measured width of the focus curves with the objective&#8217;s theoretical depth of field. It needs no knob scale but is only indicative: in simulation it was off by −34 % to +13 %. It is stored as an <strong>ESTIMATED</strong> scale, never as a calibration.</p>
+</dd>
+<dt class="hdlist1">Clear the stored estimate</dt>
+<dd>
+<p>new sweeps go back to relative focus-frame units.</p>
+</dd>
+</dl>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+A calibration always goes to the objective the sweep was made with, even if you have switched objectives since.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="what-the-chips-mean"><a class="anchor" href="#what-the-chips-mean"></a>What the chips mean</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Chip</th>
+<th class="tableblock halign-left valign-top">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Nominal</strong> (yellow)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">lateral scale from the objective&#8217;s nominal magnification; lengths are indicative</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Calibrated</strong> (green)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">lateral scale from your stage micrometer, or Z stated for that sweep</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Estimate</strong> (yellow)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">a stored Z scale carried over to new sweeps (same knob speed assumed) or the DOF ruler</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Frames</strong> (yellow)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">heights in relative focus-frame units, not µm</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><strong>Optional</strong> / <strong>Partial</strong> / <strong>Done</strong></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">dark/flat: none, one of the two, or both recorded for the current objective, capture size and exposure</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Calibrations live in a <code>calibration.json</code> file in the program&#8217;s data folder, so they survive updates. The simulator never writes to it.</p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="tutorial-mosaic.html"><small>Previous</small>Mapping with the X-Y stage</a><a class="next" href="manual.html"><small>Next</small>Manual</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#dark-and-flat-frames-step-3-optional">Dark and flat frames (step 3, optional)</a></li><li class="l1"><a href="#lateral-scale-step-4">Lateral scale (step 4)</a></li><li class="l1"><a href="#z-scale-step-5">Z scale (step 5)</a></li><li class="l1"><a href="#what-the-chips-mean">What the chips mean</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

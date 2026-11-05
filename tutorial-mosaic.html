@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mapping with the X-Y stage · MicroTopos</title>
+<meta name="description" content="Grow a stitched mosaic by moving the stage, recover from tracking loss, overlay height maps and rotate the views.">
+<meta property="og:title" content="Mapping with the X-Y stage · MicroTopos">
+<meta property="og:description" content="Grow a stitched mosaic by moving the stage, recover from tracking loss, overlay height maps and rotate the views.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-tutorial-mosaic">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html" aria-current="page">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Mapping with the X-Y stage</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>Whenever the stage moves, MicroTopos tracks the motion from the video and stitches sharp, steady views into a mosaic. You need no encoders and nothing to start: just move.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="growing-a-mosaic"><a class="anchor" href="#growing-a-mosaic"></a>Growing a mosaic</h2>
+<div class="sectionbody">
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Focus on the sample and open the <strong>Mosaic</strong> tab.</p>
+</li>
+<li>
+<p>Move the X-Y stage. The header shows <code>PAN</code> and the blue box on the mosaic follows the camera.</p>
+</li>
+<li>
+<p><strong>Pause briefly now and then.</strong> Sharp, still views become keyframes, and motion-blurred frames are only used for tracking. Overlapping keyframes are aligned to each other, and when you come back to an area already mapped, the loop is closed and the whole mosaic is corrected.</p>
+</li>
+</ol>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/live-pan.png" alt="Panning: the coach line asks for slow movement with short pauses">
+</div>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-mosaic.png" alt="The stitched mosaic with the camera box">
+</div>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+Move by less than about a fifth of the field of view per frame. Faster movement blurs the frames, and the coach line then says <strong>Move slower</strong>. The tracker still follows hand-speed pans with motion blur (tested up to 60 px per frame on a 640 px view), but slower is more precise.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="when-tracking-is-lost"><a class="anchor" href="#when-tracking-is-lost"></a>When tracking is lost</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>If the view jumps, such as a quick shove or a big move with the lamp blocked, the camera box turns red and the coach line says <strong>Mosaic tracking lost</strong>.</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Move back over an area already in the mosaic.</strong> The view is relocated against the stored keyframes and mapping continues.</p>
+</li>
+<li>
+<p>If the view cannot be placed for about 40 frames, MicroTopos starts a <strong>separate area</strong> rather than risk a wrong placement corrupting what you have. Areas are not joined automatically (yet), so to keep one mosaic, go back to mapped ground before that happens.</p>
+</li>
+<li>
+<p><strong>Reset mosaic</strong> (<kbd>R</kbd>) starts again from scratch.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>A scene that suddenly changes completely, for example when you turn the nosepiece, is detected as <code>OBJECTIVE_CHANGE</code>. A banner then asks which objective is now in place.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="height-maps-on-the-mosaic"><a class="anchor" href="#height-maps-on-the-mosaic"></a>Height maps on the mosaic</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Every height map is pinned to the keyframe where its sweep was made, and it moves with that keyframe when the mosaic is corrected. Use the menu above the mosaic:</p>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Image</dt>
+<dd>
+<p>the stitched camera image only.</p>
+</dd>
+<dt class="hdlist1">Image + height overlay</dt>
+<dd>
+<p>the heights in colour over the image; set the opacity with the slider.</p>
+</dd>
+<dt class="hdlist1">Height only</dt>
+<dd>
+<p>the stitched height maps alone. Where two maps overlap, they are levelled to each other by least squares and blended at the seam.</p>
+</dd>
+</dl>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-mosaic-overlay.png" alt="Image with height overlay: the height map sits exactly where it was measured">
+</div>
+</div>
+<div class="paragraph">
+<p><strong>Export height mosaic</strong> writes the stitched heights as a Gwyddion <code>.gsf</code> file, and <strong>Save</strong> (<span class="keyseq"><kbd>Ctrl</kbd>+<kbd>S</kbd></span>) stores the image mosaic and height mosaic with the session.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="rotating-the-views"><a class="anchor" href="#rotating-the-views"></a>Rotating the views</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>On many microscopes the camera is clamped in the eyepiece tube at an angle, so a pure X movement of the stage looks diagonal on screen. Nothing is wrong with the tracking, but it is awkward to work with. Step 1 has a <strong>View rotation</strong> control for this:</p>
+</div>
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Click <strong>Measure from X pan</strong>.</p>
+</li>
+<li>
+<p>Turn only the stage&#8217;s X knob, by at least one field width, while the mosaic tracks.</p>
+</li>
+<li>
+<p>Click <strong>Finish</strong>. The angle of that movement is measured and the Live, Mosaic, All-in-focus and Height views are rotated so that stage X runs horizontally.</p>
+</li>
+</ol>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/live-rotated.png" alt="The views rotated by 15 degrees; the x axis label states the rotation">
+</div>
+</div>
+<div class="paragraph">
+<p>You can also type an angle. The rotation is for display only: images, height maps, exports and all measurements stay in the camera&#8217;s own pixel grid, and the cursor readout still reports unrotated image coordinates. The setting is remembered.</p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="tutorial-height-map.html"><small>Previous</small>A height map from a focus sweep</a><a class="next" href="tutorial-calibration.html"><small>Next</small>Calibration for real units</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#growing-a-mosaic">Growing a mosaic</a></li><li class="l1"><a href="#when-tracking-is-lost">When tracking is lost</a></li><li class="l1"><a href="#height-maps-on-the-mosaic">Height maps on the mosaic</a></li><li class="l1"><a href="#rotating-the-views">Rotating the views</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

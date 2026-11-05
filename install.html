@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install · MicroTopos</title>
+<meta name="description" content="Download the portable MicroTopos program for Linux, Windows or macOS, or run it from source.">
+<meta property="og:title" content="Install · MicroTopos">
+<meta property="og:description" content="Download the portable MicroTopos program for Linux, Windows or macOS, or run it from source.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-install">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html" aria-current="page">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Install</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>MicroTopos 0.8.1 is a single portable program: download it, make it runnable, start it. There is no installer and nothing is written outside your user folder.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="download"><a class="anchor" href="#download"></a>Download</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 37.5%;">
+<col style="width: 37.5%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">System</th>
+<th class="tableblock halign-left valign-top">File</th>
+<th class="tableblock halign-left valign-top">Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Linux, x86-64 (most PCs)</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>microtopos-0.8.1-linux-x86_64</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Ubuntu 22.04 / Linux Mint 21 or newer</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Linux, ARM64</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>microtopos-0.8.1-linux-arm64</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">needs glibc 2.39 (Ubuntu 24.04 or newer), e.g. Raspberry Pi 5</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Windows 10/11, x86-64</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>microtopos-0.8.1-windows-x86_64.exe</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">not yet tested on a real Windows desktop</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">macOS, Apple silicon</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>microtopos-0.8.1-macos-arm64.zip</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">not yet tested on a real Mac</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">macOS, Intel</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>microtopos-0.8.1-macos-x86_64.zip</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">not yet tested on a real Mac</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph buttons">
+<p><a href="https://github.com/Foadsf/microtopos/releases/tag/v0.8.1" class="btn primary">Open the 0.8.1 release page</a> <a href="https://github.com/Foadsf/microtopos/releases" class="btn">All releases</a></p>
+</div>
+<div class="paragraph">
+<p>Every release is built and self-tested by GitHub Actions from the tagged source. <code>SHA256SUMS.txt</code> lists a checksum for each file.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="linux"><a class="anchor" href="#linux"></a>Linux</h2>
+<div class="sectionbody">
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Download the file for your processor and open a terminal in the download folder.</p>
+</li>
+<li>
+<p>Check the download and make it runnable:</p>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">sha256sum -c --ignore-missing SHA256SUMS.txt
+chmod +x microtopos-0.8.1-linux-x86_64</code></pre>
+</div>
+</div>
+</li>
+<li>
+<p>Install <code>v4l-utils</code>. MicroTopos uses its <code>v4l2-ctl</code> tool to lock the exposure and switch off in-camera sharpening:</p>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">sudo apt install v4l-utils</code></pre>
+</div>
+</div>
+</li>
+<li>
+<p>Start it:</p>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">./microtopos-0.8.1-linux-x86_64</code></pre>
+</div>
+</div>
+</li>
+</ol>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+If the camera is not listed, check that your user may use video devices: <code>groups</code> should include <code>video</code>. If not, run <code>sudo usermod -aG video $USER</code> and log out and back in.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="windows"><a class="anchor" href="#windows"></a>Windows</h2>
+<div class="sectionbody">
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Download <code>microtopos-0.8.1-windows-x86_64.exe</code>.</p>
+</li>
+<li>
+<p>Double-click it. The program is not code-signed, so Windows SmartScreen may show "Windows protected your PC". Click <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+</li>
+<li>
+<p>Allow camera access if Windows asks: <span class="menuseq"><b class="menu">Settings</b>&#160;<b class="caret">&#8250;</b> <b class="submenu">Privacy &amp; security</b>&#160;<b class="caret">&#8250;</b> <b class="submenu">Camera</b>&#160;<b class="caret">&#8250;</b> <b class="menuitem">Let desktop apps access your camera</b></span>.</p>
+</li>
+</ol>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+On Windows and macOS, exposure is set through OpenCV&#8217;s camera properties. Whether a given camera honours them depends on its driver; the Camera step shows what the device reports back.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="macos"><a class="anchor" href="#macos"></a>macOS</h2>
+<div class="sectionbody">
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p>Download the <code>.zip</code> for your Mac (Apple menu &gt; About This Mac shows <strong>Apple M…</strong> or <strong>Intel</strong>), then double-click it to unpack <code>microtopos.app</code>.</p>
+</li>
+<li>
+<p>The app is not notarised. The first time, right-click it and choose <strong>Open</strong>, then <strong>Open</strong> again. If macOS still refuses, run <code>xattr -dr com.apple.quarantine microtopos.app</code> in Terminal.</p>
+</li>
+<li>
+<p>Allow camera access when asked, or later under <span class="menuseq"><b class="menu">System Settings</b>&#160;<b class="caret">&#8250;</b> <b class="submenu">Privacy &amp; Security</b>&#160;<b class="caret">&#8250;</b> <b class="menuitem">Camera</b></span>.</p>
+</li>
+</ol>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="run-from-source"><a class="anchor" href="#run-from-source"></a>Run from source</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>For development, or on a system without a prebuilt file, run it with <a href="https://docs.astral.sh/uv/">uv</a> and Python 3.12 or newer (CI tests 3.12 and 3.13; on 3.11 the Qt bindings abort):</p>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-bash" data-lang="bash">git clone https://github.com/Foadsf/microtopos.git
+cd microtopos
+uv run microtopos              # the application
+uv run microtopos --simulator  # start on the synthetic specimen
+uv run microtopos-selftest     # the ground-truth self-test
+uv run microtopos-batch REC OUT  # reconstruct every sweep of a recording, deterministically
+uv run microtopos-bench        # CPU vs OpenCL focus-measure benchmark on this computer</code></pre>
+</div>
+</div>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+On Linux, Qt needs <code>libxcb-cursor0</code> for its X11 window plugin. If you see "Could not load the Qt platform plugin xcb", run <code>sudo apt install libxcb-cursor0</code>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="command-line-options"><a class="anchor" href="#command-line-options"></a>Command-line options</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Option</th>
+<th class="tableblock halign-left valign-top">Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--simulator</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">start on the synthetic specimen; cameras are still listed in step 1</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--replay DIR</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">play back a recording made with <strong>Record raw stream</strong> or <code>microtopos-record</code>, at its recorded timing (a busy computer skips frames, as with a camera)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--batch REC OUT [options]</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">analyse every frame of a recording in order and write each sweep&#8217;s report to <code>OUT</code> (options: <code>--objective NAME</code> from your objective list, <code>--objectives FILE</code>, <code>--list-objectives</code>, <code>--z-um-per-frame</code>, <code>--direction up/down</code>, <code>--um-per-px</code>)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--bench</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">measure the focus measure on the CPU and with OpenCL on this computer, with a parity check</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>-v</code>, <code>--verbose</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">print the live event log to the console (it is always shown under <strong>Diagnostics</strong>)</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--selftest [--quick] [--gui] [--json FILE]</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">run the ground-truth self-test and exit; <code>--json</code> writes every row with versions and thresholds</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>--version</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">print the version</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Next, try the program without a microscope in the <a href="quick-start.html">quick start</a>.</p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="index.html"><small>Previous</small>MicroTopos</a><a class="next" href="quick-start.html"><small>Next</small>Quick start</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#download">Download</a></li><li class="l1"><a href="#linux">Linux</a></li><li class="l1"><a href="#windows">Windows</a></li><li class="l1"><a href="#macos">macOS</a></li><li class="l1"><a href="#run-from-source">Run from source</a></li><li class="l1"><a href="#command-line-options">Command-line options</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

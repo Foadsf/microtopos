@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Help · MicroTopos</title>
+<meta name="description" content="Solutions to common problems with MicroTopos: camera not found, dark or frozen image, ignored sweeps, tracking and start-up errors.">
+<meta property="og:title" content="Help · MicroTopos">
+<meta property="og:description" content="Solutions to common problems with MicroTopos: camera not found, dark or frozen image, ignored sweeps, tracking and start-up errors.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-troubleshooting">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html" aria-current="page">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Help</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph lead">
+<p>Most problems show up on the coach line or as a chip in the header first. If the answer is not here, open <strong>Diagnostics</strong> on the right, copy the event log and <a href="https://github.com/Foadsf/microtopos/issues">report the problem</a>.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="camera"><a class="anchor" href="#camera"></a>Camera</h2>
+<div class="sectionbody">
+<div class="dlist">
+<dl>
+<dt class="hdlist1">No camera in the list</dt>
+<dd>
+<div class="ulist">
+<ul>
+<li>
+<p>Linux: check <code>ls /dev/video*</code> and that your user is in the <code>video</code> group (see <a href="install.html#linux">install</a>).</p>
+</li>
+<li>
+<p>Close other programs that use the camera: only one program can stream from it at a time.</p>
+</li>
+<li>
+<p>Unplug and replug it, then restart MicroTopos.</p>
+</li>
+</ul>
+</div>
+</dd>
+<dt class="hdlist1">The image is black or very dark</dt>
+<dd>
+<p>Check the lamp first. Then raise the exposure or click <strong>Set once</strong> in step 1. <strong>Device reports</strong> shows the exposure the camera actually accepted.</p>
+</dd>
+<dt class="hdlist1">The image is frozen, or the coach line says the camera stopped sending frames</dt>
+<dd>
+<p>The USB connection stalled. MicroTopos tries to reconnect every few seconds and re-applies your exposure when it does. If it does not recover, replug the cable; avoid unpowered USB hubs.</p>
+</dd>
+<dt class="hdlist1">Exposure does not change (Windows, macOS)</dt>
+<dd>
+<p>There, exposure is set through OpenCV&#8217;s camera properties, and some drivers ignore them. Use the camera&#8217;s own settings tool to fix the exposure, and keep <strong>Automatic exposure</strong> off in MicroTopos.</p>
+</dd>
+<dt class="hdlist1">Lower frame rate than advertised</dt>
+<dd>
+<p>Many eyepiece cameras deliver fewer frames than they advertise; the Bresser MikrOkular Full HD, for example, gives 12.5 fps at 1920×1080 instead of 25. Long exposures lower it further.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="height-maps"><a class="anchor" href="#height-maps"></a>Height maps</h2>
+<div class="sectionbody">
+<div class="dlist">
+<dl>
+<dt class="hdlist1">My focus sweep was ignored</dt>
+<dd>
+<p>The coach line gives the percentage of the field that went <strong>blurry → sharp → blurry</strong>; 50 % is needed. Start further out of focus and keep turning until everything is blurry again. See <a href="tutorial-height-map.html">the tutorial</a>.</p>
+</dd>
+<dt class="hdlist1">A sweep starts when I only refocus</dt>
+<dd>
+<p>Short refocusing is ignored automatically. To decide yourself, switch off <strong>Reconstruct sweeps automatically</strong> and use <strong>Reconstruct last sweep</strong>, or use <strong>Mode: Pause</strong> in step 6.</p>
+</dd>
+<dt class="hdlist1">Big holes in the height map</dt>
+<dd>
+<p>Those pixels have no clear focus peak: no texture, or saturation. Lower the exposure until the magenta stripes disappear, record a flat frame, or use a higher-NA objective.</p>
+</dd>
+<dt class="hdlist1">The heights are in "frames"</dt>
+<dd>
+<p>Calibrate the Z scale in step 5 (<a href="tutorial-calibration.html#z-scale-step-5">how</a>).</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="mosaic"><a class="anchor" href="#mosaic"></a>Mosaic</h2>
+<div class="sectionbody">
+<div class="dlist">
+<dl>
+<dt class="hdlist1">The mosaic says "tracking lost" or starts a new area</dt>
+<dd>
+<p>The view jumped too far between frames. Move back over mapped ground; next time move more slowly (the coach line says <strong>Move slower</strong> when needed).</p>
+</dd>
+<dt class="hdlist1">Moving one stage knob moves the view diagonally</dt>
+<dd>
+<p>The camera sits rotated in the eyepiece tube. Use <strong>View rotation › Measure from X pan</strong> in step 1 (<a href="tutorial-mosaic.html#rotating-the-views">how</a>).</p>
+</dd>
+<dt class="hdlist1">"The view changed abruptly" while panning</dt>
+<dd>
+<p>This happens when a scene change (objective turned, light blocked) is suspected. Fast, blurred pans are checked for motion first and should not trigger it. If it happens during normal panning, please report it with a recording (<strong>Record raw stream</strong>).</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="start-up"><a class="anchor" href="#start-up"></a>Start-up</h2>
+<div class="sectionbody">
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Linux: "Could not initialize GLX" or the program aborts at start</dt>
+<dd>
+<p>Use version 0.6.0 or newer: test builds made before that release bundled an old C++ runtime that clashed with the system&#8217;s graphics drivers.</p>
+</dd>
+<dt class="hdlist1">Linux: "Could not load the Qt platform plugin xcb"</dt>
+<dd>
+<p><code>sudo apt install libxcb-cursor0</code>.</p>
+</dd>
+<dt class="hdlist1">Windows: "Windows protected your PC"</dt>
+<dd>
+<p>The program is not code-signed: <strong>More info › Run anyway</strong>.</p>
+</dd>
+<dt class="hdlist1">macOS: "cannot be opened because the developer cannot be verified"</dt>
+<dd>
+<p>Right-click the app › <strong>Open</strong>, or run <code>xattr -dr com.apple.quarantine microtopos.app</code>.</p>
+</dd>
+<dt class="hdlist1">The 3D tab is empty or shows a message</dt>
+<dd>
+<p>3D needs OpenGL. If none is available (some virtual machines and remote desktops), MicroTopos shows a flat relief image instead; all measurements are unaffected.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="reporting-a-problem"><a class="anchor" href="#reporting-a-problem"></a>Reporting a problem</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Useful in a bug report: the version (<code>microtopos --version</code>), your system and camera, the <strong>Diagnostics</strong> log, and ideally a short raw recording (<strong>Record raw stream</strong> on the Live tab), which replays exactly with <code>--replay</code>.</p>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="metrology.html"><small>Previous</small>Metrology</a><a class="next" href="development.html"><small>Next</small>Develop</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#camera">Camera</a></li><li class="l1"><a href="#height-maps">Height maps</a></li><li class="l1"><a href="#mosaic">Mosaic</a></li><li class="l1"><a href="#start-up">Start-up</a></li><li class="l1"><a href="#reporting-a-problem">Reporting a problem</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

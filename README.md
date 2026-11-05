@@ -39,7 +39,7 @@ uv run microtopos-batch DIR OUT  # analyse EVERY frame of a recording in order, 
 uv run microtopos-bench        # CPU vs OpenCL focus-measure timing with a parity check, on this computer
 ```
 
-Python 3.11 or newer (CI tests 3.11 and 3.12).
+Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Python 3.11 the Qt bindings abort with a reference-count error, so 3.11 is not supported.
 
 ## Status (main, after v0.7)
 

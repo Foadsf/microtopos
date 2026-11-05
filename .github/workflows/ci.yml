@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-24.04, windows-latest, macos-latest]
         python: ["3.12"]
         include:
-          - {os: ubuntu-24.04, python: "3.11"}  # the oldest version pyproject.toml claims
+          - {os: ubuntu-24.04, python: "3.13"}  # Python 3.11 aborts in the Qt bindings (refcount bug), so 3.12 is the minimum
     env:
       QT_QPA_PLATFORM: offscreen
     steps:

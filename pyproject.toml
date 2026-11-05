@@ -4,7 +4,7 @@ version = "0.7.0"
 description = "Encoderless computational microscopy: live X-Y stitching, shape-from-focus height maps and surface metrology for manual microscopes"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",

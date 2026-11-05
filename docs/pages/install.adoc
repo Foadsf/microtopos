@@ -64,7 +64,7 @@ NOTE: On Windows and macOS, exposure is set through OpenCV's camera properties. 
 
 == Run from source
 
-For development, or on a system without a prebuilt file, run it with https://docs.astral.sh/uv/[uv] and Python 3.11 or newer (CI tests 3.11 and 3.12):
+For development, or on a system without a prebuilt file, run it with https://docs.astral.sh/uv/[uv] and Python 3.12 or newer (CI tests 3.12 and 3.13; on 3.11 the Qt bindings abort):
 
 [source,bash]
 ----

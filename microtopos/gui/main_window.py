@@ -29,7 +29,7 @@ from ..live import LiveEngine, SweepCapture
 from ..optics import OBJECTIVE_NAMES, OBJECTIVES
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
-from .widgets import Banner, Chip, FlowLayout, ImagePanel, Toast, section
+from .widgets import Banner, Chip, FlowWidget, ImagePanel, Toast, section
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -185,8 +185,7 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
         # header: wraps onto a second row on narrow windows instead of forcing a wide minimum
-        head_w = QWidget()
-        head = FlowLayout(head_w)
+        head = FlowWidget()
         title = QLabel("MicroTopos")
         title.setObjectName("title")
         head.addWidget(title)
@@ -223,7 +222,7 @@ class MainWindow(QMainWindow):
         self.btn_theme = QPushButton()
         self.btn_theme.clicked.connect(self._toggle_theme)
         head.addWidget(self.btn_theme)
-        v.addWidget(head_w)
+        v.addWidget(head)
         self.banner = Banner(self.t)
         v.addWidget(self.banner)
         self.guide = QLabel()

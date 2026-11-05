@@ -135,6 +135,39 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
                f" ({w.lbl_job.text()[:120]})")
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
     step("objective change", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
+    pump(app, 1)
+
+    def objective_editor():
+        from PySide6.QtWidgets import QDialogButtonBox
+
+        from .. import objectives as objlib
+
+        dlg = w._edit_objectives()
+        app.processEvents()
+        assert dlg.isVisible()
+        dlg.table.item(0, 2).setText("1.4")  # a dry objective with NA 1.4: refused, OK disabled
+        assert not dlg.buttons.button(QDialogButtonBox.Ok).isEnabled(), dlg.lbl_problems.text()
+        dlg.apply_preset(objlib.LEITZ_NPL_PRESET)
+        assert dlg.buttons.button(QDialogButtonBox.Ok).isEnabled(), dlg.lbl_problems.text()
+        dlg.accept()
+        app.processEvents()
+        names = [o.name for o in objlib.PRESETS[objlib.LEITZ_NPL_PRESET]]
+        assert [w.cmb_obj.itemText(i) for i in range(w.cmb_obj.count())] == names
+        assert "keys 1–4" in w.lbl_obj_title.text() and objlib.load_set(w.data_dir).names == names
+        w._select_objective_index(3)  # key 4
+        app.processEvents()
+        assert w.obj.name == "NPL Fluotar 50x / 0.85" and w.engine.objective.na == 0.85, w.obj
+        w._select_objective_index(0)  # key 1
+        app.processEvents()
+        assert w.obj.name == "NPL 5x / 0.09" and "5×" in w.step_chips[1].text()
+        dlg = w._edit_objectives()  # back to the built-in list for the remaining steps
+        dlg.apply_preset(objlib.DEFAULT_PRESET)
+        dlg.accept()
+        app.processEvents()
+        assert w.cmb_obj.findText("40x / 0.85") >= 0
+
+    step("objective editor: validation, Leitz preset, keys switch objectives", objective_editor)
+    step("objective change back", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
     pump(app, 2)
     if w.result is not None:
         d = Path(tmp)

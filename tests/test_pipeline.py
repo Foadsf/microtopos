@@ -12,10 +12,10 @@ from microtopos.calibration import CalibrationStore
 from microtopos.camera import FrameSource, ReplaySource
 from microtopos.live import LiveEngine
 from microtopos.mosaic import Mosaic
-from microtopos.optics import OBJECTIVES
+from microtopos.objectives import default_set, resolve
 from microtopos.recording import RecordingError, RecordingWriter, load_manifest
 
-OBJ = OBJECTIVES["10x / 0.25"]
+OBJ = resolve("10x / 0.25", objset=default_set())
 
 
 def _jpeg(img):
@@ -306,3 +306,24 @@ def test_rescale_heights_flips_sign_and_scales():
     r2 = zstack.rescale_heights(r, -0.5, "um")
     assert np.allclose(r2["height"], -0.5 * h) and r2["z_unit"] == "um"
     assert abs(r2["Sq"] - 0.5 * r["Sq"]) < 1e-4 and "Sdr_pct" in r2 and not any("direction" in w for w in r2["warnings"])
+
+
+def test_batch_accepts_any_listed_objective(tmp_path, capsys):
+    """--objective takes a name from a user list (here the Leitz preset) and records the optics it used."""
+    import json as _json
+
+    from microtopos import batch, objectives
+
+    _sim_recording(tmp_path / "rec")
+    objectives.save_set(tmp_path / "data", objectives.preset_set(objectives.LEITZ_NPL_PRESET))
+    lst = tmp_path / "data" / "objectives.json"
+    with pytest.raises(SystemExit) as e:
+        batch.main(["--objectives", str(lst), "--list-objectives"])
+    assert e.value.code == 0 and "NPL Fluotar 50x / 0.85" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as e:
+        batch.main([str(tmp_path / "rec"), str(tmp_path / "out"), "--objectives", str(lst),
+                    "--objective", "NPL 10x / 0.20"])
+    assert e.value.code == 0
+    s = _json.loads((tmp_path / "out" / "batch.json").read_text(encoding="utf-8"))
+    assert s["objective"] == "NPL 10x / 0.20" and s["objective_spec"]["na"] == 0.2
+    assert s["sweeps"] and "error" not in s["sweeps"][0]

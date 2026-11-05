@@ -21,7 +21,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .optics import OBJECTIVES, SENSOR_FULL_WIDTH_PX, Objective
+from .objectives import resolve
+from .optics import SENSOR_FULL_WIDTH_PX, Objective
 
 
 class CalStatus(str, Enum):
@@ -55,8 +56,14 @@ class ObjectiveCalibration:
         """A stored µm-per-frame value is only an estimate for a new sweep (knob speed varies between sweeps)."""
         return CalStatus.ESTIMATED if self.z_um_per_frame else CalStatus.NOMINAL
 
-    def um_per_px(self, frame_width: int) -> float:
-        obj = OBJECTIVES[self.objective]
+    @property
+    def has_data(self) -> bool:
+        """Anything measured or recorded (a revision alone, e.g. after clearing, does not count)."""
+        return bool(self.lateral_um_per_px_full or self.z_um_per_frame or self.darks or self.flats)
+
+    def um_per_px(self, frame_width: int, objective: Objective | None = None) -> float:
+        """Calibrated scale, else the nominal one of `objective` (default: this calibration's name, resolved)."""
+        obj = objective or resolve(self.objective)
         full = self.lateral_um_per_px_full or obj.nominal_um_per_px(SENSOR_FULL_WIDTH_PX)
         return full * SENSOR_FULL_WIDTH_PX / float(frame_width)
 
@@ -71,18 +78,39 @@ def today() -> str:
 
 
 class CalibrationStore:
-    """JSON metadata plus one NPZ of dark/flat frames, stored in a user data directory."""
+    """JSON metadata plus one NPZ of dark/flat frames, stored in a user data directory.
+
+    Keyed by objective name. An entry is created on first use; entries of objectives that are no longer in the
+    objective set are loaded and saved unchanged, so removing an objective never deletes its calibration."""
 
     def __init__(self, directory: Path | None):
         self.directory = directory
         self._lock = threading.RLock()
-        self.cals: dict[str, ObjectiveCalibration] = {n: ObjectiveCalibration(n) for n in OBJECTIVES}
+        self.cals: dict[str, ObjectiveCalibration] = {}
         if directory is not None:
             directory.mkdir(parents=True, exist_ok=True)
             self.load()
 
     def get(self, objective: Objective | str) -> ObjectiveCalibration:
-        return self.cals[objective if isinstance(objective, str) else objective.name]
+        name = objective if isinstance(objective, str) else objective.name
+        with self._lock:
+            c = self.cals.get(name)
+            if c is None:
+                c = self.cals[name] = ObjectiveCalibration(name)
+            return c
+
+    def has_data(self, name: str) -> bool:
+        c = self.cals.get(name)
+        return c is not None and c.has_data
+
+    def rename_many(self, renames: dict[str, str]) -> None:
+        """Move calibrations to new names (a swap is fine: all are taken out before any is put back)."""
+        with self._lock:
+            moved = {b: self.cals.pop(a) for a, b in renames.items() if a in self.cals}
+            for b, c in moved.items():
+                c.objective = b
+                c.revision += 1
+                self.cals[b] = c
 
     @property
     def _json(self) -> Path:
@@ -105,6 +133,8 @@ class CalibrationStore:
         with self._lock:
             meta, arrays = {}, {}
             for name, c in self.cals.items():
+                if not c.has_data and not c.revision:
+                    continue  # never used: nothing to keep
                 meta[name] = {
                     k: getattr(c, k)
                     for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "z_um_per_frame",
@@ -130,10 +160,11 @@ class CalibrationStore:
             except (OSError, json.JSONDecodeError):
                 meta = {}
             for name, d in meta.items():
-                if name in self.cals:
+                if isinstance(d, dict):
+                    c = self.get(name)
                     for k, v in d.items():
-                        if hasattr(self.cals[name], k):
-                            setattr(self.cals[name], k, v)
+                        if hasattr(c, k) and k not in ("objective", "darks", "flats"):
+                            setattr(c, k, v)
         if self._npz.exists():
             try:
                 z = np.load(self._npz)
@@ -141,9 +172,11 @@ class CalibrationStore:
                 return
             with z:
                 for key in z.files:
-                    kind, name, rkey = key.split("|", 2)
-                    if name in self.cals:
-                        (self.cals[name].darks if kind == "dark" else self.cals[name].flats)[rkey] = z[key]
+                    parts = key.split("|", 2)
+                    if len(parts) == 3:
+                        kind, name, rkey = parts
+                        c = self.get(name)
+                        (c.darks if kind == "dark" else c.flats)[rkey] = z[key]
 
 
 class RadiometricCorrector:

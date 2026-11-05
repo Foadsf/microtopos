@@ -16,11 +16,20 @@ import cv2
 import numpy as np
 
 
+PHASE_MIN_RESPONSE = 0.05  # below this a phase-correlation peak is indistinguishable from noise
+PHASE_MAX_FRACTION = 0.25  # a fallback shift beyond this fraction of the frame is not trusted
+
+
 @dataclass
 class PairRegistration:
     warp: np.ndarray  # 2x3, template coords -> moving coords, full resolution
     ecc: float  # ECC correlation (or phase-correlation response on fallback)
     ok: bool  # False when ECC failed or was rejected and the translation-only estimate was used
+    method: str = "ecc"  # "ecc" | "phase" (qualified fallback) | "none" (motion not observable)
+
+    @property
+    def observable(self) -> bool:
+        return self.method != "none"
 
 
 def _hann(h: int, w: int) -> np.ndarray:
@@ -66,15 +75,24 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
         t, m = template.astype(np.float32), moving.astype(np.float32)
     dx, dy, resp = phase_shift(t, m)
     W0 = np.array([[1, 0, dx], [0, 1, dy]], np.float32)
-    W, cc, ok = W0, resp, False
+    h_s, w_s = t.shape[:2]
+    # a fallback is qualified only with a real peak at a plausible shift; otherwise motion is unobservable
+    # (identical flat frames return response 0 at half the frame size, which is not a measurement)
+    qualified = (np.isfinite(resp) and resp >= PHASE_MIN_RESPONSE
+                 and math.hypot(dx, dy) <= PHASE_MAX_FRACTION * min(h_s, w_s))
+    W, cc, ok, method = (W0, resp, False, "phase") if qualified else \
+        (np.array([[1, 0, 0], [0, 1, 0]], np.float32), resp, False, "none")
     try:
         crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
         motion = cv2.MOTION_TRANSLATION if model == "translation" else cv2.MOTION_AFFINE
-        cc_e, We = cv2.findTransformECC(t, m, W0.copy(), motion, crit, None, 3)
+        init = W0.copy() if qualified else np.array([[1, 0, 0], [0, 1, 0]], np.float32)
+        cc_e, We = cv2.findTransformECC(t, m, init, motion, crit, None, 3)
         Ws, sc, rot = _to_similarity(We)
-        if np.isfinite(Ws).all() and abs(sc - 1) < max_scale_dev and abs(rot) < max_rot_deg \
-                and math.hypot(We[0, 2] - dx, We[1, 2] - dy) < 3.0:
-            W, cc, ok = Ws, float(cc_e), True
+        shape_ok = np.isfinite(Ws).all() and abs(sc - 1) < max_scale_dev and abs(rot) < max_rot_deg
+        near = math.hypot(We[0, 2] - init[0, 2], We[1, 2] - init[1, 2]) < 3.0
+        # without a qualified phase peak, ECC is trusted only with a strong correlation near zero motion
+        if shape_ok and near and (qualified or float(cc_e) >= 0.6):
+            W, cc, ok, method = Ws, float(cc_e), True, "ecc"
     except cv2.error:
         pass
     # rescale to full resolution, honouring INTER_AREA pixel centres: x_full = f*x + (f-1)/2
@@ -83,15 +101,21 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
         c = np.full(2, (factor - 1) / 2.0)
         tr = factor * W[:, 2].astype(np.float64) + (np.eye(2) - A) @ c
         W = np.hstack([A, tr[:, None]]).astype(np.float32)
-    return PairRegistration(W.astype(np.float32), cc, ok)
+    return PairRegistration(W.astype(np.float32), cc, ok, method)
+
+
+class RegistrationCancelled(Exception):
+    pass
 
 
 def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int = 2, workers: int = 4,
-                   progress=None) -> tuple[list[np.ndarray], list[PairRegistration]]:
+                   progress=None, cancelled=None) -> tuple[list[np.ndarray], list[PairRegistration]]:
     """Register a focus sweep to its reference frame.
 
     Consecutive pairs (similar defocus) are registered with translation only, in parallel, and chained;
-    a pair whose ECC fails inherits the median motion of its neighbours. Allowing scale in every pair lets
+    a pair whose ECC fails inherits the median motion of its ECC-valid neighbours. A pair whose motion is not
+    observable at all (no texture, response at noise level) and has no valid neighbours contributes zero motion
+    instead of an invented shift; `unsupported_pairs` counts them. Allowing scale in every pair lets
     defocus-induced scale errors accumulate along the chain, so the model is translation only.
     Returns warps W_k (reference coords -> frame k coords) and the pair results (pair k = frames k, k+1).
     """
@@ -100,6 +124,8 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
     done = [0]
 
     def job(k):
+        if cancelled and cancelled():
+            raise RegistrationCancelled()
         res = register_pair(frames[k], frames[k + 1], factor, "translation")
         done[0] += 1
         if progress:
@@ -114,6 +140,8 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
             nb = [steps[j] for j in range(max(0, k - 3), min(n - 1, k + 4)) if j != k and pairs[j].ok]
             if nb:
                 steps[k] = np.median(nb, axis=0)
+            elif not p.observable:
+                steps[k] = 0.0  # no evidence of motion either way: do not invent one
     T = np.zeros((n, 2))
     for k in range(ref + 1, n):
         T[k] = T[k - 1] + steps[k - 1]
@@ -135,10 +163,21 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
     return warps, pairs
 
 
-def warp_to_reference(frame: np.ndarray, W: np.ndarray) -> np.ndarray:
+def warp_to_reference(frame: np.ndarray, W: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
+    """Aligned frame. Borders are replicated so focus filters see no artificial edge; those pixels are not
+    observations, so quantitative use must also apply `warp_support`."""
     h, w = frame.shape[:2]
-    return cv2.warpAffine(frame, W, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+    return cv2.warpAffine(frame, W, (w, h), dst=out, flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                           borderMode=cv2.BORDER_REPLICATE)
+
+
+def warp_support(shape: tuple[int, int], W: np.ndarray) -> np.ndarray:
+    """Boolean mask of reference pixels that the warped frame actually observed (no replicated border)."""
+    h, w = shape
+    ones = np.ones((h, w), np.uint8)
+    s = cv2.warpAffine(ones, W, (w, h), flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return s.astype(bool)
 
 
 def warp_scale_shift(W: np.ndarray, shape: tuple[int, int]) -> tuple[float, float, float]:

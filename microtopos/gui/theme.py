@@ -74,4 +74,8 @@ def stylesheet(t: dict) -> str:
     QToolTip {{ background: {t['elevated']}; color: {t['text']}; border: 1px solid {t['border']}; padding: 6px; }}
     QStatusBar {{ background: {t['surface']}; color: {t['muted']}; }}
     QScrollArea {{ border: none; }}
+    QPushButton:focus, QToolButton:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus,
+    QCheckBox:focus, QSlider:focus, QTabBar::tab:focus {{ outline: none; border: 2px solid {t['accent']}; }}
+    QFrame#resultcard {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: {RADIUS}px; }}
+    QLabel#ctx {{ color: {t['muted']}; font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
     """

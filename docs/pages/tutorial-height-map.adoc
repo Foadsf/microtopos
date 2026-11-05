@@ -53,7 +53,8 @@ To find out how well the instrument repeats on *your* sample, press *Repeat swee
 | What you see | What to do
 | "That focus movement was not used (only N %…)" | Start further out of focus and continue further past focus, so the whole field goes blurry, sharp and blurry again.
 | Large empty areas | The surface has little texture there, or it is saturated. Lower the exposure; record a flat frame (step 3); a higher-NA objective helps on smooth metal.
-| Stripes or steps across the map | Uneven knob speed. Turn more evenly, or calibrate Z by knob travel at the speed you use.
+| Stripes or steps across the map | Uneven knob speed. Turn more evenly; heights assume an even speed while the knob moves.
+| Relief looks upside down | The sweep direction is unknown. Set it in step 5, or with *Set Z…* on the result line.
 | Map looks smeared | The stage moved during the sweep. If it moves a lot, the sweep is aborted and becomes a pan.
 |===
 

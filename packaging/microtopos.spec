@@ -36,7 +36,9 @@ pyz = PYZ(a.pure)
 if sys.platform == "darwin":
     exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="microtopos", console=False)
     coll = COLLECT(exe, a.binaries, a.datas, name="microtopos")
-    app = BUNDLE(coll, name="microtopos.app", bundle_identifier="org.microtopos.MicroTopos")
+    app = BUNDLE(coll, name="microtopos.app", bundle_identifier="org.microtopos.MicroTopos",
+                 info_plist={"NSCameraUsageDescription": "MicroTopos reads the microscope camera to stitch mosaics "
+                             "and measure height maps.", "NSHighResolutionCapable": True})
 else:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="microtopos", console=True,
               hide_console="hide-early" if sys.platform == "win32" else None)

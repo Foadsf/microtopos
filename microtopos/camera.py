@@ -95,6 +95,8 @@ class V4L2Controls:
 
 
 class FrameSource:
+    _ids = 0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._frame = None
@@ -103,6 +105,14 @@ class FrameSource:
         self._thread: threading.Thread | None = None
         self.fps = 0.0
         self.error: str | None = None
+        self.warnings: list[str] = []
+        self._consumed = 0  # last sequence number the engine finished (used by the ordered replay mode)
+        FrameSource._ids += 1
+        self.source_id = f"{type(self).__name__}-{FrameSource._ids}"
+
+    def consumed(self, seq: int) -> None:
+        """Called by the consumer after processing frame `seq` (back-pressure for lossless replay)."""
+        self._consumed = max(self._consumed, seq)
 
     def start(self):
         self._running = True
@@ -114,10 +124,12 @@ class FrameSource:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def _publish(self, frame, truth=None):
+    def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1):
+        """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
+        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps."""
         with self._lock:
-            self._seq += 1
-            self._frame = (frame, time.perf_counter(), self._seq, truth)
+            self._seq += max(1, int(step))
+            self._frame = (frame, time.perf_counter() if ts is None else ts, self._seq, truth)
 
     def latest(self):
         with self._lock:
@@ -212,22 +224,29 @@ class CameraSource(FrameSource):
         return {}
 
     def start_recording(self, folder) -> None:
-        """Save every raw MJPEG frame (exact camera bytes) plus timestamps; replay with --replay."""
-        from pathlib import Path
+        """Save every frame plus a manifest (see recording.py); replay with --replay. Raises if the folder is
+        not empty. MJPEG bytes are saved as they came; decoded frames (no raw mode) as lossless PNG."""
+        from .recording import RecordingWriter
 
-        self.rec_dir = Path(folder)
-        self.rec_dir.mkdir(parents=True, exist_ok=True)
-        self.rec_stamps, self.rec_t0 = [], time.perf_counter()
+        self.rec_writer = RecordingWriter(folder, self.info.name, dict(self.readback), dict(getattr(self, "applied", {})))
+        self.rec_dir = self.rec_writer.folder
+        self.rec_t0 = time.perf_counter()
+        self.rec_error = None
         self.recording = True
 
-    def stop_recording(self) -> int:
-        import json
+    @property
+    def rec_frames(self) -> int:
+        w = getattr(self, "rec_writer", None)
+        return w.n if w is not None else 0
 
+    def stop_recording(self) -> int:
         self.recording = False
-        n = len(getattr(self, "rec_stamps", []))
-        if n:
-            meta = {"camera": self.info.name, "readback": self.readback, "timestamps": self.rec_stamps}
-            (self.rec_dir / "frames.json").write_text(json.dumps(meta, indent=1))
+        w = getattr(self, "rec_writer", None)
+        if w is None:
+            return 0
+        n = w.close()
+        self.rec_error = w.error
+        self.rec_writer = None
         return n
 
     def _run(self):
@@ -236,8 +255,9 @@ class CameraSource(FrameSource):
         except RuntimeError as e:
             self.error = str(e)
             return
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # receive MJPEG bytes; decode here (and record them if asked)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here (and record them if asked)
         self.recording = False
+        self.rec_writer = None
         t0, n, n_total = time.perf_counter(), 0, 0
         last_ok = time.perf_counter()
         while self._running:
@@ -265,21 +285,31 @@ class CameraSource(FrameSource):
                 except Exception as e:  # a missing control must not stop the stream
                     self.applied = {"error": str(e)}
             n_total += 1
-            if raw.ndim == 3:  # backend already decoded
+            if raw.ndim == 3:  # the backend decoded already: raw MJPEG is not available from this camera
                 frame = raw
+                self.readback["delivery"] = "decoded by the backend"
             else:
                 frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
                 if frame is None:
+                    self.warnings.append("a camera frame did not decode")
+                    del self.warnings[:-20]
                     continue
-                if self.recording:
-                    (self.rec_dir / f"{len(self.rec_stamps):06d}.jpg").write_bytes(raw.tobytes())
-                    self.rec_stamps.append(round(time.perf_counter() - self.rec_t0, 4))
+                self.readback["delivery"] = "MJPEG bytes"
+            if self.recording and self.rec_writer is not None:
+                try:
+                    self.rec_writer.add(raw, n_total, time.perf_counter() - self.rec_t0)
+                except Exception as e:  # noqa: BLE001 - disk full etc.: stop and say so
+                    self.rec_error = str(e)
+                    self.stop_recording()
+                    self.rec_error = str(e)
             self._publish(frame)
             n += 1
             dt = time.perf_counter() - t0
             if dt > 1.0:
                 self.fps, t0, n = n / dt, time.perf_counter(), 0
         cap.release()
+        if self.rec_writer is not None:  # the stream ended while recording: finalise the manifest
+            self.stop_recording()
 
 
 class SimulatorSource(FrameSource):
@@ -350,36 +380,65 @@ def opencv_threads(n: int | None = None) -> None:
 
 
 class ReplaySource(FrameSource):
-    """Plays back a recording made with `microtopos-record`, at its original timing (or faster)."""
+    """Plays back a recording (see recording.py).
 
-    def __init__(self, folder: str, speed: float = 1.0, loop: bool = False):
+    Real-time mode (default) follows the recorded timing; a slow consumer skips frames, as with a camera.
+    Ordered mode (exhaustive=True) publishes each frame only after the consumer has finished the previous one,
+    so every frame is analysed in order regardless of load (deterministic offline processing).
+    """
+
+    def __init__(self, folder: str, speed: float = 1.0, loop: bool = False, exhaustive: bool = False):
         super().__init__()
-        import json
-        from pathlib import Path
+        from .recording import load_manifest
 
-        self.folder = Path(folder)
-        self.meta = json.loads((self.folder / "frames.json").read_text())
-        self.files = sorted(self.folder.glob("*.jpg"))
-        self.stamps = self.meta["timestamps"][: len(self.files)]
-        self.speed, self.loop = speed, loop
-        self.readback = {"replay": str(self.folder), "frames": len(self.files), **self.meta.get("readback", {})}
+        self.manifest = load_manifest(folder)
+        self.folder = self.manifest.folder
+        self.files = self.manifest.files
+        self.stamps = self.manifest.stamps
+        self.warnings = list(self.manifest.warnings)
+        self.speed, self.loop, self.exhaustive = speed, loop, exhaustive
+        self.readback = {"replay": str(self.folder), "frames": len(self.files), "mode": self.manifest.mode,
+                         **self.manifest.meta.get("readback", {})}
         self.done = False
+        self.corrupt = 0
 
     def frames(self):
+        """Every decodable frame in order (damaged files are counted in self.corrupt and skipped)."""
+        from .recording import decode
+
         for f in self.files:
-            yield cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
+            img = decode(f)
+            if img is None:
+                self.corrupt += 1
+                continue
+            yield img
 
     def _run(self):
+        from .recording import decode
+
+        prev_seq = None
         while self._running:
             t0 = time.perf_counter()
-            for f, ts in zip(self.files, self.stamps):
+            for f, ts, rseq in zip(self.files, self.stamps, self.manifest.seqs):
                 if not self._running:
                     return
-                wait = ts / self.speed - (time.perf_counter() - t0)
-                if wait > 0:
-                    time.sleep(wait)
-                self._publish(cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR))
+                step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
+                if self.exhaustive:
+                    while self._running and self._consumed < self._seq:
+                        time.sleep(0.002)
+                else:
+                    wait = ts / self.speed - (time.perf_counter() - t0)
+                    if wait > 0:
+                        time.sleep(wait)
+                img = decode(f)
+                if img is None:
+                    self.corrupt += 1
+                    self.error = f"{self.corrupt} damaged frame(s) skipped (last: {f.name})"
+                    continue
+                self._publish(img, ts=ts, step=step)  # recorded time and gaps, not playback time
+                prev_seq = rseq  # a damaged frame is not published, so it shows up as a gap in the sequence
                 self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
             if not self.loop:
                 self.done = True
                 return
+            prev_seq = None

@@ -2,7 +2,9 @@
 
 Statuses:
   NOMINAL     - derived from nameplate optics only; lengths are indicative
-  CALIBRATED  - measured by the user with a reference (stage micrometer, knob, step standard)
+  ESTIMATED   - a scale carried over from another measurement or a model (a stored µm-per-frame value assumes
+                the same knob speed as the sweep it came from; the DOF ruler is a model estimate)
+  CALIBRATED  - measured with a reference for THIS data (stage micrometer; knob travel stated for this sweep)
   SIMULATED   - ground truth from the built-in simulator; never written to disk
 """
 
@@ -10,6 +12,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -22,6 +26,7 @@ from .optics import OBJECTIVES, SENSOR_FULL_WIDTH_PX, Objective
 
 class CalStatus(str, Enum):
     NOMINAL = "NOMINAL"
+    ESTIMATED = "ESTIMATED"
     CALIBRATED = "CALIBRATED"
     SIMULATED = "SIMULATED"
 
@@ -36,6 +41,7 @@ class ObjectiveCalibration:
     z_source: str = ""
     z_date: str = ""
     z_uncertainty_pct: float | None = None
+    revision: int = 0  # incremented on every change; results record the revision they used
     # dark/flat keyed by "WxH@exposure"
     darks: dict[str, np.ndarray] = field(default_factory=dict)
     flats: dict[str, np.ndarray] = field(default_factory=dict)
@@ -46,7 +52,8 @@ class ObjectiveCalibration:
 
     @property
     def z_status(self) -> CalStatus:
-        return CalStatus.CALIBRATED if self.z_um_per_frame else CalStatus.NOMINAL
+        """A stored µm-per-frame value is only an estimate for a new sweep (knob speed varies between sweeps)."""
+        return CalStatus.ESTIMATED if self.z_um_per_frame else CalStatus.NOMINAL
 
     def um_per_px(self, frame_width: int) -> float:
         obj = OBJECTIVES[self.objective]
@@ -68,6 +75,7 @@ class CalibrationStore:
 
     def __init__(self, directory: Path | None):
         self.directory = directory
+        self._lock = threading.RLock()
         self.cals: dict[str, ObjectiveCalibration] = {n: ObjectiveCalibration(n) for n in OBJECTIVES}
         if directory is not None:
             directory.mkdir(parents=True, exist_ok=True)
@@ -84,23 +92,36 @@ class CalibrationStore:
     def _npz(self) -> Path:
         return self.directory / "radiometric.npz"
 
+    def touch(self, objective: Objective | str) -> int:
+        """Mark a calibration as changed; returns its new revision."""
+        c = self.get(objective)
+        c.revision += 1
+        return c.revision
+
     def save(self) -> None:
+        """Atomic, serialised write: each file goes to a temporary name and replaces the old one."""
         if self.directory is None:
             return
-        meta, arrays = {}, {}
-        for name, c in self.cals.items():
-            meta[name] = {
-                k: getattr(c, k)
-                for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "z_um_per_frame",
-                          "z_source", "z_date", "z_uncertainty_pct")
-            }
-            for kind, d in (("dark", c.darks), ("flat", c.flats)):
-                for key, arr in d.items():
-                    arrays[f"{kind}|{name}|{key}"] = arr.astype(np.float32)
-        tmp = self._json.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        tmp.replace(self._json)
-        np.savez_compressed(self._npz, **arrays)
+        with self._lock:
+            meta, arrays = {}, {}
+            for name, c in self.cals.items():
+                meta[name] = {
+                    k: getattr(c, k)
+                    for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "z_um_per_frame",
+                              "z_source", "z_date", "z_uncertainty_pct", "revision")
+                }
+                for kind, d in (("dark", c.darks), ("flat", c.flats)):
+                    for key, arr in list(d.items()):
+                        arrays[f"{kind}|{name}|{key}"] = arr.astype(np.float32)
+            tmp_npz = self._npz.with_name(f".radiometric-{os.getpid()}.tmp.npz")
+            with open(tmp_npz, "wb") as f:
+                np.savez_compressed(f, **arrays)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_npz.replace(self._npz)
+            tmp = self._json.with_name(f".calibration-{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            tmp.replace(self._json)
 
     def load(self) -> None:
         if self._json.exists():
@@ -114,7 +135,11 @@ class CalibrationStore:
                         if hasattr(self.cals[name], k):
                             setattr(self.cals[name], k, v)
         if self._npz.exists():
-            with np.load(self._npz) as z:
+            try:
+                z = np.load(self._npz)
+            except (OSError, ValueError):  # a damaged file must not stop the program; calibrations reset
+                return
+            with z:
                 for key in z.files:
                     kind, name, rkey = key.split("|", 2)
                     if name in self.cals:

@@ -4,7 +4,7 @@ version = "0.7.0"
 description = "Encoderless computational microscopy: live X-Y stitching, shape-from-focus height maps and surface metrology for manual microscopes"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.12",
@@ -24,6 +24,8 @@ serial = ["pyserial>=3.5"]
 microtopos = "microtopos.app:main"
 microtopos-selftest = "microtopos.selftest:main"
 microtopos-record = "microtopos.record:main"
+microtopos-batch = "microtopos.batch:main"
+microtopos-bench = "microtopos.backend:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]

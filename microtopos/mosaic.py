@@ -32,10 +32,12 @@ class HeightPatch:
     y: float
     edf: np.ndarray
     height: np.ndarray  # in the mosaic's pixel grid (resampled), NaN = invalid
-    z_unit: str
+    z_unit: str  # canonical unit id ("um" or "frames")
     offset: float = 0.0
     kf: int | None = None  # keyframe the patch is attached to (moves with it when the pose graph relaxes)
     rel: tuple = (0.0, 0.0)  # patch position minus keyframe position
+    z_key: str = ""  # comparability key: only patches with equal keys are levelled and blended together
+    rid: str = ""  # id of the result the patch came from
 
 
 @dataclass
@@ -262,10 +264,12 @@ class Mosaic:
 
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
-        self.keyframes.append(Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16)))
+        kf = Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16))
+        self.keyframes.append(kf)
         if parent is not None:
             self.edges.append((parent, len(self.keyframes) - 1, rel[0], rel[1], weight))
-        self._splat(f, x, y)
+        # splat the STORED 8-bit image: a later correction subtracts exactly the same contribution
+        self._splat(kf.image, x, y)
 
     def _loop_closure(self, win) -> None:
         """Verified matches between the new keyframe and older overlapping ones become extra pose-graph edges.
@@ -294,20 +298,33 @@ class Mosaic:
         self._relax()
 
     def _relax(self) -> None:
+        """Least-squares pose graph: one sparse factorisation solves x and y.
+
+        Row weights multiply residuals, so an edge of weight w enters the objective as w^2. A weak prior on every
+        node's current position keeps unconnected areas where they are and fixes the gauge freedom of each
+        connected component (keyframe 0 gets a strong prior).
+        """
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.linalg import splu
+
         n = len(self.keyframes)
-        rows = len(self.edges) + n
-        A = np.zeros((rows, n))
-        bx = np.zeros(rows)
-        by = np.zeros(rows)
-        # weak prior on every node's current position: keeps unconnected areas where they are, and fixes the
-        # gauge freedom of each connected component (keyframe 0 gets a strong prior)
+        m = len(self.edges)
+        ri, ci, vals = [], [], []
+        bx = np.zeros(n + m)
+        by = np.zeros(n + m)
         for i, k in enumerate(self.keyframes):
             wp = 10.0 if i == 0 else 0.01
-            A[i, i], bx[i], by[i] = wp, wp * k.x, wp * k.y
+            ri.append(i), ci.append(i), vals.append(wp)
+            bx[i], by[i] = wp * k.x, wp * k.y
         for r, (i, j, ex, ey, wt) in enumerate(self.edges, n):
-            A[r, i], A[r, j], bx[r], by[r] = -wt, wt, wt * ex, wt * ey
-        sx = np.linalg.lstsq(A, bx, rcond=None)[0]
-        sy = np.linalg.lstsq(A, by, rcond=None)[0]
+            ri += [r, r]
+            ci += [i, j]
+            vals += [-wt, wt]
+            bx[r], by[r] = wt * ex, wt * ey
+        A = coo_matrix((vals, (ri, ci)), shape=(n + m, n)).tocsc()
+        lu = splu((A.T @ A).tocsc())
+        sx = lu.solve(A.T @ bx)
+        sy = lu.solve(A.T @ by)
         corr = max(math.hypot(k.x - x, k.y - y) for k, x, y in zip(self.keyframes, sx, sy))
         if corr < 0.5:
             return
@@ -336,9 +353,7 @@ class Mosaic:
     # ---------------------------------------------------------------- canvas
     def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0) -> None:
         h, w = img.shape
-        fy = np.sin(np.linspace(0.05, np.pi - 0.05, h, dtype=np.float32))
-        fx = np.sin(np.linspace(0.05, np.pi - 0.05, w, dtype=np.float32))
-        feather = np.outer(fy, fx) * weight
+        feather = _feather(h, w) * weight
         x0, y0 = int(round(x)), int(round(y))
         t = self.tile
         for ty in range(y0 // t, (y0 + h - 1) // t + 1):
@@ -354,49 +369,62 @@ class Mosaic:
                 den[dst] += feather[src]
 
     def image(self) -> tuple[np.ndarray, tuple[int, int]]:
-        """Assembled mosaic (NaN where empty) and the mosaic coordinate of its top-left pixel."""
-        if not self.tiles:
-            return np.full((8, 8), np.nan, np.float32), (0, 0)
-        t = self.tile
-        txs = [k[0] for k in self.tiles]
-        tys = [k[1] for k in self.tiles]
-        X0, Y0 = min(txs), min(tys)
-        out = np.full(((max(tys) - Y0 + 1) * t, (max(txs) - X0 + 1) * t), np.nan, np.float32)
-        for (tx, ty), (num, den) in self.tiles.items():
-            sl = (slice((ty - Y0) * t, (ty - Y0 + 1) * t), slice((tx - X0) * t, (tx - X0 + 1) * t))
-            out[sl] = np.where(den > 1e-3, num / np.maximum(den, 1e-6), np.nan)
-        rows = np.where(np.isfinite(out).any(1))[0]
-        cols = np.where(np.isfinite(out).any(0))[0]
-        if rows.size == 0:
-            return out, (X0 * t, Y0 * t)
-        out = out[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
-        return out, (X0 * t + int(cols[0]), Y0 * t + int(rows[0]))
+        """Assembled full-resolution mosaic (NaN where empty) and the mosaic coordinate of its top-left pixel."""
+        img, origin, _ = render_tiles(self.tiles, self.tile, 1)
+        return img, origin
+
+    def preview(self, max_px: int = 1600) -> tuple[np.ndarray, tuple[int, int], int]:
+        """Mosaic rendered at a power-of-two reduction d so that its larger side is <= max_px (bounded memory).
+
+        Returns (image, origin in full-resolution mosaic pixels, d)."""
+        return render_tiles(self.tiles, self.tile, preview_factor(self.tiles, self.tile, max_px))
 
     # ---------------------------------------------------------------- 2.5D
-    def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str) -> None:
+    def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str,
+                         z_key: str | None = None, rid: str = "") -> None:
+        """Pin a height map at camera position (x, y). Patches are only levelled and blended with patches of the
+        same z_key (same quantity, unit and scale); z_key defaults to the canonical unit."""
+        from . import units
+
+        unit = units.canon(z_unit)
         kf = self._nearest(x, y) if self.keyframes else None
         rel = (x - self.keyframes[kf].x, y - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
-        self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), z_unit, 0.0, kf, rel))
+        self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), unit, 0.0, kf, rel,
+                                        z_key or unit, rid))
         self._splat(edf.astype(np.float32), x, y, weight=4.0)
         self._solve_offsets()
 
+    def remove_patch(self, rid: str) -> bool:
+        """Remove the height patch of a result (e.g. before re-adding it rescaled)."""
+        for i, p in enumerate(self.patches):
+            if p.rid and p.rid == rid:
+                self._splat(p.edf, p.x, p.y, weight=-4.0)
+                del self.patches[i]
+                self._solve_offsets()
+                return True
+        return False
+
     def _solve_offsets(self) -> None:
-        """Least-squares vertical offsets so overlapping height patches agree (median difference in overlaps)."""
-        P = self.patches
+        """Least-squares vertical offsets so overlapping height patches of the same z_key agree."""
+        for key in {p.z_key for p in self.patches}:
+            self._solve_offsets_for([p for p in self.patches if p.z_key == key])
+
+    @staticmethod
+    def _solve_offsets_for(P: list) -> None:
         n = len(P)
         if n < 2:
+            for p in P:
+                p.offset = 0.0
             return
         rows, rhs = [], []
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = P[i], P[j]
-                if a.z_unit != b.z_unit:
-                    continue
                 ax, ay, bx, by = int(round(a.x)), int(round(a.y)), int(round(b.x)), int(round(b.y))
                 x0, y0 = max(ax, bx), max(ay, by)
                 x1 = min(ax + a.height.shape[1], bx + b.height.shape[1])
                 y1 = min(ay + a.height.shape[0], by + b.height.shape[0])
-                if x1 - x0 < 16 or y1 - y0 < 16:
+                if x1 - x0 < 16 or y1 - y0 < 16:  # bounding boxes first: cheap rejection of distant pairs
                     continue
                 da = a.height[y0 - ay:y1 - ay, x0 - ax:x1 - ax]
                 db = b.height[y0 - by:y1 - by, x0 - bx:x1 - bx]
@@ -415,22 +443,110 @@ class Mosaic:
         for p, o in zip(P, sol):
             p.offset = float(o)
 
-    def height_mosaic(self) -> tuple[np.ndarray, tuple[int, int]] | None:
-        if not self.patches:
-            return None
-        xs = [int(round(p.x)) for p in self.patches]
-        ys = [int(round(p.y)) for p in self.patches]
-        X0, Y0 = min(xs), min(ys)
-        W = max(x + p.height.shape[1] for x, p in zip(xs, self.patches)) - X0
-        H = max(y + p.height.shape[0] for y, p in zip(ys, self.patches)) - Y0
-        num = np.zeros((H, W), np.float64)
-        den = np.zeros((H, W), np.float64)
-        for x, y, p in zip(xs, ys, self.patches):
-            h, w = p.height.shape
-            # feathered blending: patch edges (least reliable, border effects) get less weight
-            fw = np.outer(np.sin(np.linspace(0.05, np.pi - 0.05, h)), np.sin(np.linspace(0.05, np.pi - 0.05, w)))
-            ok = np.isfinite(p.height)
-            sl = (slice(y - Y0, y - Y0 + h), slice(x - X0, x - X0 + w))
-            num[sl] += np.where(ok, (p.height + p.offset) * fw, 0)
-            den[sl] += np.where(ok, fw, 0)
-        return np.where(den > 1e-6, num / np.maximum(den, 1e-6), np.nan).astype(np.float32), (X0, Y0)
+    def height_keys(self) -> list[str]:
+        """Comparability keys present, most recent patch's key first."""
+        return height_keys(self.patches)
+
+    def height_mosaic(self, key: str | None = None) -> tuple[np.ndarray, tuple[int, int]] | None:
+        """Blended heights of the patches with one z_key (default: the most recent patch's key)."""
+        return height_mosaic(self.patches, key)
+
+    def height_partitions(self) -> list[tuple[str, np.ndarray, tuple[int, int], int]]:
+        """Every comparability group: (z_key, blended heights, origin, number of patches), most recent first."""
+        return height_partitions(self.patches)
+
+
+def height_keys(patches: list) -> list[str]:
+    keys: list[str] = []
+    for p in reversed(patches):
+        if p.z_key not in keys:
+            keys.append(p.z_key)
+    return keys
+
+
+def height_mosaic(patches: list, key: str | None = None) -> tuple[np.ndarray, tuple[int, int]] | None:
+    """Feathered blend of the patches with z_key == key (default: the most recent patch's key). Patches of other
+    keys are never mixed in: a µm map and a focus-frame map are different quantities."""
+    if not patches:
+        return None
+    key = key if key is not None else patches[-1].z_key
+    P = [p for p in patches if p.z_key == key]
+    if not P:
+        return None
+    xs = [int(round(p.x)) for p in P]
+    ys = [int(round(p.y)) for p in P]
+    X0, Y0 = min(xs), min(ys)
+    W = max(x + p.height.shape[1] for x, p in zip(xs, P)) - X0
+    H = max(y + p.height.shape[0] for y, p in zip(ys, P)) - Y0
+    num = np.zeros((H, W), np.float32)
+    den = np.zeros((H, W), np.float32)
+    for x, y, p in zip(xs, ys, P):
+        h, w = p.height.shape
+        fw = _feather(h, w)  # patch edges (least reliable, border effects) get less weight
+        ok = np.isfinite(p.height)
+        sl = (slice(y - Y0, y - Y0 + h), slice(x - X0, x - X0 + w))
+        num[sl] += np.where(ok, (p.height + p.offset) * fw, 0)
+        den[sl] += np.where(ok, fw, 0)
+    return np.where(den > 1e-6, num / np.maximum(den, 1e-6), np.nan).astype(np.float32), (X0, Y0)
+
+
+def height_partitions(patches: list) -> list[tuple[str, np.ndarray, tuple[int, int], int]]:
+    out = []
+    for key in height_keys(patches):
+        hm = height_mosaic(patches, key)
+        if hm is not None:
+            out.append((key, hm[0], hm[1], sum(p.z_key == key for p in patches)))
+    return out
+
+
+_FEATHER: dict = {}
+
+
+def _feather(h: int, w: int) -> np.ndarray:
+    """Separable sine feather window, cached by shape."""
+    f = _FEATHER.get((h, w))
+    if f is None:
+        f = np.outer(np.sin(np.linspace(0.05, np.pi - 0.05, h, dtype=np.float32)),
+                     np.sin(np.linspace(0.05, np.pi - 0.05, w, dtype=np.float32)))
+        if len(_FEATHER) > 16:
+            _FEATHER.clear()
+        _FEATHER[(h, w)] = f
+    return f
+
+
+def preview_factor(tiles: dict, tile: int, max_px: int) -> int:
+    """Smallest power-of-two reduction (<= tile) that keeps the rendered mosaic within max_px."""
+    if not tiles:
+        return 1
+    txs = [k[0] for k in tiles]
+    tys = [k[1] for k in tiles]
+    side = max(max(txs) - min(txs) + 1, max(tys) - min(tys) + 1) * tile
+    d = 1
+    while side / d > max_px and d < tile:
+        d *= 2
+    return d
+
+
+def render_tiles(tiles: dict, tile: int, d: int = 1) -> tuple[np.ndarray, tuple[int, int], int]:
+    """Assemble tiles reduced by d (weighted: num and den are reduced separately). Works on a shallow copy of the
+    tile dict, so the engine can render outside its lock. Returns (image, full-resolution origin, d)."""
+    if not tiles:
+        return np.full((8, 8), np.nan, np.float32), (0, 0), d
+    t = tile
+    td = t // d
+    txs = [k[0] for k in tiles]
+    tys = [k[1] for k in tiles]
+    X0, Y0 = min(txs), min(tys)
+    out = np.full(((max(tys) - Y0 + 1) * td, (max(txs) - X0 + 1) * td), np.nan, np.float32)
+    for (tx, ty), (num, den) in list(tiles.items()):
+        if d > 1:
+            num = cv2.resize(num, (td, td), interpolation=cv2.INTER_AREA)
+            den = cv2.resize(den, (td, td), interpolation=cv2.INTER_AREA)
+        sl = (slice((ty - Y0) * td, (ty - Y0 + 1) * td), slice((tx - X0) * td, (tx - X0 + 1) * td))
+        out[sl] = np.where(den > 1e-3, num / np.maximum(den, 1e-6), np.nan)
+    rows = np.where(np.isfinite(out).any(1))[0]
+    cols = np.where(np.isfinite(out).any(0))[0]
+    if rows.size == 0:
+        return out, (X0 * t, Y0 * t), d
+    out = out[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    return out, (X0 * t + int(cols[0]) * d, Y0 * t + int(rows[0]) * d), d

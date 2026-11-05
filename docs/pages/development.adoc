@@ -22,9 +22,13 @@ uv run --group dev pytest               # the same checks as unit tests
 [cols="1,3",options="header"]
 |===
 | Module | Responsibility
-| `camera` | capture threads (V4L2/OpenCV, latest-frame pull, raw recording, reconnect), camera controls, simulator and replay sources
+| `camera` | capture threads (V4L2/OpenCV, latest-frame pull, reconnect), camera controls, simulator and replay sources (real-time, or ordered with back-pressure)
+| `recording` | one recording writer for the GUI and `microtopos-record` (MJPEG bytes or lossless PNG, checked writes, a manifest kept current) and the validated manifest reader
+| `batch` | deterministic offline reconstruction of a whole recording (`microtopos-batch`)
+| `backend` | optional OpenCL focus measure with the CPU as reference, parity checks and the benchmark (`microtopos-bench`)
+| `units`, `verdict` | canonical unit ids; typed self-test verdicts shared by the CLI, pytest and the JSON log
 | `kinematics` | motion state machine: DWELL, PAN, Z_SWEEP, OBJECTIVE_CHANGE, from noise-normalised video features with hysteresis
-| `live` | the engine thread: state, sweep capture and completeness, pre-roll, mosaic updates, lock-free snapshots for the GUI
+| `live` | the engine thread: state, sweep capture with source sequence numbers and times, completeness, pre-roll, mosaic updates, source and mosaic generations, snapshots for the GUI
 | `mosaic` | band-pass phase correlation refined by ECC, NCC verification, keyframe pose graph with loop closure, relocalisation, height patches
 | `registration`, `focus`, `sff`, `zstack` | sweep registration, focus measures, depth fitting and refinement, all-in-focus fusion, the reconstruction pipeline
 | `metrology`, `export` | ISO 25178-style parameters, filters and grains; GSF, TIFF, STL, report bundle and sessions
@@ -32,42 +36,56 @@ uv run --group dev pytest               # the same checks as unit tests
 | `gui` | the Qt (PySide6) window, built on pyqtgraph
 |===
 
-The GUI never waits for the engine: the engine publishes an immutable snapshot after each frame and the GUI draws the latest one. Reconstruction runs in worker threads.
+Reading the live state never blocks: the engine publishes an immutable snapshot after each frame and the GUI draws the latest one. Controls that change the engine (source, objective, mode, mosaic reset) take its lock briefly; mosaic rendering happens outside that lock, at display size. Reconstruction, metrology recomputation, rescaling and super-resolution run as jobs that the window owns. Closing the window cancels them and waits until they have stopped. One bad frame does not stop the engine: the error is counted, logged and shown.
+
+=== Measurement identity
+
+Every sweep carries the source id and generation, the mosaic generation, the objective, the calibration revision and the source sequence number and time of each frame. A finished height map is pinned only into the mosaic it was captured in. A calibration is written to the result's own objective. Dark and flat averages are cancelled if the source, size, exposure, gamma setting or objective changes before they are complete. Results compare (repeatability) or blend (mosaic) only when their height quantity agrees: same unit, a known sign, and the same scale basis.
 
 [#verification]
 == Verification
 
-The self-test renders a synthetic specimen with the same optics model the measurement relies on. Every instrument parameter is randomised per seed. It checks the pipeline against the known truth: 101 checks pass, 0 fail, and 30 are informational.
+The self-test renders a synthetic specimen with the same optics model the measurement relies on. Every instrument parameter is randomised per seed. It checks the pipeline against the known truth: 130 checks pass, 0 fail, and 30 are informational (measured 2026-11-05 on an i5-8365U laptop). The signed-step check uses a blur law that is independent of the optics model. `--json FILE` records every row, the thresholds and the versions.
+
+The gate itself is tested. Every verdict goes through one normalisation, so a NumPy `False` counts as a failure. A non-boolean verdict, an exception or an empty check is an error. The totals and the exit code come from the same records. A subprocess test makes sure an injected failing row exits 1.
 
 [cols="2,3",options="header"]
 |===
 | Check | Result (seeds 11, 22, 33)
-| Depth at 40×/0.85, known z | Pearson r 0.994–0.998, slope 0.979–0.994, RMSE 0.06–0.08 µm (0.1 DOF), 94–97 % valid
-| Depth at 10×/0.25 | r 0.990–0.997, slope 0.973–0.986
-| Hand sweep, unknown z (variable speed, pause) | rank correlation 0.994–0.998
-| Registration on informative frames | 0.10–0.16 px RMS
+| Depth at 40×/0.85, known z | Pearson r 0.994–0.998, slope 0.979–0.994, RMSE 0.07–0.08 µm (0.1 DOF), 94–97 % valid
+| Depth at 10×/0.25 | r 0.990–0.996, slope 0.972–0.985
+| Signed step +1.60 µm: known z up/down, hand sweep stated, reversed, thinned 2:1 | all +1.60 µm (±0.003); the old index spacing gives +0.80 µm (negative control)
+| Hand sweep, direction stated (variable speed, pause) | signed rank correlation 0.994–0.998
+| Registration on informative frames | 0.09–0.16 px RMS; blank frames give no motion
 | Mosaic around a closed loop | 0.45–0.89 px RMS
-| Tracking loss and return | every tile within about 1 px of its true place
+| Tracking loss and return | every tile within about 1.1 px of its true place
 | Fast pans with motion blur, 30 and 60 px/frame | no false view changes, one area, end error 0.5–1.2 px
 | False detections | no false sweeps in 300 still or 200 panning frames
 | Objective change | detected for an instant switch and a turret with dark frames
-| Textureless patch | 99–100 % masked instead of guessed
-| ISO 16610-61 Gaussian filter | 0.500 transmission at the cut-off
+| Textureless patch | 91–97 % masked instead of guessed
+| ISO 16610-61 Gaussian filter | 0.500 at the cut-off; 0.502 at 4 px, refused below 4 px
 | Metrology on synthetic surfaces | grain count within 25 %, 50 µm grid intercept within 5 µm, Sdr exact on a tilted plane, groove direction and Str as expected
-| 48 frames at 1920×1080 | 2.8–4.2 s end to end on a 4-core laptop
+| Metrology edge cases | patterned missing pixels withhold Sal/Str; flat field: no Std; form order 0 keeps tilt; plateau ties stable; no Vollath wrap-around
+| 48 frames at 1920×1080 | 4.1 s end to end (target ≤ 15 s)
 |===
+
+`pytest` adds 59 tests, among them recording, replay, engine-error, calibration-ownership, late-result, export and session tests, and a check that two batch runs of the same recording give identical results.
 
 On real camera data (Bresser MikrOkular Full HD on a metallurgical sample): stitching along a known path tracked 40/40 frames at 0.21 px RMS. Depth over a known synthetic relief, with real texture blurred by the optical model, gave r 0.986, slope 0.993 and RMSE 0.91 µm (0.09 DOF). A 3-minute still recording of 2,236 frames produced no false detections.
 
 IMPORTANT: Real-sample accuracy against a certified roughness or step-height standard has *not* been measured yet. Contributions of such measurements are very welcome.
+
+=== Compute backends
+
+The CPU is the reference and the default. `ZSettings.backend = "opencl"` runs the DoG focus measure through OpenCV's OpenCL path, falls back to the CPU on any error, and the result records which backend ran. `microtopos-bench` measures both, synchronised and after warm-up, with a parity check and a negative control. On the development laptop (Intel UHD 620): relative L2 difference 1.1e-7, 3.4 ms with transfers against 3.6 ms on the CPU for one 960×540 frame. That is too small a gain to change the default; a GPU backend has to show an end-to-end improvement first.
 
 == Builds and releases
 
 `packaging/build.py` builds a single-file executable with PyInstaller. Pushing a tag `v*` runs the release workflow:
 
 * builds for Linux x86-64 (on Ubuntu 22.04, for the oldest glibc) and ARM64, Windows x86-64, and macOS ARM64 and x86-64;
-* runs `--selftest --quick --gui` with each built program on its runner;
-* publishes the files with `SHA256SUMS.txt`.
+* runs `--selftest --quick --gui --json` with each built program on its runner (on macOS, the app extracted from the published zip), and attaches each runner's JSON rows to the release;
+* publishes the files with `SHA256SUMS.txt`. PyInstaller is pinned to an exact version.
 
 Linux builds deliberately leave out the system's graphics, X11, font and C++ runtime libraries, so the program uses the user's own drivers.
 

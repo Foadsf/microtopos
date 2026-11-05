@@ -106,7 +106,12 @@ def main():
     shot("live-sweep")
     shot("telemetry-sweep", telemetry, trim=True)
     prev = w.result
-    wait_result(prev)
+    for _attempt in range(3):  # grabbing the window mid-sweep can starve a busy computer: sweep again, no grabs
+        if wait_result(prev, timeout=40):
+            break
+        w._demo("sweep")
+    if w.result is None:
+        raise SystemExit("the demo sweep was never reconstructed; close other programs and run again")
     w.chk_focus.setChecked(False)
     pump(app, 2)
     for i, name in ((2, "tab-edf"), (3, "tab-height"), (5, "tab-report")):

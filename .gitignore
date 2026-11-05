@@ -23,3 +23,4 @@ packaging/dist/
 docs/node_modules/
 docs/_site/
 .claude/
+packaging/unzipped/

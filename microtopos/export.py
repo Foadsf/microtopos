@@ -3,14 +3,55 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
+import os
 import platform
+import shutil
 import struct
+import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 import tifffile
+
+
+class ExportError(OSError):
+    pass
+
+
+def _atomic_bytes(path: Path | str, data: bytes) -> Path:
+    """Write to a temporary file next to the target and rename it into place (no half-written files)."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _png_bytes(img: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise ExportError("PNG encoding failed")
+    return buf.tobytes()
+
+
+def write_mask_png(path: Path | str, valid: np.ndarray) -> Path:
+    """Validity mask (255 = measured, 0 = no reliable depth) beside a height export."""
+    return _atomic_bytes(path, _png_bytes(valid.astype(np.uint8) * 255))
+
+
+def write_sidecar(path: Path | str, info: dict) -> Path:
+    """Provenance JSON beside an export (units, scale, how invalid pixels were written)."""
+    return _atomic_bytes(path, json.dumps(_jsonable(info), indent=2, allow_nan=False).encode("utf-8"))
 
 def write_gwyddion_gsf(
     filepath: Path | str,
@@ -54,9 +95,7 @@ def write_gwyddion_gsf(
     pad_len = 4 - (len(header_bytes) % 4)
     header_padded = header_bytes + (b"\x00" * pad_len)
 
-    with open(filepath, "wb") as f:
-        f.write(header_padded)
-        f.write(data_si.tobytes(order="C"))
+    _atomic_bytes(filepath, header_padded + data_si.tobytes(order="C"))
     return fill_val
 
 
@@ -144,11 +183,8 @@ def write_binary_stl(
     records["v2"] = tris[:, 2, :].astype("<f4")
     records["attr"] = 0
 
-    header = b"MicroTopos v5 Binary STL Surface Mesh (units: um)".ljust(80, b"\x00")
-    with open(filepath, "wb") as f:
-        f.write(header)
-        f.write(struct.pack("<I", n_tri))
-        f.write(records.tobytes())
+    header = b"MicroTopos binary STL visualisation surface (units: um; invalid pixels filled)".ljust(80, b"\x00")
+    _atomic_bytes(filepath, header + struct.pack("<I", n_tri) + records.tobytes())
 
     return n_tri, (float((w - 1) * pixel_um), float((h - 1) * pixel_um))
 
@@ -175,64 +211,154 @@ def read_binary_stl_bounds(filepath: Path | str) -> tuple[int, tuple[float, floa
 def write_float32_tiff(filepath: Path | str, height_map: np.ndarray, pixel_um: float):
     """Writes standard single-channel 32-bit float TIFF (not .ome.tiff) with cm resolution tags."""
     px_per_cm = 1e4 / max(pixel_um, 1e-4)
-    tifffile.imwrite(
-        str(filepath),
-        height_map.astype(np.float32),
-        resolution=(px_per_cm, px_per_cm),
-        resolutionunit="CENTIMETER",
-    )
+    buf = io.BytesIO()
+    tifffile.imwrite(buf, height_map.astype(np.float32), resolution=(px_per_cm, px_per_cm),
+                     resolutionunit="CENTIMETER")  # NaN (no reliable depth) is kept as NaN
+    _atomic_bytes(filepath, buf.getvalue())
 
 
 def _jsonable(v):
-    if isinstance(v, (np.floating, np.integer)):
-        return v.item()
-    if isinstance(v, np.ndarray):
-        return None
+    """Strict-JSON value: numpy scalars become Python numbers, non-finite numbers become null, arrays are dropped."""
+    if isinstance(v, (np.floating, np.integer, np.bool_)):
+        v = v.item()
     if isinstance(v, float) and not np.isfinite(v):
         return None
+    if isinstance(v, np.ndarray):
+        return None
     if isinstance(v, dict):
-        return {k: _jsonable(x) for k, x in v.items() if not isinstance(x, np.ndarray)}
+        return {str(k): _jsonable(x) for k, x in v.items() if not isinstance(x, np.ndarray)}
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
     return v
 
 
 def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> list[Path]:
-    """report.json (all scalar results + provenance), summary.csv, edf.png, confidence.png."""
+    """report.json (all scalar results + provenance), summary.csv, edf.png, confidence.png, valid_mask.png.
+
+    Every file is produced in a staging folder and checked first; only a complete bundle is moved into place,
+    so a failed encoder or a full disk never leaves a partial bundle that looks complete.
+    """
     out = Path(folder)
     out.mkdir(parents=True, exist_ok=True)
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
     meta["software"] = {"python": platform.python_version(), **versions}
-    files = [out / "report.json", out / "summary.csv", out / "edf.png"]
-    files[0].write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    with open(files[1], "w", newline="", encoding="utf-8") as f:
-        wr = csv.writer(f)
+    stage = Path(tempfile.mkdtemp(prefix=".microtopos-report-", dir=out))
+    try:
+        files = {"report.json": json.dumps(meta, indent=2, allow_nan=False).encode("utf-8")}
+        csv_buf = io.StringIO()
+        wr = csv.writer(csv_buf, lineterminator="\n")
         wr.writerow(["parameter", "value"])
         for k, v in meta.items():
             if not isinstance(v, (dict, list)):
-                wr.writerow([k, v])
-    cv2.imwrite(str(files[2]), np.clip(result["edf"], 0, 255).astype(np.uint8))
-    if "confidence" in result:
-        p = out / "confidence.png"
-        cv2.imwrite(str(p), np.clip(result["confidence"] * 255, 0, 255).astype(np.uint8))
-        files.append(p)
-    return files
+                wr.writerow([k, "" if v is None else v])
+        files["summary.csv"] = csv_buf.getvalue().encode("utf-8")
+        files["edf.png"] = _png_bytes(np.clip(result["edf"], 0, 255).astype(np.uint8))
+        if isinstance(result.get("confidence"), np.ndarray):
+            files["confidence.png"] = _png_bytes(np.clip(result["confidence"] * 255, 0, 255).astype(np.uint8))
+        if isinstance(result.get("height"), np.ndarray):
+            files["valid_mask.png"] = _png_bytes(np.isfinite(result["height"]).astype(np.uint8) * 255)
+        for name, data in files.items():
+            (stage / name).write_bytes(data)
+            if (stage / name).stat().st_size != len(data):
+                raise ExportError(f"short write for {name}")
+        json.loads((stage / "report.json").read_text(encoding="utf-8"))  # parses strictly
+        done = []
+        for name in files:
+            os.replace(stage / name, out / name)
+            done.append(out / name)
+        return done
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
-SESSION_ARRAYS = ("edf", "height", "confidence", "height_raw", "mosaic_image", "height_mosaic")
+SESSION_SCHEMA = 2
+SESSION_ARRAYS = ("edf", "edf_proc", "height", "height_raw", "sl_surface", "confidence", "support", "mosaic_image",
+                  "height_mosaic")
+_LIMIT_PX = 400_000_000  # refuse absurd arrays from a damaged or foreign file before touching the UI
 
 
-def save_session(path: Path | str, result: dict, settings: dict) -> None:
+def save_session(path: Path | str, result: dict | None, settings: dict, extra: dict | None = None) -> None:
+    """Schema-2 session: the result's original arrays (incl. the processing EDF and filtered surface), all scalars
+    and warnings, settings, and optionally a mosaic. `result` may be None for a mosaic-only session."""
+    result = dict(result or {})
+    result.update(extra or {})
     arrays = {k: result[k] for k in SESSION_ARRAYS if isinstance(result.get(k), np.ndarray)}
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
-    np.savez_compressed(path, __meta__=np.array(json.dumps({"result": meta, "settings": settings})), **arrays)
+    blob = json.dumps({"schema": SESSION_SCHEMA, "result": meta, "settings": _jsonable(settings),
+                       "has_result": "height" in arrays}, allow_nan=False)
+    buf = io.BytesIO()
+    np.savez_compressed(buf, __meta__=np.array(blob), **arrays)
+    _atomic_bytes(path, buf.getvalue())
 
 
 def load_session(path: Path | str) -> tuple[dict, dict]:
+    """Load and validate a session. Raises ValueError for a file that is inconsistent; returns (result, settings).
+
+    result["session_schema"] says which schema the file had; schema-1 files lack the processing EDF and the
+    filtered surface, and result["migrated"] lists what the caller has to recompute."""
     with np.load(path, allow_pickle=False) as z:
+        if "__meta__" not in z.files:
+            raise ValueError("not a MicroTopos session")
         meta = json.loads(str(z["__meta__"]))
-        result = dict(meta["result"])
+        result = dict(meta.get("result", {}))
         for k in SESSION_ARRAYS:
             if k in z.files:
-                result[k] = z[k]
+                a = z[k]
+                if a.size > _LIMIT_PX:
+                    raise ValueError(f"array {k} is too large ({a.shape})")
+                result[k] = a
+    schema = int(meta.get("schema", 1))
+    if schema > SESSION_SCHEMA:
+        raise ValueError(f"session schema {schema} is newer than this program supports ({SESSION_SCHEMA})")
+    result["session_schema"] = schema
+    result["migrated"] = [k for k in ("edf_proc", "sl_surface") if "height" in result and k not in result]
+    if "height" in result:
+        h = result["height"]
+        if h.ndim != 2:
+            raise ValueError("height map is not 2-D")
+        for k in ("height_raw", "confidence", "edf_proc", "sl_surface", "support"):
+            if k in result and result[k].shape != h.shape:
+                raise ValueError(f"{k} has shape {result[k].shape}, height has {h.shape}")
+        um = result.get("um_per_px")
+        if not isinstance(um, (int, float)) or not np.isfinite(um) or um <= 0:
+            raise ValueError("missing or invalid pixel size")
+        if "z_unit" not in result:
+            raise ValueError("missing height unit")
+        from . import units
+        result["z_unit"] = units.canon(result["z_unit"])
     return result, meta.get("settings", {})
+
+
+def export_height(path: Path | str, fmt: str, height: np.ndarray, um_per_px: float, z_unit: str,
+                  provenance: dict | None = None, title: str = "MicroTopos height") -> list[Path]:
+    """Height export plus its validity mask (<name>.mask.png) and provenance (<name>.json).
+
+    gsf: SI metres (z in frames if uncalibrated); invalid pixels are filled with the median for Gwyddion, so the
+         mask is the record of which pixels were measured.
+    tif: 32-bit float, invalid pixels are NaN.
+    stl: visualisation mesh, invalid pixels filled with the median, z in µm (frames x pixel size if uncalibrated);
+         not a measurement archive.
+    """
+    from . import units
+
+    p = Path(path)
+    is_um = units.is_um(z_unit)
+    info = {"file": p.name, "format": fmt, "pixel_um": um_per_px, "z_unit": units.label(z_unit),
+            "shape": list(height.shape), "valid_fraction": float(np.mean(np.isfinite(height))),
+            "mask": p.with_suffix(".mask.png").name, **(provenance or {})}
+    if fmt == "gsf":
+        fill = write_gwyddion_gsf(p, height, um_per_px, is_um, title)
+        info["invalid_pixels"] = f"filled with the median ({fill:.6g} {'m' if is_um else 'frames'}); see mask"
+    elif fmt == "tif":
+        write_float32_tiff(p, height, um_per_px)
+        info["invalid_pixels"] = "NaN"
+    elif fmt == "stl":
+        z = height if is_um else height * um_per_px
+        n, _ = write_binary_stl(p, z, um_per_px, max_grid_dim=400)
+        info.update(triangles=n, invalid_pixels="filled with the median (display surface)",
+                    note="visualisation mesh, not a measurement archive"
+                    + ("" if is_um else "; z = focus frames x pixel size, not µm"))
+    else:
+        raise ValueError(f"unknown export format {fmt!r}")
+    return [p, write_mask_png(p.with_suffix(".mask.png"), np.isfinite(height)), write_sidecar(p.with_suffix(".json"),
+                                                                                              info)]

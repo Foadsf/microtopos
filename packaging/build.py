@@ -29,7 +29,11 @@ out.mkdir(exist_ok=True)
 if system == "macos":
     target = out / f"{name}.zip"
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(dist / "microtopos.app"), str(target)], check=True)
-    exe = dist / "microtopos.app" / "Contents" / "MacOS" / "microtopos"
+    # test what users download: the app extracted from the published zip, not the build tree
+    unpacked = ROOT / "packaging" / "unzipped"
+    shutil.rmtree(unpacked, ignore_errors=True)
+    subprocess.run(["ditto", "-x", "-k", str(target), str(unpacked)], check=True)
+    exe = unpacked / "microtopos.app" / "Contents" / "MacOS" / "microtopos"
 elif system == "windows":
     target = out / f"{name}.exe"
     shutil.copy2(dist / "microtopos.exe", target)

@@ -35,14 +35,14 @@ jobs:
         shell: bash
         run: |
           uv sync --python 3.12
-          uv run --with "pyinstaller>=6.10" python packaging/build.py | tee build.out
+          uv run --with "pyinstaller==6.22.3" python packaging/build.py | tee build.out
           echo "exe=$(grep '^EXE=' build.out | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
       - name: The executable tests itself (ground-truth checks + offscreen GUI)
         shell: bash
         run: |
           cd "$RUNNER_TEMP"
           "${{ steps.build.outputs.exe }}" --version
-          "${{ steps.build.outputs.exe }}" --selftest --quick --gui
+          "${{ steps.build.outputs.exe }}" --selftest --quick --gui --json "$GITHUB_WORKSPACE/release/selftest-${{ matrix.target }}.json"
       - uses: actions/upload-artifact@v4
         with:
           name: microtopos-${{ matrix.target }}

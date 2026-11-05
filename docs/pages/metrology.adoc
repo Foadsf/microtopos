@@ -50,14 +50,26 @@ Only valid pixels are used throughout. If fewer than 30 % of the pixels have a r
 | Str | – | texture aspect ratio: near 1 isotropic, near 0 strongly directional. Undefined, and not shown, when the autocorrelation does not decay to 0.2 in some direction.
 | Std | ° | texture direction (lay), from the angular power spectrum
 3+| *Other*
-| σ~inst~ | z | repeatability from two sweeps at the same place: std(Δz)/√2
+| σ~inst~ | z | relative shape repeatability from two sweeps at the same place: std(Δz − mean)/√2, with the mean offset and the overlap reported beside it. Computed only when both maps share objective, size, position and a calibrated, signed height scale
 | PSD slope β, fractal dimension | – | log-log slope of the radial power spectrum; D = (8 − β)/2, given only when 2 < β < 4
 | GLCM contrast, homogeneity, correlation | – | Haralick texture of the all-in-focus image, 64 grey levels
 | Grains, area, max Feret, circularity | –, µm², µm | marker-controlled (h-minima) watershed on the all-in-focus image; grains touching the border are excluded
 | Mean lineal intercept, ASTM E112 G | µm, – | Heyn intercept method on the grain boundaries; G = −3.2877 − 6.6439 log~10~(ℓ in mm)
 |===
 
-_z_ is µm after Z calibration, otherwise focus frames. Lengths in µm are *nominal* until the lateral scale is calibrated.
+_z_ is µm when Z is known (simulator, a stated knob travel, or a stored estimate), otherwise relative focus frames. Lengths in µm are *nominal* until the lateral scale is calibrated.
+
+=== When a value is withheld
+
+Every report states the surface operator it used (form removal, S- and L-filter, valid fraction) before the numbers, and each group says why a value shows "—":
+
+* *Height, material-ratio, spatial and spectral* parameters need at least 30 % valid depth pixels.
+* *Sdr* needs heights in µm.
+* *Sal and Str* are withheld when the autocorrelation has too few valid pixel pairs in some direction, for example with patterned or clustered missing pixels. An unsupported lag is unknown, not zero correlation. *Std* is withheld for a flat surface or a spectrum without a dominant direction.
+* *Gaussian filters* are applied only when the cut-off spans at least 4 pixels. Below that, a sampled Gaussian does not have the standard's 50 % transmission: it is 0.89 at 2 px and 0.56 at 3 px, against 0.502 at 4 px. The default λ~s~ (the optical cut-off) is skipped with a note when the pixels are too coarse for it. A value you entered yourself is refused with a warning.
+* *Form removal order* 0 removes the mean only, 1 a plane, 2 a quadratic, 3 a cubic.
+* *Smr1 and Smr2* are where the material-ratio curve crosses the core limits. On a flat plateau (tied heights) this gives the same answer as on a slightly perturbed one.
+* *Texture (GLCM) and grains* come from the all-in-focus image, not from the heights, and are labelled image-based. Watershed regions are not verified metallurgical grains.
 
 NOTE: Grain statistics come from the image, not the height, and depend on how visible the boundaries are: an etched metallographic section works best. Check them with *Overlay grain boundaries* on the All-in-focus tab.
 
@@ -65,6 +77,6 @@ NOTE: Grain statistics come from the image, not the height, and depend on how vi
 
 * *Optical limits.* Lateral resolution is limited by the objective (about 0.61 λ/NA) and by the camera's Bayer sensor and MJPEG compression. Height resolution is a fraction of the depth of field and depends on the texture.
 * *Focus breathing* (magnification changing with focus) is not corrected. The effect is about 1 pixel at the image edges in far-defocused frames.
-* *Manual Z.* Heights scale with the knob speed until calibrated, and an uneven speed distorts them. Shapes are right; the scale is what calibration fixes.
+* *Manual Z.* A hand sweep gives relative focus progression: an uneven knob speed distorts it, a different speed gives a different scale, and its direction is unknown unless you state it, so the relief can be inverted. A knob travel stated for a sweep calibrates that sweep only, assuming an even speed. Only a measured Z (an encoder or motorised drive) removes this limit.
 * *Textureless or mirror-like areas* give no focus signal and are left empty. A light etch, oblique lighting or a higher-NA objective helps.
 * *Accuracy on real samples* has not yet been validated against a certified reference. The figures on the xref:development.adoc#verification[verification] list come from simulation ground truth and from real camera texture with a known synthetic relief.

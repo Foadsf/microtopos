@@ -12,6 +12,12 @@ def _box(a: np.ndarray, win: int) -> np.ndarray:
     return cv2.boxFilter(a, cv2.CV_32F, (win, win), borderType=cv2.BORDER_REFLECT)
 
 
+def _shift_left(img: np.ndarray, k: int) -> np.ndarray:
+    """img(x + k) with the right border reflected (np.roll would wrap the left edge onto the right)."""
+    padded = cv2.copyMakeBorder(img, 0, 0, 0, k, cv2.BORDER_REFLECT)
+    return padded[:, k:]
+
+
 def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, psf_sigma_px: float = 1.0) -> np.ndarray:
     """Local focus energy, averaged over a window x window box (no subsampling, no spatial offset)."""
     img = img.astype(np.float32, copy=False)
@@ -29,10 +35,10 @@ def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, 
         ly = np.abs(cv2.filter2D(img, cv2.CV_32F, k.T, borderType=cv2.BORDER_REFLECT))
         return _box(lx + ly, window)
     if measure in ("Vollath F4", "Vollath F5"):
-        i1 = np.roll(img, -1, axis=1)
+        i1 = _shift_left(img, 1)
         p1 = _box(img * i1, window)
         if measure == "Vollath F4":
-            i2 = np.roll(img, -2, axis=1)
+            i2 = _shift_left(img, 2)
             return np.maximum(p1 - _box(img * i2, window), 0.0)
         # F5 = sum I(x)I(x+1) - N * mean(I)^2  (local version)
         m = _box(img, window)

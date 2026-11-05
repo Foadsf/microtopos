@@ -34,13 +34,17 @@ TIP: Place the line along the ruling as precisely as you can: the scale comes st
 
 == Z scale (step 5)
 
-The fine-focus knob has no encoder, so the program cannot know how far the stage moved between frames. Heights stay in *focus frames* until you tell it.
+The fine-focus knob has no encoder, so the program cannot know how far, or which way, the focal plane moved between frames. A hand sweep's heights are therefore *relative focus progression*: the number of camera frames of knob movement, assuming an even speed while the knob turns. Two things turn them into signed micrometres, and both belong to *one particular sweep*:
 
 image::step-zscale.png[Step 5: Z scale,role=narrow]
 
-From last sweep's knob travel (recommended):: Most fine-focus knobs carry a scale, often 1 or 2 µm per division. Make a sweep at an *even speed* and note the scale reading at its start and end. Then click the button and enter the travel in µm. The program divides it by the frames used in that sweep: an even speed is assumed, so keep using the same speed in later sweeps.
-Apply DOF ruler estimate (experimental):: Estimates µm per frame by comparing the measured width of the focus curves with the objective's theoretical depth of field. It needs no knob scale but is only indicative: in simulation it was off by −34 % to +13 %. It is labelled experimental wherever it is used.
-Clear:: back to focus-frame units.
+Sweep direction:: which way the focal plane moved during the sweep: *Up* (toward the objective) or *Down*. With *Unknown* the relief may be upside down, and the result says so. Set it here once if you always turn the knob the same way; it is used for new sweeps.
+Set Z of the selected result…:: Most fine-focus knobs carry a scale, often 1 or 2 µm per division. Note the reading at the start and end of a sweep. Then select that sweep's result and enter the travel in µm and the direction. Only that result becomes *CALIBRATED*. The spacing comes from the camera's own frame numbers, so thinning a long sweep or dropping frames under load does not change the scale. Pauses add no travel.
+Keep as an estimate:: The same dialog can store the µm-per-frame value for later sweeps with that objective. Those sweeps are labelled *ESTIMATED*, not calibrated, because a different knob speed gives a different scale.
+Apply DOF ruler estimate (experimental):: Estimates µm per frame by comparing the measured width of the focus curves with the objective's theoretical depth of field. It needs no knob scale but is only indicative: in simulation it was off by −34 % to +13 %. It is stored as an *ESTIMATED* scale, never as a calibration.
+Clear the stored estimate:: new sweeps go back to relative focus-frame units.
+
+NOTE: A calibration always goes to the objective the sweep was made with, even if you have switched objectives since.
 
 == What the chips mean
 
@@ -48,8 +52,9 @@ Clear:: back to focus-frame units.
 |===
 | Chip | Meaning
 | *Nominal* (yellow) | lateral scale from the objective's nominal magnification; lengths are indicative
-| *Calibrated* (green) | lateral scale or Z scale from your own calibration
-| *Frames* (yellow) | heights in focus-frame units, not µm
+| *Calibrated* (green) | lateral scale from your stage micrometer, or Z stated for that sweep
+| *Estimate* (yellow) | a stored Z scale carried over to new sweeps (same knob speed assumed) or the DOF ruler
+| *Frames* (yellow) | heights in relative focus-frame units, not µm
 | *Optional* / *Partial* / *Done* | dark/flat: none, one of the two, or both recorded for the current objective, capture size and exposure
 |===
 

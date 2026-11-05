@@ -88,12 +88,12 @@ Pan to map, sweep focus to measure. Height maps stay pinned to their place in th
 --
 .Every number says where it comes from
 ****
-Uncalibrated lengths are labelled *NOMINAL*, uncalibrated heights are in *focus frames*, and simulator results are labelled *SIMULATED*. Pixels without a reliable depth are left empty instead of guessed.
+Uncalibrated lengths are labelled *NOMINAL*. Uncalibrated heights are relative *focus frames*, and so is a sweep whose direction is unknown. A carried-over Z scale is *ESTIMATED*, and simulator results are *SIMULATED*. Pixels without a reliable depth are left empty instead of guessed, and exports carry a validity mask.
 ****
 
 .Verified against ground truth
 ****
-A built-in self-test (`microtopos-selftest`, 101 checks) runs the whole pipeline on randomised synthetic specimens with known heights. A quick version runs on every release build on every platform. link:development.html#verification[See the measured numbers].
+A built-in self-test (`microtopos-selftest`, 130 checks) runs the whole pipeline on randomised synthetic specimens with known heights. A quick version runs on every release build on every platform. link:development.html#verification[See the measured numbers].
 ****
 --
 

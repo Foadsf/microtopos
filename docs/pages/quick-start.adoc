@@ -38,7 +38,7 @@ image::tab-height.png[The height map of the synthetic specimen with its colour s
 
 Hover over the map to read the height under the cursor. Drag the orange line to see a profile. The *Report* tab lists the roughness parameters, and *3D* shows the surface in perspective.
 
-TIP: The simulator's heights are simulation truth, so the report labels them *SIMULATED*. With a real camera, heights stay in *focus frames* until you calibrate Z (xref:tutorial-calibration.adoc[calibration tutorial]).
+TIP: The simulator's heights are simulation truth, so the report labels them *SIMULATED*. With a real camera, a hand sweep's heights are relative focus frames until you state that sweep's knob travel and direction with *Set Z…* (xref:tutorial-calibration.adoc#z-scale-step-5[calibration tutorial]).
 
 == 3. Stitch a mosaic
 

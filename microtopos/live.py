@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 
 import cv2
@@ -18,7 +19,7 @@ from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, ra
 from .camera import FrameSource
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
-from .mosaic import Mosaic
+from .mosaic import Mosaic, height_partitions, preview_factor, render_tiles
 from .optics import Objective
 
 PREVIEW_W = 640
@@ -36,6 +37,35 @@ class SweepCapture:
     shape: tuple[int, int]
     simulated: bool
     completeness: float  # fraction of 6x6 field tiles whose focus peak lies inside the sweep (not at an end)
+    seqs: list = field(default_factory=list)  # source sequence number of every frame (gaps = frames not kept)
+    stamps: list = field(default_factory=list)  # capture time of every frame (s)
+    source_id: str = ""
+    source_generation: int = 0
+    mosaic_generation: int = 0
+    exposure: float | None = None
+    linearize: bool = False
+    preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
+
+
+class SweepBuffer:
+    """Frames of a sweep in progress with their z, tiles, sequence numbers and times, thinned together."""
+
+    def __init__(self):
+        self.frames, self.z, self.tiles, self.seqs, self.stamps = [], [], [], [], []
+
+    def append(self, frame, z, tiles, seq, ts):
+        self.frames.append(frame)
+        self.z.append(z)
+        self.tiles.append(tiles)
+        self.seqs.append(seq)
+        self.stamps.append(ts)
+
+    def thin(self):
+        for name in ("frames", "z", "tiles", "seqs", "stamps"):
+            setattr(self, name, getattr(self, name)[::2])
+
+    def __len__(self):
+        return len(self.frames)
 
 
 @dataclass
@@ -60,6 +90,9 @@ class Snapshot:
     mosaic_xy: tuple = (0.0, 0.0)  # live camera position in mosaic pixels (preview scale)
     preview_shape: tuple = (0, 0)
     sweep_completeness: float = 0.0  # live: fraction of the field that has gone blurry -> sharp -> blurry
+    engine_error: str | None = None  # last processing failure (the engine keeps running)
+    source_generation: int = 0
+    mosaic_generation: int = 0
 
 
 class LiveEngine:
@@ -73,22 +106,26 @@ class LiveEngine:
         self.linearize = False
         self.on_sweep = None  # callback(SweepCapture)
         self.on_objective_hint = None  # callback(ratio)
+        self.sync_callbacks = False  # True: call on_sweep in the engine thread (deterministic batch processing)
         self._lock = threading.Lock()
         self._snap = Snapshot()
         self.verbose = False  # also print the event log to stdout (--verbose)
         self._running = False
         self._thread = None
         self._last_seq = -1
+        self._last_src = None
+        self.source_generation = 0  # +1 whenever the source changes: older frames and requests are stale
+        self.mosaic_generation = 0  # +1 whenever the mosaic restarts: late height maps are not pinned into it
+        self.error: str | None = None
+        self.errors = 0
         self._preroll = collections.deque(maxlen=PREROLL)
-        self._sweep: list = []
-        self._sweep_z: list = []
+        self._buf = SweepBuffer()
         self._sweep_pose = (0.0, 0.0)
         self._n_preroll = 0
-        self._sweep_tiles: list = []
         self._stride, self._zcount = 1, 0
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
         self._pending_patches: list = []
-        self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0)), None, 0, 0)
+        self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0), 1), [], 0, 0)
         self._view_version = -1
         self._view_t = 0.0
         self._areas_seen = 1
@@ -96,7 +133,8 @@ class LiveEngine:
         self._dwell = collections.deque(maxlen=16)
         self._avg = collections.deque(maxlen=8)
         self._bhist = collections.deque(maxlen=200)
-        self._calib_req = None  # (kind, n, frames)
+        self._calib_req = None
+        self.calib_error: str | None = None
         self.events: collections.deque = collections.deque(maxlen=500)  # (seq, text) for diagnostics
         self._last_state = None
         self._t0 = time.perf_counter()
@@ -110,22 +148,30 @@ class LiveEngine:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> bool:
+        """Stop the engine thread; True when it has really stopped."""
         self._running = False
         if self._thread:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=5)
+            return not self._thread.is_alive()
+        return True
 
     def set_source(self, src: FrameSource | None):
         with self._lock:
             self.source = src
+            self.source_generation += 1
+            self._last_seq, self._last_src = -1, None
+            self._cancel_calibration("the source changed")
             self._reset_motion()
             self.mosaic.reset()  # a different source shows a different specimen or scale
+            self.mosaic_generation += 1
             self.mosaic_version += 1
 
     def set_objective(self, obj: Objective):
         with self._lock:
             self.objective = obj
             self._corrector_key = None
+            self._cancel_calibration("the objective changed")
             self._reset_motion()
 
     def set_override(self, mode: Override):
@@ -136,28 +182,37 @@ class LiveEngine:
         with self._lock:
             self.mosaic.reset()
             self._areas_seen = 1
+            self._pending_patches.clear()
+            self.mosaic_generation += 1
             self.mosaic_version += 1
 
     def _reset_motion(self):
         self.sm.reset()
         self._held = None
         self._preroll.clear()
-        self._sweep_tiles = []
+        self._buf = SweepBuffer()
         self._n_preroll = 0
-        self._sweep.clear()
-        self._sweep_z.clear()
         self._cov = None
         self._dwell.clear()
         self._avg.clear()
 
     def request_calibration(self, kind: str, n: int = 24):
-        """Average the next n raw frames into a dark or flat frame for the current objective and exposure."""
+        """Average the next n raw frames into a dark or flat frame. The source, objective, exposure and gamma
+        setting are frozen now; if any changes before the average is complete, the request is cancelled."""
         with self._lock:
-            self._calib_req = [kind, n, []]
+            self.calib_error = None
+            self._calib_req = {"kind": kind, "n": n, "frames": [], "gen": self.source_generation,
+                               "objective": self.objective.name, "exposure": self.exposure,
+                               "linearize": self.linearize, "shape": None}
+
+    def _cancel_calibration(self, why: str):
+        if self._calib_req is not None:
+            self.calib_error = f"{self._calib_req['kind'].capitalize()} frame cancelled: {why}."
+            self._calib_req = None
 
     def calibration_progress(self):
         c = self._calib_req
-        return None if c is None else (c[0], len(c[2]), c[1])
+        return None if c is None else (c["kind"], len(c["frames"]), c["n"])
 
     def dwell_frames(self) -> list[np.ndarray]:
         with self._lock:
@@ -166,12 +221,17 @@ class LiveEngine:
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
 
-    def _emit(self, frames, zs, tiles, pose, n_pre, shape, simulated):
-        if len(frames) - n_pre < 8 or not self.on_sweep:
+    def _emit(self, buf: SweepBuffer, pose, n_pre, shape, simulated, prev_shape):
+        if len(buf) - n_pre < 8 or not self.on_sweep:
             return
-        z = None if any(v is None for v in zs) else np.array(zs)
-        cap = SweepCapture(list(frames), z, pose, self.objective.name, shape, simulated, _completeness(tiles))
-        threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
+        z = None if any(v is None for v in buf.z) else np.array(buf.z)
+        cap = SweepCapture(list(buf.frames), z, pose, self.objective.name, shape, simulated, _completeness(buf.tiles),
+                           list(buf.seqs), list(buf.stamps), getattr(self.source, "source_id", ""),
+                           self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape)
+        if self.sync_callbacks:
+            self.on_sweep(cap)
+        else:
+            threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
 
     def log(self, text: str, seq: int = 0):
         line = f"{time.perf_counter() - self._t0:7.1f}s #{seq:<5d} {text}"
@@ -180,11 +240,26 @@ class LiveEngine:
             print(line, flush=True)
 
     def mosaic_image(self):
-        """Latest mosaic rendering, prepared by the engine thread: ((image, origin), height_mosaic, n_kf, n_patch)."""
+        """Latest mosaic rendering, prepared by the engine thread:
+        ((preview image, origin, reduction d), height partitions, n_keyframes, n_patches)."""
         return self._mosaic_view
 
-    def add_height_patch(self, pose, edf_preview, height_preview, z_unit):
-        self._pending_patches.append((pose, edf_preview, height_preview, z_unit))  # applied by the engine thread
+    def mosaic_full(self):
+        """Full-resolution mosaic and its height partitions, e.g. for saving (takes the engine lock briefly)."""
+        with self._lock:
+            tiles, tile, patches = dict(self.mosaic.tiles), self.mosaic.tile, list(self.mosaic.patches)
+        img, origin, _ = render_tiles(tiles, tile, 1)
+        return (img, origin), height_partitions(patches)
+
+    def add_height_patch(self, pose, edf_preview, height_preview, z_unit, z_key=None, rid="",
+                         mosaic_generation: int | None = None):
+        """Queue a height map for the mosaic. It is applied by the engine thread only if the mosaic is still the
+        one the sweep was captured in (same mosaic generation); a reset or source change makes it stale."""
+        self._pending_patches.append(("add", pose, edf_preview, height_preview, z_unit, z_key, rid,
+                                      self.mosaic_generation if mosaic_generation is None else mosaic_generation))
+
+    def remove_height_patch(self, rid: str):
+        self._pending_patches.append(("remove", rid))
 
     # ------------------------------------------------------------------ loop
     def _corrector_for(self, shape):
@@ -200,29 +275,88 @@ class LiveEngine:
         t0, n = time.perf_counter(), 0
         fps_proc = 0.0
         while self._running:
-            src = self.source
+            src, gen = self.source, self.source_generation
             item = src.latest() if src else None
-            if item is None or item[2] == self._last_seq:
+            if item is None or (src is self._last_src and item[2] == self._last_seq):
                 time.sleep(0.004)
                 continue
             bgr, ts, seq, truth = item
-            self._last_seq = seq
+            render = None
             with self._lock:
-                self._process(bgr, truth, src.fps, fps_proc, seq)
+                if gen != self.source_generation or src is not self.source:  # switched while we fetched
+                    continue
+                self._last_src, self._last_seq = src, seq
+                try:
+                    render = self._process(bgr, truth, src.fps, fps_proc, seq, ts)
+                except Exception as e:  # noqa: BLE001 - one bad frame must not kill the engine
+                    self.errors += 1
+                    self.error = f"{type(e).__name__}: {e}"
+                    self.log(f"processing error ({self.errors}): {self.error}", seq)
+                    if self.verbose:
+                        traceback.print_exc()
+                    self._snap = Snapshot(**{**self._snap.__dict__, "engine_error": self.error})
+            src.consumed(seq)
+            if render is not None:  # render outside the lock: controls never wait for it
+                self._render(*render)
             n += 1
             if time.perf_counter() - t0 > 1:
                 fps_proc, t0, n = n / (time.perf_counter() - t0), time.perf_counter(), 0
 
-    def _process(self, bgr, truth, fps_in, fps_proc, seq):
+    def process_frame(self, bgr, ts: float, seq: int, truth=None, render: bool = False) -> None:
+        """Synchronous processing of one frame (batch mode, tests). Exceptions propagate."""
+        with self._lock:
+            req = self._process(bgr, truth, 0.0, 0.0, seq, ts)
+            self._last_seq = seq
+        if render and req is not None:
+            self._render(*req)
+
+    def flush(self) -> None:
+        """End of input (batch mode): deliver a held or still-running sweep instead of dropping it."""
+        with self._lock:
+            if self._held is not None:
+                held, self._held = self._held, None
+                self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
+            elif self.sm.state == State.Z_SWEEP and len(self._buf) and _completeness(self._buf.tiles) >= 0.5:
+                h, w = self._buf.frames[0].shape
+                self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), False, self._snap.preview_shape)
+                self._buf = SweepBuffer()
+
+    def _render(self, tiles, tile, patches, version, nkf):
+        d = preview_factor(tiles, tile, 1600)
+        self._mosaic_view = (render_tiles(tiles, tile, d), height_partitions(patches), nkf, len(patches))
+        self._view_version = version
+
+    def _process(self, bgr, truth, fps_in, fps_proc, seq, ts):
         raw = bgr_to_luma(bgr, self.linearize)
-        if self._calib_req is not None:
-            kind, need, acc = self._calib_req
-            acc.append(raw)
-            if len(acc) >= need:
-                cal = self.store.get(self.objective)
-                (cal.darks if kind == "dark" else cal.flats)[radiometric_key(raw.shape, self.exposure)] = np.mean(acc, 0)
-                self.store.save()
-                self._calib_req = None
+        if raw.shape != getattr(self, "_frame_shape", raw.shape):
+            # a camera mode change (or reconnect at another size): motion, sweep and mosaic belong to the old mode
+            self.log(f"frame size changed {self._frame_shape[1]}x{self._frame_shape[0]} -> "
+                     f"{raw.shape[1]}x{raw.shape[0]}: motion tracking and the mosaic restart", seq)
+            self._reset_motion()
+            self.mosaic.reset()
+            self.mosaic_generation += 1
+            self.mosaic_version += 1
+        self._frame_shape = raw.shape
+        req = self._calib_req
+        if req is not None:
+            if req["shape"] is None:
+                req["shape"] = raw.shape
+            if (req["gen"] != self.source_generation or req["objective"] != self.objective.name
+                    or req["exposure"] != self.exposure or req["linearize"] != self.linearize
+                    or req["shape"] != raw.shape):
+                self._cancel_calibration("the camera mode, exposure or objective changed while recording")
+            else:
+                req["frames"].append(raw)
+                if len(req["frames"]) >= req["n"]:
+                    cal = self.store.get(req["objective"])
+                    avg = np.mean(np.stack(req["frames"]).astype(np.float64), 0).astype(np.float32)
+                    with self.store._lock:
+                        (cal.darks if req["kind"] == "dark" else cal.flats)[radiometric_key(raw.shape,
+                                                                                            req["exposure"])] = avg
+                        self.store.touch(req["objective"])
+                        self.store.save()
+                    self._corrector_key = None
+                    self._calib_req = None
         corr = self._corrector_for(raw.shape)(raw)
         sat = float(np.mean(raw >= 250))
         full_u8 = np.clip(corr + 0.5, 0, 255).astype(np.uint8)
@@ -231,69 +365,74 @@ class LiveEngine:
         prev = cv2.resize(corr, (pw, int(round(h * pw / w))), interpolation=cv2.INTER_AREA) if pw < w else corr
 
         while self._pending_patches:
-            pose, e, hp, zu = self._pending_patches.pop(0)
-            self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu)
+            op = self._pending_patches.pop(0)
+            if op[0] == "remove":
+                if self.mosaic.remove_patch(op[1]):
+                    self.mosaic_version += 1
+                continue
+            _, pose, e, hp, zu, zkey, rid, mgen = op
+            if mgen != self.mosaic_generation:
+                self.log("height map not pinned: the mosaic was restarted after its sweep", seq)
+                continue
+            self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu, zkey, rid)
             self.mosaic_version += 1
         um = self.store.get(self.objective).um_per_px(prev.shape[1])
         fm = focus_map(prev, "DoG band-pass", 9, self.objective.psf_sigma_px(um))
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
         if self.sm.state == State.Z_SWEEP:
-            self.sm.sweep_complete = _completeness(self._sweep_tiles + [tiles]) >= 0.5
+            self.sm.sweep_complete = _completeness(self._buf.tiles + [tiles]) >= 0.5
         state, feat, events = self.sm.update(prev)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
             self._last_state = state
         self._bhist.append(feat.brenner)
         z_true = getattr(truth, "focus_z_um", None)
+        simulated = truth is not None
         for ev in events:
             if ev.kind == "sweep_started":
                 if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it
-                    self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll = self._held[:5]
+                    self._buf, self._sweep_pose, self._n_preroll = self._held[:3]
                     self._held = None
                     self.log("sweep resumed (merged with the previous incomplete part)", seq)
                 else:
-                    self._sweep = [f for f, _, _ in self._preroll]
-                    self._sweep_z = [z for _, z, _ in self._preroll]
-                    self._sweep_tiles = [t for _, _, t in self._preroll]  # the blurry start is part of the sweep
-                    self._n_preroll = len(self._sweep)
+                    self._buf = SweepBuffer()
+                    for item in self._preroll:  # the blurry start is part of the sweep
+                        self._buf.append(*item)
+                    self._n_preroll = len(self._buf)
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
                     self._cov = None
                 self._stride, self._zcount = 1, 0
             elif ev.kind == "sweep_ended":
-                comp = _completeness(self._sweep_tiles)
-                self.log(f"sweep ended: {len(self._sweep)} frames ({self._n_preroll} pre-roll), completeness "
+                comp = _completeness(self._buf.tiles)
+                self.log(f"sweep ended: {len(self._buf)} frames ({self._n_preroll} pre-roll), completeness "
                          f"{comp:.2f}{', ABORTED by motion' if ev.detail.get('aborted') else ''}", seq)
                 if ev.detail.get("aborted"):
                     self._held = None
                 elif comp < 0.5:  # incomplete: hold it for a few seconds in case focusing resumes
-                    self._held = (self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
-                                  seq + HOLD_FRAMES, (h, w), truth is not None)
+                    self._held = (self._buf, self._sweep_pose, self._n_preroll, seq + HOLD_FRAMES, (h, w), simulated,
+                                  prev.shape)
                 else:
-                    self._emit(self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
-                               (h, w), truth is not None)
-                self._sweep, self._sweep_z = [], []
+                    self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), simulated, prev.shape)
+                self._buf = SweepBuffer()
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
-        self._preroll.append((full_u8, z_true, tiles))
-        if self._held is not None and (seq > self._held[5] or state == State.PAN):
+        self._preroll.append((full_u8, z_true, tiles, seq, ts))
+        if self._held is not None and (seq > self._held[3] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
-                self._emit(*held[:5], held[6], held[7])
+                self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
 
         in_focus = None
         if state == State.Z_SWEEP:
             if self._zcount % self._stride == 0:
-                if len(self._sweep) >= MAX_SWEEP_FRAMES:  # a long, slow sweep: thin it 2:1 instead of cutting it
-                    self._sweep, self._sweep_z, self._sweep_tiles = (self._sweep[::2], self._sweep_z[::2],
-                                                                     self._sweep_tiles[::2])
+                if len(self._buf) >= MAX_SWEEP_FRAMES:  # a long, slow sweep: thin it 2:1 instead of cutting it
+                    self._buf.thin()  # sequence numbers are thinned too, so z spacing stays in source frames
                     self._n_preroll = (self._n_preroll + 1) // 2
                     self._stride *= 2
-                self._sweep.append(full_u8)
-                self._sweep_z.append(z_true)
-                self._sweep_tiles.append(tiles)
+                self._buf.append(full_u8, z_true, tiles, seq, ts)
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov
@@ -307,12 +446,13 @@ class LiveEngine:
                 self.log("mosaic tracking LOST" if self.mosaic.lost else "mosaic tracking recovered", seq)
             if added:
                 self.mosaic_version += 1
+        render = None
         now = time.perf_counter()
         if self.mosaic_version != self._view_version and now - self._view_t > 0.5:
-            # render the mosaic here (not in the GUI thread), at most twice a second
-            self._view_version, self._view_t = self.mosaic_version, now
-            self._mosaic_view = (self.mosaic.image(), self.mosaic.height_mosaic(), len(self.mosaic.keyframes),
-                                 len(self.mosaic.patches))
+            # rendering happens after the lock is released (at most twice a second, at display size)
+            self._view_t = now
+            render = (dict(self.mosaic.tiles), self.mosaic.tile, list(self.mosaic.patches), self.mosaic_version,
+                      len(self.mosaic.keyframes))
         if state == State.DWELL:
             self._dwell.append(full_u8)
             self._avg.append(prev)
@@ -324,11 +464,14 @@ class LiveEngine:
         self._snap = Snapshot(
             preview=display.astype(np.float32), state=state, fps_in=fps_in, fps_proc=fps_proc, shift_px=feat.shift_px,
             response=feat.response, z_score=feat.z_score, brenner_hist=list(self._bhist), saturation=sat,
-            sweep_frames=len(self._sweep), coverage=self._cov, in_focus=in_focus, frame_shape=(h, w),
+            sweep_frames=len(self._buf), coverage=self._cov, in_focus=in_focus, frame_shape=(h, w),
             mosaic_version=self._view_version, mosaic_lost=self.mosaic.lost, dwell_frames=len(self._dwell), seq=seq,
             mosaic_xy=(self.mosaic.x, self.mosaic.y), preview_shape=prev.shape,
-            sweep_completeness=_completeness(self._sweep_tiles) if state == State.Z_SWEEP and seq % 4 == 0
-            else (self._snap.sweep_completeness if state == State.Z_SWEEP else 0.0))
+            sweep_completeness=_completeness(self._buf.tiles) if state == State.Z_SWEEP and seq % 4 == 0
+            else (self._snap.sweep_completeness if state == State.Z_SWEEP else 0.0),
+            engine_error=self.error, source_generation=self.source_generation,
+            mosaic_generation=self.mosaic_generation)
+        return render
 
 
 def _completeness(tiles: list) -> float:

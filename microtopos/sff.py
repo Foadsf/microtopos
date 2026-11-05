@@ -263,20 +263,33 @@ class EDFAccumulator:
 
 def softmax_weights(fv: np.ndarray, temperature: float = 0.25) -> np.ndarray:
     """Per-pixel softmax over log focus energy; temperature is in natural-log units."""
-    lf = np.log(np.maximum(fv, 1e-12))
-    lf = lf - lf.max(axis=0, keepdims=True)
-    e = np.exp(lf / temperature)
-    return (e / e.sum(axis=0, keepdims=True)).astype(np.float32)
+    return softmax_weights_inplace(np.array(fv, np.float32, copy=True), temperature)
+
+
+def softmax_weights_inplace(fv: np.ndarray, temperature: float = 0.25) -> np.ndarray:
+    """Same as softmax_weights, but overwrites the float32 volume fv (no extra full-size volume)."""
+    if fv.dtype != np.float32:
+        raise TypeError("softmax_weights_inplace needs a float32 volume")
+    np.maximum(fv, 1e-12, out=fv)
+    np.log(fv, out=fv)
+    peak = fv.max(axis=0)
+    fv -= peak[None]
+    fv /= temperature
+    np.exp(fv, out=fv)
+    fv /= fv.sum(axis=0, keepdims=True)
+    return fv
 
 
 # ---------------------------------------------------------------------------------------------- DOF ruler
 
 
-def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.ndarray) -> float:
+def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.ndarray) -> float | None:
     """FWHM (in um of defocus) of the focus measure's response for this objective and this specimen.
 
     The all-in-focus image is blurred with the optical defocus model at known defocus steps, so the
     ruler has no hand-tuned factor. Assumes the all-in-focus image is close to the true in-focus texture.
+    Returns None when the response carries no focus information (zero or non-finite energy, or a half-maximum
+    that is not bracketed inside the search range): a blank crop must not yield the search width.
     """
     h, w = texture.shape
     c = min(h, w, 256) // 2
@@ -289,7 +302,12 @@ def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.nda
         s = float(np.sqrt(max(objective.defocus_sigma_um(d) ** 2 - objective.airy_sigma_um**2, 0))) / um_per_px
         img = cv2.GaussianBlur(tex, (0, 0), s) if s > 0.05 else tex
         resp.append(float(np.mean(measure_fn(img)[20:-20, 20:-20])))
-    lr = np.log(np.array(resp))
+    resp = np.array(resp)
+    if not np.all(np.isfinite(resp)) or resp.max() <= 1e-9:
+        return None
+    lr = np.log(np.maximum(resp, 1e-30))
     half = lr.max() - np.log(2)
-    above = dz[lr >= half]
-    return float(above.max() - above.min())
+    above = np.nonzero(lr >= half)[0]
+    if above.size == 0 or above[0] == 0 or above[-1] == len(dz) - 1:  # not bracketed: no defined width
+        return None
+    return float(dz[above[-1]] - dz[above[0]])

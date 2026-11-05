@@ -5,9 +5,11 @@ This is the reference for every control. For a guided introduction, see the xref
 
 image::overview-dark.png[The main window: checklist (left), coach line, tabs and views (middle), telemetry (right)]
 
-== Header and coach line
+== Header, coach line and result line
 
-The header chips summarise the state at a glance:
+The header row describes the *live capture*: the camera or replay, the motion state, and the calibration of the objective selected *now*. The *result line* below the coach describes the *selected height map*: its own objective, X-Y and Z status, valid area and warnings. The two can differ, for example when you look at a 40× result while the 10× objective is in use. Each result keeps its own provenance.
+
+The header chips summarise the capture at a glance:
 
 [cols="1,3",options="header"]
 |===
@@ -16,11 +18,14 @@ The header chips summarise the state at a glance:
 | `● REC` | raw camera frames are being recorded
 | source | the camera, the recording being replayed, or `SIMULATOR`
 | `XY …` | lateral scale in µm per pixel and whether it is NOMINAL or CALIBRATED
-| `Z …` | height unit: `FRAMES` until Z is calibrated
+| `Z …` | what new sweeps will get: `FRAMES` (relative), or `EST` with the stored µm-per-frame estimate
 | `DARK/FLAT` | radiometric correction state for the current setting
 | `CLIPPING` | more than 1 % of the pixels are saturated
 | fps | frames per second received from the camera and processed
+| ◧ ◨ | show or hide the checklist and telemetry panels; *Reset layout* restores them
 |===
+
+The result line shows the selected map's label, objective, `XY` status, `Z` status (`CALIBRATED`, `ESTIMATED`, `NOMINAL` or `SIMULATED`, with the unit and whether the sweep direction is known), the valid fraction and the number of warnings. *Set Z…* states the knob travel and direction of that sweep; *View height* opens the Height tab. The window fits 1280×720 with both panels; hide them for a bigger image.
 
 The *coach line* under the header always describes the current situation and the next useful action. It changes with the state, for example during a sweep, after an ignored sweep, when tracking is lost or when you pan too fast. If you are unsure what to do, read it first.
 
@@ -59,7 +64,11 @@ Calibrates µm per pixel with the blue line on a stage micrometer. See xref:tuto
 
 === 5. Z scale
 
-Sets µm per focus frame from the knob's travel or, experimentally, from the depth of field. See xref:tutorial-calibration.adoc#z-scale-step-5[calibration].
+Sweep direction:: Up, Down or Unknown, for new sweeps. Unknown keeps the relief's sign undetermined, and results say so.
+Set Z of the selected result…:: knob travel (µm) and direction of *that* sweep; calibrates that result only. It can also keep the µm-per-frame value as an estimate for later sweeps with the same objective.
+DOF ruler (experimental):: stores a model estimate of µm per frame.
+
+See xref:tutorial-calibration.adoc#z-scale-step-5[calibration] for what each status means.
 
 === 6. Inspect
 
@@ -67,23 +76,23 @@ image::step-inspect.png[Step 6,role=narrow]
 
 Mode:: *Auto* detects pans and sweeps; *Pan* and *Z capture* force a state; *Pause* stops detection.
 Focus measure:: *DoG band-pass* (default, robust to noise); Tenengrad, SML, Vollath F4 and F5 for comparison.
-Form removal order:: polynomial order removed before roughness: 1 = tilt, 2 = curvature.
-S-filter λs / L-filter λc:: the ISO 16610-61 Gaussian filter cut-offs in µm. The S-filter removes noise below λs; the optional L-filter removes waviness above λc.
+Form removal order:: polynomial removed before roughness: 0 = mean only, 1 = plane (tilt), 2 = quadratic, 3 = cubic.
+S-filter λs / L-filter λc:: the ISO 16610-61 Gaussian filter cut-offs in µm. The S-filter removes noise below λs; the optional L-filter removes waviness above λc. A cut-off shorter than 4 pixels is not applied, and the report says so.
 Start Z capture:: (kbd:[Space]) starts and stops a manual sweep capture.
 Repeat sweep here:: the next sweep at the same place is compared with the last for repeatability, σ~inst~.
-Recompute metrology:: recomputes the report with the current filter settings without a new sweep.
-Super-resolve current view:: experimental: drizzles several still frames with sub-pixel shifts into a sharper image.
+Recompute metrology:: recomputes the report with the current filter settings without a new sweep (in the background).
+Super-resolve current view:: experimental: drizzles still frames with sub-pixel shifts onto a 2× finer grid (4× the pixels). Frames that do not register reliably are left out. It refuses when the frames have too little sub-pixel motion between them to add information.
 
 == The views (middle)
 
 The tool bar of each view sits above the image. Every 2D view has µm axes; hover for the value under the cursor, scroll to zoom, drag to pan, and click the small *A* button in the corner (or right-click › *View All*) to show everything again.
 
-Live:: the camera preview. *Outline in-focus regions* marks the areas that are currently at their sharpest during a sweep. *Show clipped pixels* stripes saturated areas in magenta. *Record raw stream* saves the camera's exact MJPEG frames for replay with `--replay`.
-Mosaic:: the stitched map, with the camera box. *Image*, *Image + height overlay* or *Height only*; opacity slider; *Export height mosaic*; *Reset mosaic* (kbd:[R]).
+Live:: the camera preview. *Outline in-focus regions* marks the areas that are currently at their sharpest during a sweep. *Show clipped pixels* stripes saturated areas in magenta. *Record raw stream* saves every frame for replay with `--replay`: the camera's exact MJPEG bytes, or lossless PNG when the camera only delivers decoded frames. A full disk or a write error stops the recording with a message.
+Mosaic:: the stitched map, with the camera box. *Image*, *Image + height overlay* or *Height only*; opacity slider; *Export height mosaic*; *Reset mosaic* (kbd:[R]). Height maps are only levelled and blended with maps of the same quantity: calibrated µm with calibrated µm. A map in relative frames, or with an unknown direction, keeps its own colour scale and is never blended. The legend says how many groups there are. A height map that finishes after the mosaic was reset is not pinned into the new mosaic. Very large mosaics are drawn at a reduced scale, which the status line shows.
 All-in-focus:: the extended-depth-of-field image at full resolution; *Overlay grain boundaries*.
-Height:: filtered height, raw height or confidence; history of the last 10 maps; profile line and plot.
-3D:: the surface in perspective; *Z exaggeration* and colour map (viridis, cividis, inferno, plasma, magma, turbo).
-Report:: parameters, warnings and provenance (kbd:[F1] opens it).
+Height:: filtered height, raw height or confidence; history of the last 10 maps; *Lock colour range* keeps one scale while you compare maps; profile line and plot. The profile values are unfiltered and labelled with their unit; in the confidence view the line shows confidence only.
+3D:: the surface in perspective; *Z exaggeration* (shown on the status line) and colour map (viridis, cividis, inferno, plasma, magma, turbo). Pixels without a depth are holes, not a flat fill. The view is kept when you change the colours.
+Report:: what the numbers are first (calibration and direction status, warnings, the surface operator), then height, material-ratio, spatial, repeatability and image-based groups. A withheld value says why. Provenance comes last (kbd:[F1] opens it).
 
 image::tab-edf-grains.png[All-in-focus image with grain boundaries]
 
@@ -97,7 +106,7 @@ Sharpness:: the image sharpness over time. A sweep shows as a rise and fall.
 Focus sweep coverage:: per pixel, how strongly it has been in focus during the current sweep.
 Motion line:: frame-to-frame shift in pixels, correlation and the sharpness trend as a z-score.
 Reconstruction:: progress, *Cancel*, *Reconstruct sweeps automatically* and *Reconstruct last sweep*.
-Export:: *.gsf* (Gwyddion), *TIFF* (32-bit float heights), *STL* (binary mesh), *Report* (folder with `report.json`, `summary.csv`, `edf.png`, `confidence.png`), *Save* / *Open* session.
+Export:: *.gsf* (Gwyddion), *TIFF* (32-bit float heights, NaN where there is no depth), *STL* (a visualisation mesh, not a measurement archive). Every height export writes a validity mask (`name.mask.png`) and a provenance file (`name.json`) beside it, and a confirmation first says what will be written. *Report* writes a folder with `report.json`, `summary.csv`, `edf.png`, `confidence.png` and `valid_mask.png`. The files are written complete or not at all. *Save* / *Open* session.
 Diagnostics:: the live event log, for bug reports.
 
 == Keyboard shortcuts
@@ -119,5 +128,5 @@ Shortcuts are ignored while you type in a field.
 
 * *Calibrations* (`calibration.json` and dark/flat frames) are kept in the program's data folder, for example `~/.local/share/MicroTopos/MicroTopos` on Linux. On Windows the folder is under `%APPDATA%`, and on macOS under `~/Library/Application Support`.
 * *Settings* (window layout, theme, exposure, view rotation, last folders) use Qt's settings store, for example `~/.config/MicroTopos/MicroTopos.conf` on Linux.
-* *Recordings* go to a `recordings` folder in the current directory.
-* *Sessions* (`.npz`) contain the height map, all-in-focus image, confidence, mosaic, height mosaic and all report values.
+* *Recordings* go to a new folder under `recordings` in the current directory. Each frame is listed in `frames.json` with its sequence number, time, size and checksum. The manifest is kept up to date while recording, so a disconnect leaves a usable recording, marked incomplete.
+* *Sessions* (`.npz`, schema 2) contain the original arrays of the selected result (heights, raw fit, confidence, processing image, filtered surface), all report values and warnings, the settings and the mosaic. A session can also hold a mosaic alone. Opening validates the file before anything changes, and an older session is converted with a note about what had to be recomputed.

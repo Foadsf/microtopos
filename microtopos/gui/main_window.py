@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import html
 import math
-import time
 import os
+import time
+import uuid
 from pathlib import Path
 
 import cv2
@@ -13,12 +14,13 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
-                               QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
+                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+                               QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTabWidget,
+                               QTextBrowser, QVBoxLayout, QWidget)
 
-from .. import __version__, export, metrology, zstack
+from .. import __version__, export, metrology, units, zstack
 from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
 from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
 from ..focus import MEASURES
@@ -27,7 +29,7 @@ from ..live import LiveEngine, SweepCapture
 from ..optics import OBJECTIVE_NAMES, OBJECTIVES
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
-from .widgets import Banner, Chip, ImagePanel, Toast, section
+from .widgets import Banner, Chip, FlowLayout, ImagePanel, Toast, section
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -37,9 +39,10 @@ lateral lengths are <i>nominal</i>.</p>
 <p><b>Colour sensor and MJPEG.</b> A Bayer colour sensor behind 8-bit MJPEG compression resolves less than its pixel
 pitch suggests. In-camera sharpening is switched off here because it distorts focus measures. Your camera delivers
 about 12.5 frames per second at 1920×1080, although it advertises 25.</p>
-<p><b>No Z encoder.</b> Turning the focus knob by hand gives no height scale and an uneven speed. Heights are shown in
-<i>focus frames</i> until you calibrate Z (knob travel, step standard) or use the experimental DOF ruler. A frame index
-is monotonic with height, so shapes are right, but uneven knob speed distorts the scale.</p>
+<p><b>No Z encoder.</b> Turning the focus knob by hand gives no height scale, no direction and an uneven speed. A hand
+sweep's heights are relative focus progression in camera frames, assuming an even speed while the knob moves; uneven
+speed distorts them, and without a stated direction the relief may be inverted. State a sweep's knob travel and
+direction (Set Z…) for signed µm for that sweep; only a measured Z drive removes the speed assumption.</p>
 <p><b>Textureless or mirror-polished surfaces.</b> Shape from focus needs local contrast. Pixels without a clear focus
 peak are left blank (NaN) and excluded from roughness. Remedies: a light etch, oblique or dark-field lighting, or a
 pattern projected through the field diaphragm.</p>
@@ -59,14 +62,16 @@ class Bridge(QObject):
 
 
 class Job(QThread):
+    """A worker with one owner (the window), a cancellation flag the work polls, and a label for its progress."""
     progress = Signal(float, str)
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, fn, *args, **kw):
+    def __init__(self, fn, *args, label: str = "Job", **kw):
         super().__init__()
         self.fn, self.args, self.kw = fn, args, kw
         self.cancel = False
+        self.label = label
 
     def run(self):
         try:
@@ -83,6 +88,38 @@ def _sr_job(frames, psf, progress=None, cancelled=None):
     if progress:
         progress(0.1, "Registering dwell frames and drizzling...")
     return dwell_superres(frames, psf)
+
+
+def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
+    if progress:
+        progress(0.2, "Recomputing metrology...")
+    return metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
+                             OBJECTIVES[r["objective"]].lateral_cutoff_um, form_order, lam_s, lam_c)
+
+
+def _rescale_job(r, factor, unit, progress=None, cancelled=None):
+    if progress:
+        progress(0.2, "Rescaling heights and recomputing metrology...")
+    return zstack.rescale_heights(r, factor, unit)
+
+
+DIRECTIONS = {"Unknown": None, "Up (focal plane toward the objective)": 1, "Down (focal plane away from the objective)": -1}
+
+
+def z_key(r: dict) -> str:
+    """Which height maps are the same quantity and may be levelled and blended together in the mosaic."""
+    unit, orient, stat = units.canon(r["z_unit"]), r.get("z_orientation"), r.get("z_status")
+    if unit == units.UM and orient in ("known", "stated") and stat in ("SIMULATED", "CALIBRATED"):
+        return "um"
+    if unit == units.UM and orient in ("known", "stated") and stat == "ESTIMATED":
+        return f"um~{r['objective']}@{r.get('calibration_revision', 0)}"  # same stored estimate, same assumption
+    return f"{unit}#{r.get('result_id', '')}"  # its own scale (or unknown sign): never mixed with others
+
+
+def z_status_text(r: dict) -> str:
+    unit, orient = units.label(r["z_unit"]), r.get("z_orientation", "known")
+    o = {"known": "", "stated": ", direction stated", "unknown": ", direction unknown"}.get(orient, "")
+    return f"Z {r.get('z_status', '?')} ({unit}{o})"
 
 
 class MainWindow(QMainWindow):
@@ -108,7 +145,9 @@ class MainWindow(QMainWindow):
         self.result: dict | None = None
         self.prev_result: dict | None = None
         self.repeat_armed = False
-        self.job: Job | None = None
+        self.job: Job | None = None  # the reconstruction / metrology job (one at a time)
+        self.sr_job: Job | None = None
+        self.jobs: list[Job] = []  # every job still owned by the window (joined on close)
         self.sr_result = None
         self.last_mosaic_version = -1
         self.history: list[dict] = []
@@ -130,6 +169,7 @@ class MainWindow(QMainWindow):
         g = self.settings.value("geometry")
         if g is not None:
             self.restoreGeometry(g)
+        self._default_state = self.saveState()  # for "Reset layout"
         st = self.settings.value("state")
         if st is not None:
             self.restoreState(st)
@@ -144,11 +184,17 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(central)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
-        # header
-        head = QHBoxLayout()
+        # header: wraps onto a second row on narrow windows instead of forcing a wide minimum
+        head_w = QWidget()
+        head = FlowLayout(head_w)
         title = QLabel("MicroTopos")
         title.setObjectName("title")
         head.addWidget(title)
+        ctx = QLabel("CAPTURE")
+        ctx.setObjectName("ctx")
+        ctx.setToolTip("The chips on this row describe the live capture: source, motion, and the calibration of the "
+                       "objective selected now. The selected result has its own line below.")
+        head.addWidget(ctx)
         self.chip_state = Chip("DWELL", "success")
         self.chip_state.setToolTip("Motion state detected from the video: DWELL (still), PAN (X-Y moving), "
                                    "Z_SWEEP (focus moving), OBJECTIVE_CHANGE")
@@ -165,12 +211,19 @@ class MainWindow(QMainWindow):
         self.chip_rec.hide()
         for w in (self.chip_rec, self.chip_state, self.chip_src, self.chip_xy, self.chip_z, self.chip_rad, self.chip_sat):
             head.addWidget(w)
-        head.addStretch(1)
         head.addWidget(self.chip_fps)
+        self.btn_left = self._btn("◧", lambda c: self.dock_left.setVisible(c), "Show or hide the session checklist")
+        self.btn_right = self._btn("◨", lambda c: self.dock_right.setVisible(c), "Show or hide the telemetry panel")
+        for b in (self.btn_left, self.btn_right):
+            b.setCheckable(True)
+            b.setChecked(True)
+            b.setAccessibleName(b.toolTip())
+            head.addWidget(b)
+        head.addWidget(self._btn("Reset layout", self._reset_layout, "Restore the default panel layout"))
         self.btn_theme = QPushButton()
         self.btn_theme.clicked.connect(self._toggle_theme)
         head.addWidget(self.btn_theme)
-        v.addLayout(head)
+        v.addWidget(head_w)
         self.banner = Banner(self.t)
         v.addWidget(self.banner)
         self.guide = QLabel()
@@ -179,6 +232,24 @@ class MainWindow(QMainWindow):
         self.guide.setTextFormat(Qt.RichText)
         v.addWidget(self.guide)
         self.last_ignored = None
+        # selected result: its own provenance, independent of the live capture
+        self.card = QFrame()
+        self.card.setObjectName("resultcard")
+        cl = QHBoxLayout(self.card)
+        cl.setContentsMargins(10, 4, 6, 4)
+        ctx2 = QLabel("RESULT")
+        ctx2.setObjectName("ctx")
+        cl.addWidget(ctx2)
+        self.lbl_card = QLabel("No height map yet.")
+        self.lbl_card.setWordWrap(True)
+        self.lbl_card.setTextFormat(Qt.RichText)
+        cl.addWidget(self.lbl_card, 1)
+        self.btn_view_height = self._btn("View height", lambda: self.tabs.setCurrentIndex(3))
+        self.btn_card_z = self._btn("Set Z…", self._set_result_z, "State the knob travel and direction of THIS sweep")
+        cl.addWidget(self.btn_card_z)
+        cl.addWidget(self.btn_view_height)
+        self.card.hide()
+        v.addWidget(self.card)
         # tabs
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
@@ -220,6 +291,18 @@ class MainWindow(QMainWindow):
 
         self._build_left()
         self._build_right()
+        # status labels in the tool bars wrap instead of setting the window's minimum width
+        from PySide6.QtWidgets import QSizePolicy
+        for lab in (self.lbl_live, self.lbl_mosaic, self.lbl_hlegend, self.lbl_edf, self.lbl_height, self.lbl_3d,
+                    self.prof_label):
+            lab.setWordWrap(True)
+            lab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lab.setMinimumWidth(160)
+            if lab is not self.prof_label:
+                lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        for cmb in (self.cmb_height, self.cmb_hist, self.cmb_edf, self.cmb_mview):
+            cmb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cmb.setMinimumContentsLength(14)
         self.toast = Toast(central, self.t)
         self.setStatusBar(None)
 
@@ -265,8 +348,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.btn_rec)
         self.lbl_live = QLabel()
         self.lbl_live.setObjectName("muted")
-        h.addStretch(1)
-        h.addWidget(self.lbl_live)
+        h.addWidget(self.lbl_live, 1)
         return h
 
     def _mosaic_bar(self):
@@ -287,16 +369,14 @@ class MainWindow(QMainWindow):
         h.addWidget(self.sl_hop)
         self.lbl_hlegend = QLabel()
         self.lbl_hlegend.setObjectName("mono")
-        h.addWidget(self.lbl_hlegend)
-        h.addStretch(1)
+        h.addWidget(self.lbl_hlegend, 1)
         h2 = QHBoxLayout()  # second row: actions and status, so nothing overlaps on narrow windows
         h2.addWidget(self._btn("Export height mosaic", self._export_height_mosaic,
                                "Stitched height mosaic as a Gwyddion .gsf"))
         h2.addWidget(self._btn("Reset mosaic  (R)", self._reset_mosaic, "Start a new mosaic"))
         self.lbl_mosaic = QLabel()
         self.lbl_mosaic.setObjectName("muted")
-        h2.addStretch(1)
-        h2.addWidget(self.lbl_mosaic)
+        h2.addWidget(self.lbl_mosaic, 1)
         v = QVBoxLayout()
         v.addLayout(h)
         v.addLayout(h2)
@@ -311,10 +391,9 @@ class MainWindow(QMainWindow):
         self.cmb_edf.addItems(["All-in-focus", "Super-resolution (experimental)"])
         self.cmb_edf.currentIndexChanged.connect(self._show_result)
         h.addWidget(self.cmb_edf)
-        h.addStretch(1)
         self.lbl_edf = QLabel()
         self.lbl_edf.setObjectName("muted")
-        h.addWidget(self.lbl_edf)
+        h.addWidget(self.lbl_edf, 1)
         return h
 
     def _height_bar(self):
@@ -327,10 +406,13 @@ class MainWindow(QMainWindow):
         self.cmb_hist.setToolTip("Every height map of this session (most recent first)")
         self.cmb_hist.currentIndexChanged.connect(self._pick_history)
         h.addWidget(self.cmb_hist)
-        h.addStretch(1)
+        self.chk_lock = QCheckBox("Lock colour range")
+        self.chk_lock.setToolTip("Keep the current colour scale when another map is shown, to compare repeat scans")
+        self.chk_lock.toggled.connect(lambda c: (setattr(self, "_locked_levels", None), self._show_result()))
+        h.addWidget(self.chk_lock)
         self.lbl_height = QLabel()
         self.lbl_height.setObjectName("muted")
-        h.addWidget(self.lbl_height)
+        h.addWidget(self.lbl_height, 1)
         return h
 
     def _build_3d(self):
@@ -383,7 +465,7 @@ class MainWindow(QMainWindow):
         self.cmb_cmap.addItems(["viridis", "cividis", "inferno", "plasma", "magma", "turbo"])
         self.cmb_cmap.currentIndexChanged.connect(self._update_3d)
         bar.addWidget(self.cmb_cmap)
-        bar.addWidget(self.lbl_3d)
+        bar.addWidget(self.lbl_3d, 1)
         lay.addLayout(bar)
 
 
@@ -400,7 +482,10 @@ class MainWindow(QMainWindow):
     def _build_left(self):
         dock = QDockWidget("Session", self)
         dock.setObjectName("session")
-        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+                         | QDockWidget.DockWidgetClosable)
+        self.dock_left = dock
+        dock.visibilityChanged.connect(lambda vis: self.btn_left.setChecked(vis))
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -435,7 +520,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(line)
         lay.addWidget(self.stack, 1)
         dock.setWidget(w)
-        dock.setMinimumWidth(360)
+        dock.setMinimumWidth(300)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
         self._open_step(0)
 
@@ -551,18 +636,30 @@ class MainWindow(QMainWindow):
                             "marks on the Live view, then enter their distance in µm.")
 
     def _page_z(self):
-        self.btn_z_travel = self._btn("From last sweep's knob travel…", self._calibrate_z_travel,
-                                      "Turn the fine-focus knob from one mark to another during a sweep, then enter "
-                                      "the travel in µm (knob divisions × µm per division). Assumes even speed.", True)
+        self.cmb_dir = QComboBox()
+        self.cmb_dir.addItems(list(DIRECTIONS))
+        self.cmb_dir.setCurrentText(self.settings.value("sweep_direction", "Unknown"))
+        self.cmb_dir.setToolTip("Which way you turn the fine focus during a sweep. With 'Unknown' the relief may be "
+                                "inverted and the result says so.")
+        self.cmb_dir.currentTextChanged.connect(lambda t: self.settings.setValue("sweep_direction", t))
+        self.cmb_dir.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_dir.setMinimumContentsLength(10)
+        self.btn_z_travel = self._btn("Set Z of the selected result…", self._set_result_z,
+                                      "State the knob travel (µm) and direction of THAT sweep. Calibrates that result "
+                                      "only; optionally keeps the scale as an estimate for later sweeps.", True)
         self.btn_z_ruler = self._btn("Apply DOF ruler estimate (experimental)", self._calibrate_z_ruler,
                                      "Estimates µm per frame by comparing the measured focus-curve width with the "
                                      "optical model. Simulator tests: errors up to ±35%.")
-        self.btn_z_clear = self._btn("Clear (focus-frame units)", self._clear_z)
+        self.btn_z_clear = self._btn("Clear the stored estimate", self._clear_z)
         self.lbl_z = QLabel()
         self.lbl_z.setObjectName("muted")
         self.lbl_z.setWordWrap(True)
-        return section("5. Z scale", self.btn_z_travel, self.btn_z_ruler, self.btn_z_clear, self.lbl_z,
-                       hint="The focus knob has no encoder, so heights are in focus frames until calibrated.")
+        f = QFormLayout()
+        f.addRow("Sweep direction", self.cmb_dir)
+        return section("5. Z scale", f, self.btn_z_travel, self.btn_z_ruler, self.btn_z_clear, self.lbl_z,
+                       hint="The focus knob has no encoder. A hand sweep's heights are relative focus progression in "
+                            "camera frames, assuming an even knob speed. For µm, state the knob travel of a sweep; a "
+                            "stored µm-per-frame value is only an estimate for later sweeps.")
 
     def _page_inspect(self):
         self.cmb_override = QComboBox()
@@ -581,7 +678,7 @@ class MainWindow(QMainWindow):
         self.sp_form = QSpinBox()
         self.sp_form.setRange(0, 3)
         self.sp_form.setValue(1)
-        self.sp_form.setToolTip("F-operator: polynomial order removed before roughness (1 = plane)")
+        self.sp_form.setToolTip("F-operator before roughness: 0 = mean only, 1 = plane, 2 = quadratic, 3 = cubic")
         self.sp_ls = QDoubleSpinBox()
         self.sp_ls.setRange(0, 100)
         self.sp_ls.setDecimals(2)
@@ -609,7 +706,10 @@ class MainWindow(QMainWindow):
     def _build_right(self):
         dock = QDockWidget("Telemetry", self)
         dock.setObjectName("telemetry")
-        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
+        dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+                         | QDockWidget.DockWidgetClosable)
+        self.dock_right = dock
+        dock.visibilityChanged.connect(lambda vis: self.btn_right.setChecked(vis))
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
@@ -672,7 +772,7 @@ class MainWindow(QMainWindow):
         sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         sc.setWidget(w)
         dock.setWidget(sc)
-        dock.setMinimumWidth(390)
+        dock.setMinimumWidth(300)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
     # ================================================================== theme & shortcuts
@@ -701,6 +801,11 @@ class MainWindow(QMainWindow):
             self.gl_grid.setColor(pg.mkColor(t["grid"]))
         self._refresh_checklist()
         self._show_result()
+
+    def _reset_layout(self):
+        self.restoreState(self._default_state)
+        self.dock_left.show()
+        self.dock_right.show()
 
     def _toggle_theme(self):
         self.dark = not self.dark
@@ -916,14 +1021,31 @@ class MainWindow(QMainWindow):
             import datetime
             folder = Path(self.settings.value("rec_dir", str(Path.cwd() / "recordings"))) / \
                 datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            self.source.start_recording(folder)
+            try:
+                self.source.start_recording(folder)
+            except OSError as e:  # includes a folder that is not empty
+                self.btn_rec.blockSignals(True)
+                self.btn_rec.setChecked(False)
+                self.btn_rec.blockSignals(False)
+                self.notify(f"Recording not started: {e}", "danger")
+                return
             self.rec_folder = folder
+            self._rec_err_shown = None
             self.btn_rec.setText("■ Stop recording")
-            self.notify(f"Recording raw frames to {folder}")
+            self.notify(f"Recording to {folder}")
         else:
             n = self.source.stop_recording()
             self.btn_rec.setText("● Record raw stream")
-            self.notify(f"Saved {n} frames to {self.rec_folder}", "success")
+            mode = (getattr(self.source, "readback", {}) or {}).get("delivery", "")
+            err = getattr(self.source, "rec_error", None)
+            if err:
+                self.notify(f"Recording stopped with an error after {n} frames: {err}", "danger")
+            elif n == 0:
+                self.notify("No frames were recorded.", "warning")
+            else:
+                self.notify(f"Saved {n} frames to {self.rec_folder}"
+                            + (" (lossless PNG: this camera delivers decoded frames)" if "decoded" in mode else ""),
+                            "success")
 
     def _reset_mosaic(self):
         self.engine.reset_mosaic()
@@ -938,6 +1060,7 @@ class MainWindow(QMainWindow):
         c = self.store.get(self.obj)
         c.darks.clear()
         c.flats.clear()
+        self.store.touch(self.obj)
         self.store.save()
         self.engine._corrector_key = None
         self._refresh_checklist()
@@ -974,6 +1097,7 @@ class MainWindow(QMainWindow):
         c.lateral_um_per_px_full = full
         c.lateral_source = f"stage micrometer: {val:g} µm over {px:.1f} px"
         c.lateral_date = today()
+        self.store.touch(self.obj)
         self.store.save()
         self._refresh_checklist()
         nominal = self.obj.nominal_um_per_px(1920)
@@ -982,26 +1106,90 @@ class MainWindow(QMainWindow):
     def _clear_lateral(self):
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = None
+        self.store.touch(self.obj)
         self.store.save()
         self._refresh_checklist()
 
-    def _calibrate_z_travel(self):
+    def _set_result_z(self):
+        """Bind knob travel and direction to the SELECTED result (its own sweep), not to the live objective."""
         r = self.result
-        if r is None or r.get("z_status") == CalStatus.SIMULATED.value:
-            self.notify("Make a real focus sweep first (turn the knob between two marks).", "warning")
+        if r is None or r.get("z_status") == CalStatus.SIMULATED.value or r.get("z_orientation") == "known":
+            self.notify("Select a hand-sweep result first: simulated or motor-measured heights already have Z.",
+                        "warning")
             return
-        val, ok = QInputDialog.getDouble(self, "Z calibration from knob travel",
-                                         f"The last sweep used {r['frames_used']} frames.\n"
-                                         "Knob travel during that sweep (µm):", 10.0, 0.01, 1e4, 3)
-        if ok:
-            c = self.store.get(self.obj)
-            c.z_um_per_frame = val / max(1, r["frames_used"] - 1)
-            c.z_source = f"knob travel {val:g} µm over {r['frames_used']} frames (even speed assumed)"
+        if self.job is not None and self.job.isRunning():
+            self.notify("Wait for the running job to finish.", "warning")
+            return
+        # camera frames of knob movement in the part used (pauses excluded), whatever the current scale
+        span = max(1.0, abs(r["z_last"] - r["z_first"]) / (r.get("z_um_per_frame_used") or 1.0))
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Z of {r.get('label', 'this result')}")
+        f = QFormLayout(dlg)
+        travel = QDoubleSpinBox()
+        travel.setRange(0.0, 1e4)
+        travel.setDecimals(3)
+        travel.setSuffix(" µm")
+        travel.setSpecialValueText("unknown (keep relative)")
+        cur = r.get("z_um_per_frame_used")
+        travel.setValue(abs(cur) * span if cur else 0.0)
+        direction = QComboBox()
+        direction.addItems(list(DIRECTIONS))
+        sign = r.get("z_sign")
+        direction.setCurrentText(next((k for k, v in DIRECTIONS.items() if v == sign), "Unknown"))
+        keep = QCheckBox(f"Also keep µm per frame as an estimate for later {r['objective']} sweeps")
+        f.addRow(QLabel(f"The part of this sweep that was used spans {span:.0f} camera frames of knob movement "
+                        f"({r['frames_used']} frames kept)."))
+        f.addRow("Knob travel during the sweep", travel)
+        f.addRow("Focal plane moved", direction)
+        f.addRow(keep)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        f.addRow(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_sign = DIRECTIONS[direction.currentText()]
+        old_sign = r.get("z_sign") or 1
+        old_scale = r.get("z_um_per_frame_used") or 1.0  # current µm (or frames) per source frame
+        if travel.value() > 0:
+            new_scale, unit, stat = travel.value() / span, units.UM, CalStatus.CALIBRATED.value
+        else:
+            new_scale, unit, stat = 1.0, units.FRAMES, CalStatus.NOMINAL.value
+        factor = (new_scale / old_scale) * ((new_sign or 1) / old_sign)
+        meta = {"z_status": stat, "z_sign": new_sign, "z_orientation": "stated" if new_sign else "unknown",
+                "z_um_per_frame_used": new_scale if unit == units.UM else None,
+                "z_source": (f"knob travel {travel.value():g} µm over {span:.0f} frames (this sweep, even speed "
+                             f"assumed)" if unit == units.UM else "relative focus progression")}
+        if keep.isChecked() and unit == units.UM:
+            c = self.store.get(r["objective"])  # the result's objective, whatever is selected now
+            c.z_um_per_frame = new_scale
+            c.z_source = meta["z_source"].replace("this sweep", "from one sweep; an estimate for others")
             c.z_uncertainty_pct = None
             c.z_date = today()
+            self.store.touch(r["objective"])
             self.store.save()
-            self._refresh_checklist()
-            self.notify(f"Z scale {c.z_um_per_frame:.4f} µm per frame.", "success")
+        old = r
+        self._start_job(Job(_rescale_job, r, factor, unit, label="Z"),
+                        lambda res: self._replace_result(old, {**res, **meta}), main=True)
+
+    def _replace_result(self, old: dict, new: dict):
+        """Swap a result for its rescaled version everywhere (history, mosaic patch, views)."""
+        new["warnings"] = [w for w in new.get("warnings", []) if "Sweep direction unknown" not in w] + (
+            ["Sweep direction unknown: heights are relative focus progression and the relief may be inverted."]
+            if new.get("z_orientation") == "unknown" else [])
+        for i, h in enumerate(self.history):
+            if h is old:
+                self.history[i] = new
+        if self.result is old:
+            self.result = new
+        rid = new.get("result_id")
+        if rid and new.get("mosaic_generation") == self.engine.mosaic_generation and new.get("preview_shape"):
+            self.engine.remove_height_patch(rid)
+            self._pin(new)
+        self._refresh_history()
+        self._refresh_checklist()
+        self._show_result()
+        self.notify(f"Z of the selected result set: {z_status_text(new)}.", "success")
 
     def _calibrate_z_ruler(self):
         r = self.result
@@ -1009,18 +1197,21 @@ class MainWindow(QMainWindow):
         if not est:
             self.notify("Needs a hand sweep reconstructed in focus-frame units first.", "warning")
             return
-        c = self.store.get(self.obj)
+        c = self.store.get(r["objective"])  # the objective the sweep was made with
         c.z_um_per_frame = float(est)
-        c.z_source = "DOF ruler (experimental, simulator error up to ±35%)"
+        c.z_source = "DOF ruler (experimental model estimate, simulator error up to ±35%)"
         c.z_uncertainty_pct = 35.0
         c.z_date = today()
+        self.store.touch(r["objective"])
         self.store.save()
         self._refresh_checklist()
-        self.notify(f"Applied experimental Z scale {est:.4f} µm per frame.", "warning")
+        self.notify(f"Stored an experimental Z estimate of {est:.4f} µm per frame for {r['objective']}; "
+                    "new sweeps use it and are labelled ESTIMATED.", "warning")
 
     def _clear_z(self):
         c = self.store.get(self.obj)
         c.z_um_per_frame = None
+        self.store.touch(self.obj)
         self.store.save()
         self._refresh_checklist()
 
@@ -1045,7 +1236,7 @@ class MainWindow(QMainWindow):
             ("Done" if rad else ("Partial" if rkey in c.darks or rkey in c.flats else "Optional"),
              "success" if rad else "warning"),
             ("Calibrated" if c.lateral_um_per_px_full else "Nominal", "success" if c.lateral_um_per_px_full else "warning"),
-            ("Calibrated" if c.z_um_per_frame else "Frames", "success" if c.z_um_per_frame else "warning"),
+            ("Estimate" if c.z_um_per_frame else "Frames", "warning"),
             ("Ready" if cam_ok else "Waiting", "success" if cam_ok else "neutral"),
         ]
         for chip, (txt, kind) in zip(self.step_chips, states):
@@ -1057,8 +1248,10 @@ class MainWindow(QMainWindow):
         self.chip_xy.set(f"XY {'CAL' if c.lateral_um_per_px_full else 'NOMINAL'} {um_full:.3f} µm/px",
                          "success" if c.lateral_um_per_px_full else "warning",
                          c.lateral_source or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
-        self.chip_z.set(f"Z {'CAL ' + format(c.z_um_per_frame, '.3f') + ' µm/f' if c.z_um_per_frame else 'FRAMES'}",
-                        "success" if c.z_um_per_frame else "warning", c.z_source or "Heights in focus-frame units")
+        self.chip_z.set(f"Z {'EST ' + format(c.z_um_per_frame, '.3f') + ' µm/f' if c.z_um_per_frame else 'FRAMES'}",
+                        "warning", (c.z_source + " — an estimate for new sweeps (same knob speed assumed); state "
+                                    "each sweep's travel for CALIBRATED heights") if c.z_um_per_frame
+                        else "New hand sweeps: relative focus progression in camera frames")
         self.chip_rad.set("DARK/FLAT ✓" if rad else "DARK/FLAT —", "success" if rad else "neutral")
         self.chip_src.set("SIMULATOR" if sim else "CAMERA", "info" if sim else "success")
         o = self.obj
@@ -1071,7 +1264,9 @@ class MainWindow(QMainWindow):
         self.lbl_rad.setText("\n".join(lines) or "Nothing recorded for this objective.")
         self.lbl_lat.setText(f"{c.lateral_status.value}: {c.lateral_source or 'nominal'}"
                              + (f" ({c.lateral_date})" if c.lateral_date else ""))
-        self.lbl_z.setText(f"{c.z_status.value}: {c.z_source or 'focus-frame units'}" + (f" ({c.z_date})" if c.z_date else ""))
+        self.lbl_z.setText(f"Stored for {self.obj.name}: {c.z_status.value}"
+                           + (f", {c.z_um_per_frame:.4f} µm per frame — {c.z_source}" if c.z_um_per_frame else
+                              " (new sweeps in camera frames)") + (f" ({c.z_date})" if c.z_date else ""))
 
     # ================================================================== live tick
     def _tick(self):
@@ -1123,7 +1318,21 @@ class MainWindow(QMainWindow):
         if rec:
             secs = int(time.perf_counter() - self.source.rec_t0)
             self.chip_rec.set(f"● REC {secs // 60}:{secs % 60:02d}", "danger")
-        self.lbl_live.setText((f"● REC {len(self.source.rec_stamps)} frames · " if rec else "") +
+        rec_err = getattr(self.source, "rec_error", None)
+        if rec_err and rec_err != getattr(self, "_rec_err_shown", None):
+            self._rec_err_shown = rec_err
+            self.btn_rec.blockSignals(True)
+            self.btn_rec.setChecked(False)
+            self.btn_rec.setText("● Record raw stream")
+            self.btn_rec.blockSignals(False)
+            self.notify(f"Recording stopped: {rec_err}", "danger")
+        if s.engine_error and s.engine_error != getattr(self, "_eng_err_shown", None):
+            self._eng_err_shown = s.engine_error
+            self.notify(f"Processing error (the engine keeps running; see Diagnostics): {s.engine_error}", "danger")
+        if self.engine.calib_error and self.engine.calib_error != getattr(self, "_cal_err_shown", None):
+            self._cal_err_shown = self.engine.calib_error
+            self.notify(self.engine.calib_error, "warning")
+        self.lbl_live.setText((f"● REC {self.source.rec_frames} frames · " if rec else "") +
                               f"{s.frame_shape[1]}×{s.frame_shape[0]} capture · preview {um_prev:.3f} µm/px · "
                               f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}")
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
@@ -1134,66 +1343,96 @@ class MainWindow(QMainWindow):
         if cp:
             self.lbl_job.setText(f"Recording {cp[0]}: {cp[1]}/{cp[2]} frames")
         elif getattr(self, "_cal_was", None):
-            self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
+            if not self.engine.calib_error:
+                self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
             self._refresh_checklist()
         self._cal_was = cp
         if self.tabs.currentIndex() == 1:
             self._draw_camera_box(s, um_prev)
         if s.mosaic_version != self.last_mosaic_version and self.tabs.currentIndex() == 1:
             self.last_mosaic_version = s.mosaic_version
-            (img, origin), hm, nkf, npatch = self.engine.mosaic_image()
+            (img, origin, d), parts, nkf, npatch = self.engine.mosaic_image()
             if nkf <= 1 and self.loaded_mosaic is not None:  # nothing mapped yet: show the opened session's mosaic
-                (img, origin), hm = self.loaded_mosaic
-            self.current_hmosaic = hm
+                (img, origin, d), parts = self.loaded_mosaic
+            self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
-            if mode == 2 and hm is not None:
-                self.p_mosaic.set_image(hm[0], um_prev, unit=self._z_unit_label())
+            if mode == 2 and parts:
+                key, hz, horig, n = parts[0]
+                self.p_mosaic.set_image(hz, um_prev, unit=self._key_unit(key))
                 self.p_mosaic.set_overlay(None)
-                self.mosaic_origin = hm[1]
+                self.mosaic_origin = horig
+                self.lbl_hlegend.setText(self._legend(parts, hz))
             else:
-                # display copy: at most 1600 px wide, 8-bit RGBA (empty = transparent); cheap to repaint
-                f = max(1.0, img.shape[1] / 1600.0)
-                small = cv2.resize(np.nan_to_num(img, nan=0.0), (int(img.shape[1] / f), int(img.shape[0] / f)),
-                                   interpolation=cv2.INTER_AREA) if f > 1 else np.nan_to_num(img, nan=0.0)
-                valid = cv2.resize(np.isfinite(img).astype(np.uint8), small.shape[::-1], interpolation=cv2.INTER_NEAREST)
-                g = np.clip(small, 0, 255).astype(np.uint8)
-                rgba = np.dstack([g, g, g, valid * 255])
-                self.p_mosaic.set_image(rgba, um_prev * img.shape[1] / small.shape[1], rgb=True)
-                self.p_mosaic.data_full = img
+                valid = np.isfinite(img).astype(np.uint8)
+                g = np.clip(np.nan_to_num(img, nan=0.0), 0, 255).astype(np.uint8)
+                rgba = np.dstack([g, g, g, valid * 255])  # empty = transparent; at most ~1600 px: cheap to repaint
+                self.p_mosaic.set_image(rgba, um_prev * d, rgb=True)
                 self.mosaic_origin = origin
-                self._draw_height_overlay(hm if mode == 1 else None, origin, um_prev)
-            self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · "
-                                    f"{img.shape[1] * um_prev:.0f} × {img.shape[0] * um_prev:.0f} µm")
+                self._draw_height_overlay(parts if mode == 1 else [], origin, um_prev)
+            span = (img.shape[1] * d * um_prev, img.shape[0] * d * um_prev)
+            self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · {span[0]:.0f} × {span[1]:.0f} µm"
+                                    + (f" · shown at 1/{d}" if d > 1 else ""))
         if s.seq % 20 == 0:
             self._refresh_checklist()
             if self.diag.isVisible() and self.result is None:
                 self.diag.setPlainText("\n".join(list(self.engine.events)[-40:]))
 
-    def _draw_height_overlay(self, hm, origin, um):
-        """Colour-mapped stitched height mosaic over the image mosaic, at its true position."""
-        if hm is None or not np.isfinite(hm[0]).any():
+    @staticmethod
+    def _key_unit(key: str) -> str:
+        return "µm" if key.startswith("um") else "frames"
+
+    def _legend(self, parts, z) -> str:
+        key, _, _, n = parts[0]
+        lo, hi = np.nanpercentile(z, [2, 98]) if np.isfinite(z).any() else (0, 0)
+        kind = {"um": "calibrated µm"}.get(key, "estimated µm (stored knob scale)" if key.startswith("um~")
+                                           else "relative, own scale")
+        more = f" · {len(parts) - 1} other group(s) not blended" if len(parts) > 1 else ""
+        return f"height {lo:.3g}–{hi:.3g} {self._key_unit(key)} ({kind}, {n} map(s)){more}"
+
+    def _draw_height_overlay(self, parts, origin, um):
+        """Colour-mapped heights over the image mosaic at their true positions. Each group of comparable maps is
+        normalised on its own: maps in different quantities are never put on one colour scale."""
+        parts = [p for p in parts if np.isfinite(p[1]).any()]
+        if not parts:
             self.p_mosaic.set_overlay(None)
             self.lbl_hlegend.setText("")
             return
-        z, (hx, hy) = hm
-        lo, hi = np.nanpercentile(z, [2, 98])
-        norm = np.clip((np.nan_to_num(z, nan=lo) - lo) / max(hi - lo, 1e-9), 0, 1)
-        rgba = pg.colormap.get("viridis").map(norm.ravel(), mode="byte").reshape(z.shape + (4,)).copy()
-        rgba[..., 3] = np.where(np.isfinite(z), int(255 * self.sl_hop.value() / 100), 0)
+        x0 = min(p[2][0] for p in parts)
+        y0 = min(p[2][1] for p in parts)
+        x1 = max(p[2][0] + p[1].shape[1] for p in parts)
+        y1 = max(p[2][1] + p[1].shape[0] for p in parts)
+        rgba = np.zeros((y1 - y0, x1 - x0, 4), np.uint8)
+        cmap = pg.colormap.get("viridis")
+        alpha = int(255 * self.sl_hop.value() / 100)
+        for _key, z, (hx, hy), _n in reversed(parts):  # the most recent group is drawn last (on top)
+            lo, hi = np.nanpercentile(z, [2, 98])
+            norm = np.clip((np.nan_to_num(z, nan=lo) - lo) / max(hi - lo, 1e-9), 0, 1)
+            col = cmap.map(norm.ravel(), mode="byte").reshape(z.shape + (4,))
+            ok = np.isfinite(z)
+            sub = rgba[hy - y0:hy - y0 + z.shape[0], hx - x0:hx - x0 + z.shape[1]]
+            sub[ok, :3] = col[ok, :3]
+            sub[ok, 3] = alpha
         from PySide6.QtCore import QRectF
-        rect = QRectF((hx - origin[0]) * um, (hy - origin[1]) * um, z.shape[1] * um, z.shape[0] * um)
+        rect = QRectF((x0 - origin[0]) * um, (y0 - origin[1]) * um, (x1 - x0) * um, (y1 - y0) * um)
         self.p_mosaic.set_overlay(rgba, rect)
-        self.lbl_hlegend.setText(f"height {lo:.3g}–{hi:.3g} {self._z_unit_label()} (viridis)")
+        self.lbl_hlegend.setText(self._legend(parts, parts[0][1]))
 
     def _export_height_mosaic(self):
-        hm = getattr(self, "current_hmosaic", None)
-        if hm is None:
+        parts = getattr(self, "current_parts", None)
+        if not parts:
             self.notify("No height maps in the mosaic yet.", "warning")
             return
+        key, hz, origin, n = parts[0]
         p = self._save_path("Export stitched height mosaic", "height_mosaic.gsf", "GSF (*.gsf)")
-        if p:
-            export.write_gwyddion_gsf(p, hm[0], self.um_preview, self._z_unit_label() == "µm", "MicroTopos height mosaic")
-            self.notify(f"Saved {p}", "success")
+        if p and self._confirm_export(p, f"stitched height mosaic ({n} map(s), group '{key}')", self._key_unit(key),
+                                      "median-filled in the .gsf; the mask file records them"):
+            try:
+                export.export_height(p, "gsf", hz, self.um_preview, "um" if key.startswith("um") else "frames",
+                                     {"kind": "height mosaic", "group": key, "maps": n, "origin_px": list(origin)},
+                                     "MicroTopos height mosaic")
+                self.notify(f"Saved {p} (+ mask and provenance)", "success")
+            except OSError as e:
+                self.notify(f"Export failed: {e}", "danger")
 
     def _draw_camera_box(self, s, um):
         """Live outline of the camera's field of view on the mosaic (red when tracking is lost)."""
@@ -1231,7 +1470,8 @@ class MainWindow(QMainWindow):
                    "tiles. The blue box on the Mosaic tab is the camera."
                    if not s.mosaic_lost else "<b>Mosaic tracking lost</b> — move back over an area already in the mosaic.")
         elif busy:
-            txt = "<b>Building the height map…</b> You can keep working; it opens in the Height tab when ready."
+            txt = (f"<b>{html.escape(self.job.label)} running…</b> You can keep working; the result line below the "
+                   "coach says when it is ready.")
         elif self.last_ignored is not None:
             txt = (f"<b>That focus movement was not used</b> (only {self.last_ignored:.0%} of the field went sharp and "
                    "blurry again). For a height map: start blurry, turn slowly through sharp, stop when blurry again.")
@@ -1240,14 +1480,17 @@ class MainWindow(QMainWindow):
                    "turn slowly the other way — through sharp — until it is blurry again, and stop.  "
                    "<b>Or a mosaic:</b> focus, then move the X-Y stage slowly.")
         else:
-            txt = (f"<b>Height map ready</b> ({self.result['valid_fraction']:.0%} reliable) — see the Height, 3D and "
-                   "Report tabs. Sweep again anywhere for another; calibrate X-Y and Z (steps 4–5) for real µm.")
+            r = self.result
+            nxt = (" State this sweep's knob travel and direction (Set Z…) for signed µm."
+                   if r.get("z_orientation") == "unknown" or units.canon(r["z_unit"]) == units.FRAMES else "")
+            txt = (f"<b>Height map ready</b> ({r['valid_fraction']:.0%} reliable) — see the Height, 3D and Report "
+                   f"tabs. Sweep again anywhere for another.{nxt}")
         if txt != self.guide.text():
             self.guide.setText(txt)
 
     # ================================================================== reconstruction
     def _z_unit_label(self):
-        return (self.result or {}).get("z_unit", "frames")
+        return units.label((self.result or {}).get("z_unit", "frames"))
 
     def _on_sweep(self, cap: SweepCapture):
         self.last_cap = cap
@@ -1263,6 +1506,28 @@ class MainWindow(QMainWindow):
         cap = getattr(self, "last_cap", None)
         if cap is not None:
             self._reconstruct(cap, force=True)
+
+    def _lam_s(self, obj) -> float | None:
+        """λs from the spin box; None (the optical default) when it still shows that objective's default."""
+        v = self.sp_ls.value()
+        return None if v == 0 or abs(v - round(obj.lateral_cutoff_um, 2)) < 1e-9 else v
+
+    def _start_job(self, job: Job, on_done, main: bool = False) -> bool:
+        """Start a job the window owns. main=True: the reconstruction slot (one at a time)."""
+        if main and self.job is not None and self.job.isRunning():
+            self.notify(f"{self.job.label} is still running; try again when it has finished.", "warning")
+            return False
+        job.progress.connect(lambda f, m, j=job: self._on_progress(j, f, m))
+        job.done.connect(on_done)
+        job.failed.connect(lambda msg, j=job: self._on_failed(j, msg))
+        job.finished.connect(lambda j=job: self.jobs.remove(j) if j in self.jobs else None)
+        self.jobs.append(job)
+        if main:
+            self.job = job
+            self.btn_cancel.setEnabled(True)
+            job.finished.connect(lambda: self.btn_cancel.setEnabled(False))
+        job.start()
+        return True
 
     def _reconstruct(self, cap: SweepCapture, force: bool = False):
         if cap.completeness < 0.5 and self.engine.sm.override != Override.Z and not force:
@@ -1280,84 +1545,110 @@ class MainWindow(QMainWindow):
         cal = self.store.get(obj)
         w = cap.shape[1]
         um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w)
+        sign = DIRECTIONS.get(self.cmb_dir.currentText())
         if cap.z is not None and cap.simulated:
-            z, unit, zstat, zcal = cap.z, "µm", CalStatus.SIMULATED.value, None
+            z, unit, zstat, zcal = cap.z, units.UM, CalStatus.SIMULATED.value, None
         elif cal.z_um_per_frame:
-            z, unit, zstat, zcal = None, "µm", CalStatus.CALIBRATED.value, cal.z_um_per_frame
+            z, unit, zstat, zcal = None, units.UM, CalStatus.ESTIMATED.value, cal.z_um_per_frame
         else:
-            z, unit, zstat, zcal = None, "frames", CalStatus.NOMINAL.value, None
+            z, unit, zstat, zcal = None, units.FRAMES, CalStatus.NOMINAL.value, None
         st = zstack.ZSettings(measure=self.cmb_measure.currentText(), form_order=self.sp_form.value(),
-                              lam_s_um=self.sp_ls.value() or None, lam_c_um=self.sp_lc.value(),
+                              lam_s_um=self._lam_s(obj), lam_c_um=self.sp_lc.value(),
                               workers=max(1, (os.cpu_count() or 2) - 1))
         meta = {"z_status": zstat, "lateral_status": cal.lateral_status.value if not cap.simulated else "SIMULATED",
-                "pose": cap.pose, "capture_shape": cap.shape}
-        self.job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st)
-        self.job.progress.connect(self._on_progress)
-        self.job.done.connect(lambda r: self._on_result({**r, **meta}))
-        self.job.failed.connect(self._on_failed)
-        self.btn_cancel.setEnabled(True)
-        self.job.start()
-        self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
+                "pose": cap.pose, "capture_shape": cap.shape, "result_id": uuid.uuid4().hex[:12],
+                "source_id": cap.source_id, "source_generation": cap.source_generation,
+                "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
+                "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
+                "z_source": cal.z_source if zstat == CalStatus.ESTIMATED.value else "",
+                "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
+        sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
+        job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
+                  sample_pos=sample_pos, z_sign=sign if z is None else None)
+        if self._start_job(job, lambda r: self._on_result({**r, **meta}), main=True):
+            self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
 
-    def _on_progress(self, f, msg):
+    def _on_progress(self, job, f, msg):
         self.prog.setValue(int(f * 1000))
-        self.lbl_job.setText(msg)
+        self.lbl_job.setText(f"{job.label}: {msg}")
 
-    def _on_failed(self, msg):
-        self.btn_cancel.setEnabled(False)
+    def _on_failed(self, job, msg):
+        if job is self.job:
+            self.btn_cancel.setEnabled(False)
         self.prog.setValue(0)
-        self.lbl_job.setText(msg)
-        self.notify(msg, "warning")
+        self.lbl_job.setText(f"{job.label}: {msg}")
+        self.notify(f"{job.label}: {msg}", "warning")
 
     def _cancel(self):
         if self.job is not None:
             self.job.cancel = True
 
+    def _repeat_check(self, a: dict, b: dict) -> str | None:
+        """Why two results cannot be compared for repeatability, or None when they can."""
+        if a["objective"] != b["objective"]:
+            return "the objective changed"
+        if a["height"].shape != b["height"].shape:
+            return "the image size differs"
+        if math.hypot(a["pose"][0] - b["pose"][0], a["pose"][1] - b["pose"][1]) > 2.0:
+            return "the stage moved"
+        if z_key(a) != z_key(b) or z_key(a).startswith("frames"):
+            return "the two maps do not share a calibrated, signed height scale (unit, direction or calibration)"
+        return None
+
     def _on_result(self, r: dict):
-        self.btn_cancel.setEnabled(False)
         if self.repeat_armed and self.result is not None:
             self.repeat_armed = False
-            a, b = self.result, r
-            same = (a["objective"] == b["objective"] and a["height"].shape == b["height"].shape
-                    and math.hypot(a["pose"][0] - b["pose"][0], a["pose"][1] - b["pose"][1]) <= 2.0)
-            if same:
-                sig = metrology.repeatability(a["height"], b["height"])
-                r["sigma_inst"] = sig
-                if sig is not None and r.get("Sq"):
-                    r["sigma_inst_lt_Sq_over_10"] = bool(sig < r["Sq"] / 10)
+            why = self._repeat_check(self.result, r)
+            if why is None:
+                rep = metrology.repeatability(self.result["height"], r["height"])
+                if rep is not None:
+                    r["sigma_inst"] = rep["sigma_inst"]
+                    r["repeat_offset"] = rep["mean_offset"]
+                    r["repeat_overlap"] = rep["overlap_fraction"]
+                    if r.get("Sq"):
+                        r["sigma_inst_lt_Sq_over_10"] = bool(rep["sigma_inst"] < r["Sq"] / 10)
             else:
-                r["warnings"] = r.get("warnings", []) + ["Repeatability not computed: the stage moved, the objective "
-                                                         "changed or the size differs between the two sweeps."]
+                r["warnings"] = r.get("warnings", []) + [f"Repeatability not computed: {why}."]
         self.prev_result, self.result = self.result, r
         self._result_t = time.perf_counter()
         self._remember(r)
         self.last_ignored = None
-        # pin into the mosaic at preview resolution
-        s = self.engine.snapshot()
-        if s.preview is not None:
-            ph, pw = s.preview.shape
-            edf_p = cv2.resize(r["edf"], (pw, ph), interpolation=cv2.INTER_AREA)
-            h_p = cv2.resize(r["height"], (pw, ph), interpolation=cv2.INTER_NEAREST)
-            self.engine.add_height_patch(r["pose"], edf_p, h_p, r["z_unit"])
-            self.last_mosaic_version = -1
-        self._show_result()  # stay on the current tab: the user may be mapping; the toast says where to look
+        self._pin(r)
+        self._show_result()  # stay on the current tab: the user may be mapping; the result card says where to look
         w = r.get("warnings") or []
-        self.notify(f"Height map ready (Height tab): {r['valid_fraction']:.0%} of pixels reliable, "
+        self.notify(f"Height map ready: {r['valid_fraction']:.0%} of pixels reliable, "
                     f"{r['timings']['total']:.1f} s." + (f"  {len(w)} warning(s) in Report." if w else ""),
                     "warning" if w else "success")
+
+    def _pin(self, r: dict):
+        """Pin a result into the mosaic it was captured in, at the preview size of ITS capture. The engine drops it
+        if that mosaic has been restarted since (reset, new source or objective)."""
+        ps = r.get("preview_shape")
+        if not ps or not ps[0]:
+            return
+        ph, pw = int(ps[0]), int(ps[1])
+        edf_p = cv2.resize(r["edf"], (pw, ph), interpolation=cv2.INTER_AREA)
+        h_p = cv2.resize(r["height"], (pw, ph), interpolation=cv2.INTER_NEAREST)
+        self.engine.add_height_patch(r["pose"], edf_p, h_p, r["z_unit"], z_key(r), r.get("result_id", ""),
+                                     r.get("mosaic_generation"))
+        self.last_mosaic_version = -1
 
     HISTORY = 10
 
     def _remember(self, r):
         self._n_results = getattr(self, "_n_results", 0) + 1
         r.setdefault("label", f"#{self._n_results}  {str(r.get('timestamp', ''))[11:19]}  "
-                              f"{r['objective'].split(' /')[0]} · {r['valid_fraction']:.0%} reliable")
+                              f"{r['objective'].split(' /')[0]}")
         self.history.insert(0, r)
         del self.history[self.HISTORY:]
+        self._refresh_history()
+
+    def _refresh_history(self):
         self.cmb_hist.blockSignals(True)
         self.cmb_hist.clear()
-        self.cmb_hist.addItems([h["label"] for h in self.history])
-        self.cmb_hist.setCurrentIndex(0)
+        self.cmb_hist.addItems([f"{h['label']} · {h['valid_fraction']:.0%} · {units.label(h['z_unit'])}"
+                                for h in self.history])
+        self.cmb_hist.setCurrentIndex(next((i for i, h in enumerate(self.history) if h is self.result), 0))
         self.cmb_hist.blockSignals(False)
 
     def _pick_history(self, i):
@@ -1369,18 +1660,30 @@ class MainWindow(QMainWindow):
         r = self.result
         if r is None:
             return
-        m = metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
-                              OBJECTIVES[r["objective"]].lateral_cutoff_um, self.sp_form.value(),
-                              self.sp_ls.value() or None, self.sp_lc.value())
-        r["warnings"] = [x for x in r.get("warnings", []) if "reliable depth" not in x] + m.pop("warnings")
-        for k in ("Sa", "Sq", "Sp", "Sv", "Sz", "Ssk", "Sku", "Sdr_pct", "PSD_beta", "fractal_dimension", "Sk", "Spk",
-                  "Svk", "Smr1_pct", "Smr2_pct", "Sal_um", "Str", "Std_deg"):
-            r.pop(k, None)
-        r.update(m)
+        job = Job(_metrology_job, r, self.sp_form.value(), self._lam_s(OBJECTIVES[r["objective"]]),
+                  self.sp_lc.value(), label="Metrology")
+        self._start_job(job, lambda m, r=r: self._on_recomputed(r, m), main=True)
+
+    def _on_recomputed(self, r, m):
+        new = dict(r)
+        for k in metrology.PARAMETER_KEYS:
+            new.pop(k, None)
+        new["warnings"] = [x for x in r.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
+        new.update(m)
+        for i, h in enumerate(self.history):
+            if h is r:
+                self.history[i] = new
+        if self.result is r:
+            self.result = new
+        self.prog.setValue(1000)
+        self.lbl_job.setText("Metrology recomputed.")
         self._show_result()
         self.notify("Metrology recomputed with the new filter settings.", "success")
 
     def _run_sr(self):
+        if self.sr_job is not None and self.sr_job.isRunning():
+            self.notify("Super-resolution is already running.", "warning")
+            return
         frames = self.engine.dwell_frames()
         if len(frames) < 8:
             self.notify("Hold still for a moment (needs 8 still frames).", "warning")
@@ -1390,30 +1693,50 @@ class MainWindow(QMainWindow):
         y0, x0 = (h - c) // 2, (w - c) // 2
         crops = [f[y0:y0 + c, x0:x0 + c].astype(np.float32) for f in frames]
         cal = self.store.get(self.obj)
-        um = cal.um_per_px(w)
-        self.sr_job = Job(_sr_job, crops, self.obj.psf_sigma_px(um))
-        self.sr_job.progress.connect(self._on_progress)
-        self.sr_job.done.connect(lambda r: self._on_sr({**r, "um_per_px": um / 2, "input": crops[0]}))
-        self.sr_job.failed.connect(self._on_failed)
-        self.sr_job.start()
+        um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w)
+        job = Job(_sr_job, crops, self.obj.psf_sigma_px(um), label="Super-resolution")
+        self.sr_job = job
+        self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / 2, "input": crops[0]}))
 
     def _on_sr(self, r):
         self.sr_result = r
+        self.sr_count = getattr(self, "sr_count", 0) + 1
         self.prog.setValue(1000)
-        self.lbl_job.setText(f"Super-resolution: {len(r['shifts'])} frames, RL {r['rl_iterations']} iterations, "
-                             f"PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
+        self.lbl_job.setText(f"Super-resolution (2× linear, 4× pixels): {r['frames_used']} frames used, "
+                             f"{r['frames_rejected']} rejected, {r['subpixel_bins']} sub-pixel phases, "
+                             f"RL {r['rl_iterations']} iterations, PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
         self.cmb_edf.setCurrentIndex(1)
         self.tabs.setCurrentIndex(2)
         self._show_result()
 
     # ================================================================== result views
+    def _update_card(self):
+        r = self.result
+        if r is None:
+            self.card.hide()
+            return
+        lat = r.get("lateral_status", "?")
+        vf = r["valid_fraction"]
+        bits = [f"<b>{html.escape(r.get('label', ''))}</b>", html.escape(r["objective"]),
+                f"XY {lat}", html.escape(z_status_text(r)), f"{vf:.0%} valid"]
+        if r.get("support_fraction") is not None and r["support_fraction"] < 0.98:
+            bits.append(f"{r['support_fraction']:.0%} of the field observed in every frame")
+        warn = len(r.get("warnings", []))
+        if warn:
+            bits.append(f"<span style='color:{self.t['warning']}'>⚠ {warn} warning(s) in Report</span>")
+        self.lbl_card.setText(" · ".join(bits))
+        self.btn_card_z.setVisible(r.get("z_orientation") != "known" and r.get("z_status") != "SIMULATED")
+        self.card.show()
+
     def _show_result(self):
         r = self.result
+        self._update_card()
         if self.cmb_edf.currentIndex() == 1 and self.sr_result is not None:
             sr = self.sr_result
             self.p_edf.set_image(np.clip(sr["image"], 0, 255), sr["um_per_px"], levels=(0, 255), unit="DN", autorange=True)
             self.p_edf.set_overlay(None)
-            self.lbl_edf.setText("Experimental: 2× drizzle + Richardson-Lucy of the centre crop")
+            self.lbl_edf.setText("Experimental: 2× (linear) drizzle + Richardson-Lucy of the centre crop; a display "
+                                 "image, not a measured resolution gain")
         elif r is not None:
             um_cap = r["um_per_px_capture"]
             self.p_edf.set_image(r["edf"], um_cap, levels=(0, 255), unit="DN")
@@ -1427,20 +1750,31 @@ class MainWindow(QMainWindow):
                 self.p_edf.set_overlay(ov)
             else:
                 self.p_edf.set_overlay(None)
-            self.lbl_edf.setText(f"{r['frames_used']} of {r['frames_in']} frames fused · {r.get('grain_count', 0)} grains")
+            self.lbl_edf.setText(f"{r['frames_used']} of {r['frames_in']} frames fused · {r.get('grain_count', 0)} "
+                                 "watershed regions (image-based)")
         if r is None:
             self._render_report()
             return
         mode = self.cmb_height.currentIndex()
         um = r["um_per_px"]
+        zl = units.label(r["z_unit"])
         if mode == 0:
-            data, unit = r["sl_surface"], r["z_unit"]
+            data, unit = r["sl_surface"], zl
         elif mode == 1:
-            data, unit = r["height"], r["z_unit"]
+            data, unit = r["height"], zl
         else:
             data, unit = r["confidence"], ""
+        levels = (0, 1) if mode == 2 else None
+        if self.chk_lock.isChecked() and mode != 2:
+            lk = getattr(self, "_locked_levels", None)
+            if lk is None or lk[0] != (mode, units.canon(r["z_unit"])):
+                fin = data[np.isfinite(data)]
+                lk = ((mode, units.canon(r["z_unit"])), (float(np.percentile(fin, 1)), float(np.percentile(fin, 99)))
+                      if fin.size else (0.0, 1.0))
+                self._locked_levels = lk
+            levels = lk[1]
         self.p_height.bar.setColorMap(pg.colormap.get("cividis" if mode == 2 else "viridis"))
-        self.p_height.set_image(data, um, levels=(0, 1) if mode == 2 else None, unit=unit)
+        self.p_height.set_image(data, um, levels=levels, unit=unit)
         self.p_height.extra = r["confidence"]
         if not self.prof_roi.isVisible():
             h, w = data.shape
@@ -1449,8 +1783,8 @@ class MainWindow(QMainWindow):
             hs[0].setPos(w * um * 0.1, h * um * 0.5)
             hs[1].setPos(w * um * 0.9, h * um * 0.5)
             self.prof_roi.show()
-        zs = r["z_status"]
-        self.lbl_height.setText(f"{r['valid_fraction']:.0%} reliable · {um:.3f} µm/px · z in {r['z_unit']} ({zs})")
+        what = ["filtered height", "raw fitted height", "confidence (0–1)"][mode]
+        self.lbl_height.setText(f"{what} · {r['valid_fraction']:.0%} reliable · {um:.3f} µm/px · {z_status_text(r)}")
         self._update_profile()
         self._update_3d()
         self._render_report()
@@ -1461,28 +1795,37 @@ class MainWindow(QMainWindow):
             return
         mode = self.cmb_height.currentIndex()
         data = r["sl_surface"] if mode == 0 else (r["height"] if mode == 1 else r["confidence"])
+        zl = units.label(r["z_unit"])
         um = r["um_per_px"]
+        self.prof_plot.setLabel("left", "confidence" if mode == 2 else "height", units="" if mode == 2 else zl)
+        self.prof_plot.getAxis("left").enableAutoSIPrefix(False)
+        self.prof_plot.setLabel("bottom", "distance", units="µm")
+        self.prof_plot.getAxis("bottom").enableAutoSIPrefix(False)
         h0, h1 = (self.prof_roi.mapToParent(hd.pos()) for hd in self.prof_roi.getHandles())
         x0, y0, x1, y1 = h0.x() / um, h0.y() / um, h1.x() / um, h1.y() / um
         n = int(max(2, math.hypot(x1 - x0, y1 - y0)))
         xs, ys = np.linspace(x0, x1, n), np.linspace(y0, y1, n)
         ok = (xs >= 0) & (xs < data.shape[1] - 1) & (ys >= 0) & (ys < data.shape[0] - 1)
         prof = np.full(n, np.nan, np.float32)
-        if not ok.any():
+        if not ok.any():  # outside the image: nothing stale may remain
             self.prof_curve.setData([], [])
+            self.prof_label.setText("The profile line is outside the image.")
             return
         prof[ok] = cv2.remap(data.astype(np.float32), xs[ok].astype(np.float32).reshape(1, -1),
                              ys[ok].astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR).ravel()
         dist = np.hypot(xs - x0, ys - y0) * um
         self.prof_curve.setData(dist, prof, connect="finite")
-        self.prof_plot.setLabel("bottom", "distance", units="µm")
-        self.prof_plot.getAxis("bottom").enableAutoSIPrefix(False)
         v = prof[np.isfinite(prof)]
-        if v.size > 4 and mode != 2:
+        if mode == 2:
+            self.prof_label.setText(f"Confidence along {dist[-1]:.1f} µm: mean {np.mean(v):.2f}" if v.size
+                                    else "No confidence values along the line.")
+        elif v.size > 4:
             v = v - v.mean()
-            self.prof_label.setText(f"Profile over {dist[-1]:.1f} µm:  Ra {np.mean(np.abs(v)):.4g} {r['z_unit']}  ·  "
-                                    f"Rq {np.sqrt(np.mean(v * v)):.4g}  ·  Rz(max-min) {np.ptp(v):.4g}  "
-                                    "(no profile filtering; for orientation only)")
+            self.prof_label.setText(f"Profile over {dist[-1]:.1f} µm ({v.size} of {n} points valid):  "
+                                    f"Ra {np.mean(np.abs(v)):.4g} {zl}  ·  Rq {np.sqrt(np.mean(v * v)):.4g} {zl}  ·  "
+                                    f"peak-to-valley {np.ptp(v):.4g} {zl}  (unfiltered profile; for orientation only)")
+        else:
+            self.prof_label.setText("Too few valid heights along the line for profile values.")
 
     def _update_3d(self):
         r = self.result
@@ -1496,98 +1839,148 @@ class MainWindow(QMainWindow):
         if not finite.any():
             return
         fill = float(np.nanmedian(zs))
-        zf = np.where(finite, zs, fill)
+        zf = np.where(finite, zs, fill)  # display-only fill: those facets are fully transparent (real holes)
         lo, hi = np.percentile(zf[finite], [1, 99])
         cm = pg.colormap.get(self.cmb_cmap.currentText())
         norm = np.clip((zf - lo) / max(hi - lo, 1e-9), 0, 1)
+        exag = self.sl_exag.value() / 10.0
+        is_um = units.is_um(r["z_unit"])
+        note = (f"z exaggeration ×{exag:g}" + ("" if is_um else " · z in focus frames × pixel size (not µm)")
+                + f" · {1 - finite.mean():.0%} without depth shown as holes")
         if self.gl is not None:
-            exag = self.sl_exag.value() / 10.0
-            zscale = exag * (1.0 if r["z_unit"] == "µm" else um)
+            zscale = exag * (1.0 if is_um else um)
             cols = cm.map(norm.ravel(), mode="float").reshape(zs.shape + (4,))
-            cols[~finite, 3] = 0.15
+            cols[~finite, 3] = 0.0
             xs = np.arange(zs.shape[1]) * um * step
             ys = np.arange(zs.shape[0]) * um * step
             self.gl_surf.setData(x=xs - xs.mean(), y=ys - ys.mean(), z=(zf.T - fill) * zscale,
                                  colors=np.transpose(cols, (1, 0, 2)))
             self.gl_surf.setVisible(True)
             span = max(xs.max(), ys.max())
-            self.gl_grid.setSize(span * 1.2, span * 1.2)
-            self.gl_grid.setSpacing(span / 10, span / 10)
-            self.gl.setCameraPosition(distance=span * 1.4)
+            key = (zs.shape, round(span, 3))
+            if key != getattr(self, "_gl_key", None):  # keep the user's view when only colours or exaggeration change
+                self._gl_key = key
+                self.gl_grid.setSize(span * 1.2, span * 1.2)
+                self.gl_grid.setSpacing(span / 10, span / 10)
+                self.gl.setCameraPosition(distance=span * 1.4)
+            self.lbl_3d.setText(note)
         else:
-            gy, gx = np.gradient(zf * (self.sl_exag.value() / 10.0))
+            gy, gx = np.gradient(zf * exag)
             shade = np.clip(0.6 + 0.4 * (-gx - gy) / (np.hypot(gx, gy) + 1e-3 * (hi - lo) + 1e-12), 0, 1)
             rgb = (cm.map(norm.ravel(), mode="float").reshape(zs.shape + (4,))[..., :3] * shade[..., None] * 255)
             rgb[~finite] = hex_rgb(self.t["nan"])
             self.relief.set_image(rgb.astype(np.uint8), um * step, rgb=True)
+            self.lbl_3d.setText("Shaded relief (no OpenGL) · " + note)
 
     def _render_report(self):
         t = self.t
         r = self.result
         css = (f"body{{color:{t['text']};font-size:13px}} h2,h3{{margin:6px 0}} table{{border-collapse:collapse}}"
                f" td,th{{padding:4px 10px;border-bottom:1px solid {t['border']}}} th{{text-align:left;color:{t['muted']}}}"
-               f" .w{{color:{t['warning']}}} .m{{color:{t['muted']}}}")
+               f" .w{{color:{t['warning']}}} .m{{color:{t['muted']}}} .ok{{color:{t['success']}}}")
         if r is None:
             self.report.setHtml(f"<style>{css}</style><h2>Report</h2><p class='m'>No measurement yet. Turn the fine "
                                 f"focus through the sample to create a height map.</p>{OPTICS_NOTES}")
             return
-        zu = r["z_unit"]
+        zu = units.label(r["z_unit"])
+        elig = r.get("eligibility", {})
 
-        def row(name, key, unit, desc, fmt="{:.4g}"):
+        def row(name, key, unit, desc, fmt="{:.4g}", group=None):
             v = r.get(key)
             if v is None or (isinstance(v, float) and not np.isfinite(v)):
-                return f"<tr><td>{name}</td><td class='m'>—</td><td>{unit}</td><td class='m'>{desc}</td></tr>"
-            return f"<tr><td>{name}</td><td><b>{fmt.format(v)}</b></td><td>{unit}</td><td class='m'>{desc}</td></tr>"
+                why = elig.get(group, "") if group else ""
+                why = "" if why == "ok" else why
+                return (f"<tr><td>{name}</td><td class='m'>—</td><td>{unit}</td><td class='m'>{html.escape(desc)}"
+                        f"{(' · <i>' + html.escape(why) + '</i>') if why else ''}</td></tr>")
+            return (f"<tr><td>{name}</td><td><b>{fmt.format(v)}</b></td><td>{unit}</td>"
+                    f"<td class='m'>{html.escape(desc)}</td></tr>")
 
-        warn = "".join(f"<p class='w'>⚠ {html.escape(w)}</p>" for w in r.get("warnings", []))
-        if r.get("z_status") == CalStatus.SIMULATED.value:
-            warn += "<p class='w'>⚠ Simulated specimen: heights are simulation truth units, not a measurement.</p>"
-        elif zu == "frames":
-            warn += "<p class='w'>⚠ Z is not calibrated: height parameters are in focus-frame units.</p>"
+        def table(title, rows):
+            return (f"<h3>{title}</h3><table><tr><th>Parameter</th><th>Value</th><th>Unit</th><th>Meaning</th></tr>"
+                    + "".join(row(*x) for x in rows) + "</table>")
+
+        # 1. eligibility first: what these numbers are and are not
+        status = []
+        zs = r.get("z_status")
+        if zs == CalStatus.SIMULATED.value:
+            status.append("Simulated specimen: heights are simulation truth, not a measurement.")
+        elif units.canon(r["z_unit"]) == units.FRAMES:
+            status.append("Z is not calibrated: heights are relative focus progression in camera frames (constant "
+                          "knob speed assumed). Use 'Set Z…' to state this sweep's knob travel.")
+        elif zs == CalStatus.ESTIMATED.value:
+            status.append("Z scale is an ESTIMATE carried over from another sweep or the DOF ruler "
+                          f"({html.escape(str(r.get('z_source') or ''))}); it assumes the same knob speed.")
+        if r.get("z_orientation") == "unknown":
+            status.append("Sweep direction unknown: the relief may be inverted.")
         if r.get("lateral_status") == "NOMINAL":
-            warn += "<p class='w'>⚠ Lateral scale is nominal (uncalibrated): µm lengths and Sdr are indicative.</p>"
-        rows = [
-            ("Sa", "Sa", zu, "Arithmetic mean height"), ("Sq", "Sq", zu, "Root-mean-square height"),
-            ("Sp", "Sp", zu, "Maximum peak height"), ("Sv", "Sv", zu, "Maximum pit depth"),
-            ("Sz", "Sz", zu, "Maximum height (Sp + Sv)"), ("Ssk", "Ssk", "", "Skewness"), ("Sku", "Sku", "", "Kurtosis"),
-            ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)"),
-            ("Sk", "Sk", zu, "Core height (40% secant of the material ratio curve)"),
-            ("Spk", "Spk", zu, "Reduced peak height"), ("Svk", "Svk", zu, "Reduced valley depth"),
-            ("Smr1", "Smr1_pct", "%", "Material ratio at the top of the core"),
-            ("Smr2", "Smr2_pct", "%", "Material ratio at the bottom of the core"),
-            ("Sal", "Sal_um", "µm", "Fastest autocorrelation decay length (to 0.2)"),
-            ("Str", "Str", "", "Texture aspect ratio: ~1 isotropic, ~0 strongly directional"),
-            ("Std", "Std_deg", "°", "Texture direction (lay), from the angular spectrum"),
-            ("σ_inst", "sigma_inst", zu, "Repeatability from two sweeps, std(Δz)/√2"),
-            ("PSD slope β", "PSD_beta", "", "Log-log slope of the radial power spectrum"),
-            ("Fractal dimension", "fractal_dimension", "", "(8−β)/2, only when 2 < β < 4"),
+            status.append("Lateral scale is nominal (uncalibrated): µm lengths, Sdr and grain sizes are indicative.")
+        head = "".join(f"<p class='w'>⚠ {html.escape(x)}</p>" for x in status)
+        head += "".join(f"<p class='w'>⚠ {html.escape(w)}</p>" for w in r.get("warnings", []))
+        head += "".join(f"<p class='m'>{html.escape(n)}</p>" for n in r.get("filter_notes", [])
+                        if n not in r.get("warnings", []))
+        form = metrology.FORM_NAMES.get(r.get("form_order"), str(r.get("form_order")))
+        lam_s = r.get("lambda_s_um") or 0
+        operator = (f"Surface operator: form removal ({form}), "
+                    + (f"S-filter λs {lam_s:.3g} µm" if lam_s else "no S-filter")
+                    + (f", L-filter λc {r['lambda_c_um']:.4g} µm" if r.get("lambda_c_um") else ", no L-filter")
+                    + f"; {r['valid_fraction']:.0%} of pixels valid; parameters use valid pixels only.")
+        body = table("Height (ISO 25178-2 amplitude)", [
+            ("Sa", "Sa", zu, "Arithmetic mean height", "{:.4g}", "height"),
+            ("Sq", "Sq", zu, "Root-mean-square height", "{:.4g}", "height"),
+            ("Sp", "Sp", zu, "Maximum peak height", "{:.4g}", "height"),
+            ("Sv", "Sv", zu, "Maximum pit depth", "{:.4g}", "height"),
+            ("Sz", "Sz", zu, "Maximum height (Sp + Sv)", "{:.4g}", "height"),
+            ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
+            ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])
+        body += table("Material ratio (functional)", [
+            ("Sk", "Sk", zu, "Core height (40% secant of the material ratio curve)", "{:.4g}", "functional"),
+            ("Spk", "Spk", zu, "Reduced peak height", "{:.4g}", "functional"),
+            ("Svk", "Svk", zu, "Reduced valley depth", "{:.4g}", "functional"),
+            ("Smr1", "Smr1_pct", "%", "Material ratio at the top of the core", "{:.4g}", "functional"),
+            ("Smr2", "Smr2_pct", "%", "Material ratio at the bottom of the core", "{:.4g}", "functional")])
+        body += table("Spatial and spectral", [
+            ("Sal", "Sal_um", "µm", "Fastest autocorrelation decay length (to 0.2)", "{:.4g}", "spatial"),
+            ("Str", "Str", "", "Texture aspect ratio: ~1 isotropic, ~0 strongly directional", "{:.4g}", "spatial"),
+            ("Std", "Std_deg", "°", "Texture direction (lay), from the angular spectrum", "{:.4g}", "spatial"),
+            ("PSD slope β", "PSD_beta", "", "Log-log slope of the radial power spectrum", "{:.4g}", "spectral"),
+            ("Fractal dimension", "fractal_dimension", "", "(8−β)/2, only when 2 < β < 4", "{:.4g}", "spectral")])
+        if r.get("sigma_inst") is not None or any("Repeatability" in w for w in r.get("warnings", [])):
+            body += table("Repeatability (two sweeps, same spot)", [
+                ("σ_inst", "sigma_inst", zu, "Relative shape repeatability, std(Δz − mean)/√2"),
+                ("Mean offset", "repeat_offset", zu, "Datum difference between the sweeps (removed above)"),
+                ("Overlap", "repeat_overlap", "", "Fraction of pixels valid in both", "{:.0%}")])
+        body += table("Image texture and grains (from the all-in-focus image, not heights)", [
             ("GLCM contrast", "GLCM_contrast", "", "Haralick texture, 64 grey levels"),
             ("GLCM homogeneity", "GLCM_homogeneity", "", ""), ("GLCM correlation", "GLCM_correlation", "", ""),
-            ("Grains", "grain_count", "", "Watershed regions not touching the border", "{:d}"),
-            ("Mean grain area", "mean_grain_area_um2", "µm²", ""), ("Mean max Feret", "mean_max_feret_um", "µm", ""),
-            ("Mean circularity", "mean_circularity", "", "4πA/P²"),
-            ("Mean lineal intercept", "mean_intercept_um", "µm", "Heyn intercept on the grain boundaries"),
-            ("ASTM E112 G", "ASTM_E112_G", "", "Grain size number from the mean intercept (calibrated X-Y needed)"),
-        ]
-        body = "".join(row(*x) for x in rows)
-        prov = [("Objective", r["objective"]), ("Frames used", f"{r['frames_used']} of {r['frames_in']}"),
-                ("Valid pixels", f"{r['valid_fraction']:.1%}"), ("Pixel size", f"{r['um_per_px']:.4f} µm"),
-                ("λs / λc", f"{r['lambda_s_um']:.3g} µm / {r['lambda_c_um'] or 'off'}"),
-                ("Form removal order", r["form_order"]), ("Focus measure", r["measure"]),
-                ("Z status", r.get("z_status")), ("Lateral status", r.get("lateral_status")),
-                ("Registration", f"ECC mean {r['ecc_mean']:.3f}, fallbacks {r['registration_fallbacks']}"
-                 if r.get("ecc_mean") is not None else "—"),
-                ("DOF ruler (experimental)", f"{r['dof_ruler_um_per_frame']:.4f} µm/frame" if r.get("dof_ruler_um_per_frame") else "—"),
-                ("Time", f"{r['timings']['total']:.1f} s")]
+            ("Regions", "grain_count", "", "Watershed regions not touching the border (not verified grains)", "{:d}"),
+            ("Mean region area", "mean_grain_area_um2", "µm²", ""),
+            ("Mean max Feret", "mean_max_feret_um", "µm", ""), ("Mean circularity", "mean_circularity", "", "4πA/P²"),
+            ("Mean lineal intercept", "mean_intercept_um", "µm", "Heyn intercept on the region boundaries"),
+            ("ASTM E112-style G", "ASTM_E112_G", "", "From the mean intercept; needs calibrated X-Y and a real "
+             "grain structure")])
+        prov = [("Result", r.get("label", "")), ("Result id", r.get("result_id", "—")), ("Objective", r["objective"]),
+                ("Source", f"{r.get('source_id', '—')} (generation {r.get('source_generation', '—')})"),
+                ("Frames used", f"{r['frames_used']} of {r['frames_in']}"),
+                ("Z", z_status_text(r) + (f" · {r['z_source']}" if r.get("z_source") else "")),
+                ("Lateral status", r.get("lateral_status")), ("Pixel size", f"{r['um_per_px']:.4f} µm"),
+                ("Calibration revision", r.get("calibration_revision", "—")), ("Focus measure", r["measure"]),
+                ("Compute backend", r.get("backend", "cpu")),
+                ("Registration", f"ECC mean {r['ecc_mean']:.3f}, fallbacks {r['registration_fallbacks']}, "
+                 f"unobservable {r.get('registration_unobservable', 0)}" if r.get("ecc_mean") is not None else "—"),
+                ("Observed in every frame", f"{r['support_fraction']:.1%}" if r.get("support_fraction") is not None
+                 else "—"),
+                ("DOF ruler (experimental)", f"{r['dof_ruler_um_per_frame']:.4f} µm/frame"
+                 if r.get("dof_ruler_um_per_frame") else "—"),
+                ("Session file", f"schema {r['session_schema']}" if r.get("session_schema") else "—"),
+                ("Time", f"{r['timings']['total']:.1f} s" if r.get("timings") else "—")]
         pv = "".join(f"<tr><td>{k}</td><td>{html.escape(str(v))}</td></tr>" for k, v in prov)
-        self.report.setHtml(f"<style>{css}</style><h2>Surface report</h2>{warn}"
-                            f"<p class='m'>ISO 25178-style parameters (not a certified implementation): form removal, "
-                            f"Gaussian S-filter, optional L-filter, valid pixels only.</p>"
-                            f"<table><tr><th>Parameter</th><th>Value</th><th>Unit</th><th>Meaning</th></tr>{body}</table>"
-                            f"<h3>Provenance</h3><table>{pv}</table>{OPTICS_NOTES}")
-        self.diag.setPlainText("stage timings (s)\n" + "\n".join(f"  {k}: {v}" for k, v in r["timings"].items())
-                               + f"\nframes used: {r['frames_used']} of {r['frames_in']}"
-                               + f"\nreversal at: {r.get('reversal_at')}\nfocus window: {r.get('focus_window_px')} px")
+        self.report.setHtml(f"<style>{css}</style><h2>Surface report</h2>{head}"
+                            f"<p class='m'>{html.escape(operator)} ISO 25178-style parameters (not a certified "
+                            f"implementation).</p>{body}<h3>Provenance</h3><table>{pv}</table>{OPTICS_NOTES}")
+        if r.get("timings"):
+            self.diag.setPlainText("stage timings (s)\n" + "\n".join(f"  {k}: {v}" for k, v in r["timings"].items())
+                                   + f"\nframes used: {r['frames_used']} of {r['frames_in']}"
+                                   + f"\nreversal at: {r.get('reversal_at')}\nfocus window: {r.get('focus_window_px')} px")
 
     # ================================================================== export / session
     def _need_result(self) -> bool:
@@ -1603,25 +1996,45 @@ class MainWindow(QMainWindow):
             self.settings.setValue("export_dir", str(Path(p).parent))
         return p
 
+    def _confirm_export(self, path, what, unit, invalid) -> bool:
+        """Say exactly what will be written before writing it."""
+        r = self.result or {}
+        txt = (f"<b>{html.escape(what)}</b><br>Result: {html.escape(str(r.get('label', '—')))} · "
+               f"{html.escape(r.get('objective', '—'))}<br>Heights in <b>{unit}</b>"
+               + (f" · {html.escape(z_status_text(r))}" if r else "")
+               + f"<br>Pixels without a reliable depth: {html.escape(invalid)}<br>A validity mask (.mask.png) and "
+               f"provenance (.json) are written beside it.<br><br>{html.escape(str(path))}")
+        box = QMessageBox(QMessageBox.Question, "Export", txt, QMessageBox.Save | QMessageBox.Cancel, self)
+        box.setTextFormat(Qt.RichText)
+        return box.exec() == QMessageBox.Save
+
+    def _export(self, fmt, title, name, filt, what, invalid):
+        if not (self._need_result() and (p := self._save_path(title, name, filt))):
+            return
+        r = self.result
+        if not self._confirm_export(p, what, units.label(r["z_unit"]), invalid):
+            return
+        prov = {k: r.get(k) for k in ("label", "result_id", "objective", "z_status", "z_orientation",
+                                      "lateral_status", "form_name", "lambda_s_um", "lambda_c_um", "timestamp")}
+        prov["software"] = f"MicroTopos {__version__}"
+        try:
+            paths = export.export_height(p, fmt, r["sl_surface"], r["um_per_px"], r["z_unit"], prov,
+                                         f"MicroTopos {r['objective']} {r.get('z_status')}")
+            self.notify(f"Saved {paths[0]} (+ mask and provenance)", "success")
+        except OSError as e:
+            self.notify(f"Export failed, nothing written: {e}", "danger")
+
     def _export_gsf(self):
-        if self._need_result() and (p := self._save_path("Export Gwyddion field", "height.gsf", "GSF (*.gsf)")):
-            r = self.result
-            export.write_gwyddion_gsf(p, r["sl_surface"], r["um_per_px"], r["z_unit"] == "µm",
-                                      f"MicroTopos {r['objective']} {r.get('z_status')}")
-            self.notify(f"Saved {p}", "success")
+        self._export("gsf", "Export Gwyddion field", "height.gsf", "GSF (*.gsf)", "Filtered height map, Gwyddion .gsf",
+                     "filled with the median in the .gsf (Gwyddion needs a value); the mask records them")
 
     def _export_tiff(self):
-        if self._need_result() and (p := self._save_path("Export float TIFF", "height.tif", "TIFF (*.tif)")):
-            export.write_float32_tiff(p, self.result["sl_surface"], self.result["um_per_px"])
-            self.notify(f"Saved {p}", "success")
+        self._export("tif", "Export float TIFF", "height.tif", "TIFF (*.tif)", "Filtered height map, 32-bit float TIFF",
+                     "NaN")
 
     def _export_stl(self):
-        if self._need_result() and (p := self._save_path("Export STL", "surface.stl", "STL (*.stl)")):
-            r = self.result
-            z = r["sl_surface"] if r["z_unit"] == "µm" else r["sl_surface"] * r["um_per_px"]
-            n, _ = export.write_binary_stl(p, z, r["um_per_px"], max_grid_dim=400)
-            self.notify(f"Saved {p} ({n} triangles)" + ("" if r["z_unit"] == "µm" else "; z in frames × pixel size"),
-                        "success")
+        self._export("stl", "Export STL", "surface.stl", "STL (*.stl)", "Visualisation mesh (STL), not a measurement "
+                     "archive", "filled with the median (display surface)")
 
     def _export_report(self):
         if not self._need_result():
@@ -1631,20 +2044,41 @@ class MainWindow(QMainWindow):
         if d:
             import scipy
             import skimage
-            files = export.write_report_bundle(d, self.result, {"microtopos": __version__, "numpy": np.__version__,
-                                                                "opencv": cv2.__version__, "scipy": scipy.__version__,
-                                                                "scikit-image": skimage.__version__})
-            self.notify(f"Saved {len(files)} files to {d}", "success")
+            try:
+                files = export.write_report_bundle(d, self.result, {
+                    "microtopos": __version__, "numpy": np.__version__, "opencv": cv2.__version__,
+                    "scipy": scipy.__version__, "scikit-image": skimage.__version__})
+                self.notify(f"Saved {len(files)} files to {d}", "success")
+            except OSError as e:
+                self.notify(f"Report not written (nothing was left half-done): {e}", "danger")
 
     def _save_session(self):
-        if self._need_result() and (p := self._save_path("Save session", "session.npz", "Session (*.npz)")):
-            (img, origin), hm, _, _ = self.engine.mosaic_image()
-            extra = {"mosaic_image": img, "mosaic_origin": list(origin), "um_preview": getattr(self, "um_preview", None)}
-            if hm is not None:
-                extra.update(height_mosaic=hm[0], height_mosaic_origin=list(hm[1]))
-            export.save_session(p, {**self.result, **extra},
-                                {"objective": self.obj.name, "measure": self.cmb_measure.currentText()})
-            self.notify(f"Saved {p}", "success")
+        (img, origin), parts = self.engine.mosaic_full()
+        mosaic_ok = np.isfinite(img).any() and len(self.engine.mosaic.keyframes) > 1
+        if self.result is None and not mosaic_ok and self.loaded_mosaic is None:
+            self.notify("Nothing to save yet: no height map and no mosaic.", "warning")
+            return
+        p = self._save_path("Save session", "session.npz", "Session (*.npz)")
+        if not p:
+            return
+        extra = {"um_preview": getattr(self, "um_preview", None)}
+        if mosaic_ok:
+            extra.update(mosaic_image=img, mosaic_origin=list(origin))
+            if parts:
+                extra.update(height_mosaic=parts[0][1], height_mosaic_origin=list(parts[0][2]),
+                             height_mosaic_key=parts[0][0])
+        elif self.loaded_mosaic is not None:  # re-saving an opened session keeps its mosaic
+            (limg, lorig, _d), lparts = self.loaded_mosaic
+            extra.update(mosaic_image=limg, mosaic_origin=list(lorig))
+            if lparts:
+                extra.update(height_mosaic=lparts[0][1], height_mosaic_origin=list(lparts[0][2]),
+                             height_mosaic_key=lparts[0][0])
+        try:
+            export.save_session(p, self.result, {"objective": self.obj.name, "measure": self.cmb_measure.currentText(),
+                                                 "software": f"MicroTopos {__version__}"}, extra)
+            self.notify(f"Saved {p}" + ("" if self.result is not None else " (mosaic only)"), "success")
+        except OSError as e:
+            self.notify(f"Session not saved: {e}", "danger")
 
     def _load_session(self):
         d = self.settings.value("export_dir", str(Path.home()))
@@ -1652,26 +2086,39 @@ class MainWindow(QMainWindow):
         if not p:
             return
         try:
-            r, s = export.load_session(p)
-            if "edf_proc" not in r:
-                r["edf_proc"] = cv2.resize(r["edf"], (r["height"].shape[1], r["height"].shape[0]),
-                                           interpolation=cv2.INTER_AREA)
-            m = metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
-                                  OBJECTIVES[r["objective"]].lateral_cutoff_um, r.get("form_order", 1),
-                                  r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
-            r["warnings"] = m.pop("warnings")
-            r.update(m)
-            self.result = r
-            self._remember(r)
+            r, s = export.load_session(p)  # validated before anything in the window changes
+            has = "height" in r
+            if has and r["migrated"]:  # schema 1: recompute what it did not store, and say so
+                if "edf_proc" not in r:
+                    r["edf_proc"] = cv2.resize(r["edf"], (r["height"].shape[1], r["height"].shape[0]),
+                                               interpolation=cv2.INTER_AREA)
+                m = metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
+                                      OBJECTIVES[r["objective"]].lateral_cutoff_um, r.get("form_order", 1),
+                                      r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
+                kept = [w for w in r.get("warnings", []) if not metrology.is_metrology_warning(w)]
+                r["warnings"] = kept + m.pop("warnings") + [
+                    "Opened from an older session file: the processing image and the filtered surface were "
+                    "recomputed from the stored heights (the original processing image was not stored)."]
+                r.update({k: v for k, v in m.items() if k not in r or k in metrology.PARAMETER_KEYS})
             if isinstance(r.get("mosaic_image"), np.ndarray):
-                hm = (r["height_mosaic"], tuple(r["height_mosaic_origin"])) if isinstance(
-                    r.get("height_mosaic"), np.ndarray) else None
-                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"])), hm)
+                parts = []
+                if isinstance(r.get("height_mosaic"), np.ndarray):
+                    parts = [(r.get("height_mosaic_key", "um" if units.is_um(r.get("z_unit")) else "frames#loaded"),
+                              r["height_mosaic"], tuple(r["height_mosaic_origin"]), 1)]
+                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts)
                 self.last_mosaic_version = -1
-            self._show_result()
-            self.tabs.setCurrentIndex(3)
-            self.notify(f"Opened {p}", "success")
-        except Exception as e:
+            if has:
+                r.setdefault("result_id", uuid.uuid4().hex[:12])
+                r["mosaic_generation"] = -1  # never pinned into the live mosaic
+                r["label"] = f"{Path(p).name}: {r.get('label', '')}".strip(": ")
+                self.result = r
+                self._remember(r)
+                self._show_result()
+                self.tabs.setCurrentIndex(3)
+            else:
+                self.tabs.setCurrentIndex(1)
+            self.notify(f"Opened {p}" + ("" if has else " (mosaic only)"), "success")
+        except Exception as e:  # noqa: BLE001 - a damaged file is reported, the window is unchanged
             self.notify(f"Could not open session: {e}", "danger")
 
     # ================================================================== shutdown
@@ -1679,6 +2126,16 @@ class MainWindow(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("state", self.saveState())
         self.timer.stop()
+        for j in list(self.jobs):  # ask every worker to stop, then wait until it has (they poll the flag)
+            j.cancel = True
+        t0 = time.perf_counter()
+        for j in list(self.jobs):
+            while j.isRunning():
+                QApplication.processEvents()
+                j.wait(50)
+                if time.perf_counter() - t0 > 60:
+                    print(f"warning: {j.label} did not stop within 60 s", flush=True)
+                    t0 = float("inf")
         if isinstance(self.source, CameraSource) and getattr(self.source, "recording", False):
             self.source.stop_recording()
         self.engine.stop()

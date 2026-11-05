@@ -126,12 +126,36 @@ def richardson_lucy(obs: np.ndarray, sigma_px: float, noise_sigma: float, max_it
     return x, it
 
 
+MIN_SR_FRAMES = 4
+
+
+def subpixel_bins(shifts: list[tuple[float, float]], scale: int) -> int:
+    """Number of distinct (x, y) sub-pixel phases (on the 1/scale grid) covered by the frame shifts."""
+    return len({(int(np.floor((dx % 1.0) * scale)), int(np.floor((dy % 1.0) * scale))) for dx, dy in shifts})
+
+
 def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2, pixfrac: float = 0.7,
                    deconvolve: bool = True) -> dict:
+    """Drizzle + Richardson-Lucy of still frames. `scale` is linear (2 = 2x per axis, 4x the pixel count).
+
+    Frames whose registration is not a valid ECC match are excluded; fewer than MIN_SR_FRAMES valid frames, or
+    shifts that cover too few sub-pixel phases to add information, raise ValueError instead of returning a
+    resampled image that only looks sharper.
+    """
     ref = frames[0].astype(np.float32)
     # ECC translation (sub-pixel, unbiased) initialised by phase correlation; content shift = warp translation
-    shifts = [(0.0, 0.0)] + [tuple(float(v) for v in register_pair(ref, f.astype(np.float32), 1).warp[:, 2])
-                             for f in frames[1:]]
+    regs = [register_pair(ref, f.astype(np.float32), 1) for f in frames[1:]]
+    keep = [0] + [k + 1 for k, r in enumerate(regs) if r.ok]
+    rejected = len(frames) - len(keep)
+    if len(keep) < MIN_SR_FRAMES:
+        raise ValueError(f"only {len(keep)} of {len(frames)} frames registered reliably (needs {MIN_SR_FRAMES}); "
+                         "the view needs texture and must stay in focus")
+    frames = [frames[k] for k in keep]
+    shifts = [(0.0, 0.0)] + [tuple(float(v) for v in regs[k - 1].warp[:, 2]) for k in keep[1:]]
+    bins = subpixel_bins(shifts, scale)
+    if bins < max(2, (scale * scale + 1) // 2):
+        raise ValueError(f"the frames cover only {bins} of {scale * scale} sub-pixel phases: there is not enough "
+                         "sub-pixel motion between them for super-resolution")
     driz, cover = drizzle(frames, shifts, scale, pixfrac)
     sigma_lr, src = fit_edge_psf_sigma(np.mean(frames, axis=0), psf_sigma_lr)
     out, iters = driz, 0
@@ -141,4 +165,5 @@ def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2
         sig_hr = math.sqrt((sigma_lr * scale) ** 2 + (pixfrac * scale) ** 2 / 12.0)
         out, iters = richardson_lucy(driz, sig_hr, noise)  # stops at the noise level or after 30 iterations
     return {"image": out, "drizzled": driz, "shifts": shifts, "psf_sigma_lr": sigma_lr, "psf_source": src,
-            "rl_iterations": iters, "noise_sigma": noise, "coverage_min": float(cover.min())}
+            "rl_iterations": iters, "noise_sigma": noise, "coverage_min": float(cover.min()),
+            "frames_used": len(frames), "frame_indices": keep, "frames_rejected": rejected, "subpixel_bins": bins, "scale_linear": scale}

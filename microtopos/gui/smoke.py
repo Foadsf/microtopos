@@ -97,8 +97,42 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     got3 = wait_result(n_before + 1)
     log.append(f"{'ok' if got3 else 'FAIL'}    manual reconstruction of the last sweep")
     w.chk_autorec.setChecked(True)
+
+    def profile_confidence():
+        w.tabs.setCurrentIndex(3)
+        w.cmb_height.setCurrentIndex(2)
+        app.processEvents()
+        assert w.prof_label.text().startswith("Confidence") or "No confidence" in w.prof_label.text(), \
+            w.prof_label.text()
+        w.cmb_height.setCurrentIndex(0)
+
+    step("profile follows the confidence view", profile_confidence)
+
+    def panels():
+        w.btn_left.click()
+        app.processEvents()
+        assert not w.dock_left.isVisible()
+        w._reset_layout()
+        app.processEvents()
+        assert w.dock_left.isVisible() and w.dock_right.isVisible()
+        assert w.card.isVisible() and "RESULT" not in w.lbl_card.text() and w.lbl_card.text()
+
+    step("panels hide and reset; result card shown", panels)
+    sr_before = getattr(w, "sr_count", 0)
+    w.tabs.setCurrentIndex(0)
+    if w.sim_source is not None:  # hand tremor gives the sub-pixel motion super-resolution needs
+        with w.sim_source.lock:
+            w.sim_source.sim.tremor_px = 0.6
+    t0 = time.time()
+    while len(w.engine.dwell_frames()) < 8 and time.time() - t0 < 30:  # still frames for the dwell buffer
+        pump(app, 0.2)
+    log.append(f"{'ok' if len(w.engine.dwell_frames()) >= 8 else 'FAIL'}    view still for super-resolution")
     step("super-resolution", w._run_sr)
-    pump(app, 8)
+    t0 = time.time()
+    while getattr(w, "sr_count", 0) == sr_before and time.time() - t0 < 30:
+        pump(app, 0.2)
+    log.append(f"{'ok' if getattr(w, 'sr_count', 0) > sr_before else 'FAIL'}    super-resolution produced a new image"
+               f" ({w.lbl_job.text()[:120]})")
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
     step("objective change", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
     pump(app, 2)
@@ -110,11 +144,29 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         step("export tiff", lambda: export.write_float32_tiff(d / "h.tif", r["sl_surface"], r["um_per_px"]))
         step("export report", lambda: export.write_report_bundle(d / "rep", r, {}))
         step("save+load session", lambda: export.load_session(_save(export, d, r)))
+
+        def mosaic_only():
+            (img, origin), parts = w.engine.mosaic_full()
+            export.save_session(d / "m.npz", None, {}, {"mosaic_image": img, "mosaic_origin": list(origin)})
+            m, _ = export.load_session(d / "m.npz")
+            assert "mosaic_image" in m and "height" not in m
+
+        step("mosaic-only session", mosaic_only)
     st = w.store.get(w.obj)
     contaminated = st.z_um_per_frame is not None or st.lateral_um_per_px_full is not None
     log.append(f"{'FAIL' if contaminated else 'ok'}    simulator did not write calibration")
+    # close while a reconstruction is running: the window must cancel and wait for it, not leave it orphaned
+    while w.job is not None and w.job.isRunning():
+        pump(app, 0.2)
+    before = w.job
+    w._reconstruct_last()
+    running = w.job if w.job is not before else None
+    started = running is not None and running.isRunning()
+    pump(app, 0.3)
     w.close()
     pump(app, 0.5)
+    log.append(f"{'ok' if started and not running.isRunning() else 'FAIL'}    close during a running "
+               f"reconstruction cancelled and joined it (started: {started})")
     sys.excepthook = old_hook
     ok = got1 and got2 and not errors and not contaminated and not any(x.startswith("FAIL") for x in log)
     for line in log:

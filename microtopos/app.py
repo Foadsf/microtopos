@@ -29,6 +29,10 @@ def main():
     ap.add_argument("--replay", metavar="DIR", help="play back a recording made with microtopos-record")
     ap.add_argument("--selftest", nargs=argparse.REMAINDER, metavar="ARGS",
                     help="run the ground-truth self-test (e.g. --selftest --quick --gui) and exit")
+    ap.add_argument("--batch", nargs=argparse.REMAINDER, metavar="ARGS",
+                    help="reconstruct every sweep of a recording offline (RECORDING OUTDIR [options]) and exit")
+    ap.add_argument("--bench", nargs=argparse.REMAINDER, metavar="ARGS",
+                    help="benchmark the CPU and OpenCL focus measure on this computer and exit")
     ap.add_argument("-v", "--verbose", action="store_true", help="print the live event log to the console")
     ap.add_argument("--version", action="version", version=f"MicroTopos {__version__}")
     args = ap.parse_args()
@@ -36,6 +40,15 @@ def main():
         from .selftest import main as selftest_main
 
         selftest_main(args.selftest)
+    if args.batch is not None:
+        from .batch import main as batch_main
+
+        batch_main(args.batch)
+    if args.bench is not None:
+        from .backend import main as bench_main
+
+        bench_main(args.bench)
+        sys.exit(0)
     import pyqtgraph as pg
     from PySide6.QtWidgets import QApplication
 

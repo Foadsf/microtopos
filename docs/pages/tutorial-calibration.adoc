@@ -3,6 +3,8 @@
 
 Out of the box, MicroTopos measures lateral lengths with the objective's *nominal* scale and heights in *focus frames*. The checklist shows this with yellow chips (*Nominal*, *Frames*). Three calibrations turn them into real units. Each is stored per objective, so you do it once.
 
+Before you start, make sure step 2 lists the objectives that are really on your nosepiece (*Edit objectives…*, see xref:manual.adoc#objective-step[the manual]). Calibrations are stored under the objective's name, so set up the list first; renaming an objective later takes its calibration along.
+
 == Dark and flat frames (step 3, optional)
 
 image::step-darkflat.png[Step 3: dark and flat frame buttons,role=narrow]
@@ -29,6 +31,8 @@ image::step-lateral.png[Step 4: lateral scale,role=narrow]
 image::live-lateral.png[Step 4 open: the blue calibration line on the Live view, with a handle at each end]
 
 The chip turns green and every length, area and µm axis now uses the calibrated scale. The scale is stored for full resolution and converted automatically for the other capture size, which has the same field of view.
+
+Repeat this for *every* objective. The nominal scale is the nameplate magnification divided into an assumed 3 µm sensor pixel, but neither the camera's real pixel pitch nor the magnification of any relay lens in the camera adapter is known. Even with an infinity-corrected objective and a 1× tube, the true scale can differ from the nominal one by a large factor, and only a stage micrometer measures it.
 
 TIP: Place the line along the ruling as precisely as you can: the scale comes straight from its length in pixels. Zoom with the mouse wheel on the Live view to place the ends more accurately.
 

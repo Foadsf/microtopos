@@ -70,7 +70,11 @@ The left panel is a checklist; each step shows a status chip.
    starts and after a reconnect, and the device's actual values are read back and shown. "Set once" picks a manual
    exposure just below saturation. **View rotation** turns the 2D views when the camera sits rotated in the
    eyepiece tube; "Measure from X pan" sets it from a move of the X knob alone (display only).
-2. **Objective** (keys 1–4): sets NA, depth of field, focus window and the roughness S-filter.
+2. **Objective** (keys 1–9, in list order): sets NA, depth of field, focus window and the roughness S-filter.
+   *Edit objectives…* holds the objectives on your nosepiece (name, magnification, NA, immersion index, cover-glass
+   note, maker/series) with validation, or loads a preset such as Leitz NPL 5×/10×/20×/50× Fluotar. The list is
+   saved as `objectives.json` next to the calibration; calibrations stay with the objective's name (renaming
+   carries them along, removing keeps them). The lateral scale still needs a stage micrometer for each objective.
 3. **Dark & flat** (optional): 24-frame averages, stored per objective, capture size and exposure.
 4. **Lateral scale**: drag the blue line over a stage micrometer interval and enter its length. Until then all
    lateral lengths are labelled NOMINAL.
@@ -179,7 +183,7 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
 - Focus breathing (magnification change with focus) is not corrected: two estimators were biased by defocus more
   than the breathing itself. Effect: about 1 px at the image edges in far-defocused frames.
 - The magnification guess after an objective change is a texture-scale heuristic and is not validated; the
-  prompt always offers all objectives.
+  prompt always offers all objectives in the list.
 - The simulator scales its relief to each objective's depth of field so every objective can be demonstrated.
 - Not implemented: high-magnification insets inside a low-magnification mosaic, a motorised Z drive, multiband
   blending (feathering is used).

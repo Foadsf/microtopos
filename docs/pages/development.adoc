@@ -33,6 +33,7 @@ uv run --group dev pytest               # the same checks as unit tests
 | `registration`, `focus`, `sff`, `zstack` | sweep registration, focus measures, depth fitting and refinement, all-in-focus fusion, the reconstruction pipeline
 | `metrology`, `export` | ISO 25178-style parameters, filters and grains; GSF, TIFF, STL, report bundle and sessions
 | `optics`, `calibration`, `simulator` | objective model, calibration store and radiometric correction, synthetic specimen renderer
+| `objectives` | the user's objective list (`objectives.json`): presets, validation, the one name→optics resolver (also for objectives no longer in the list), edits that carry calibrations across renames
 | `gui` | the Qt (PySide6) window, built on pyqtgraph
 |===
 
@@ -69,7 +70,7 @@ The gate itself is tested. Every verdict goes through one normalisation, so a Nu
 | 48 frames at 1920×1080 | 4.1 s end to end (target ≤ 15 s)
 |===
 
-`pytest` adds 59 tests, among them recording, replay, engine-error, calibration-ownership, late-result, export and session tests, and a check that two batch runs of the same recording give identical results.
+`pytest` adds 83 tests, among them recording, replay, engine-error, calibration-ownership, objective-list (persistence, validation, old sessions, calibrations across edits, presets), late-result, export and session tests, and a check that two batch runs of the same recording give identical results.
 
 On real camera data (Bresser MikrOkular Full HD on a metallurgical sample): stitching along a known path tracked 40/40 frames at 0.21 px RMS. Depth over a known synthetic relief, with real texture blurred by the optical model, gave r 0.986, slope 0.993 and RMSE 0.91 µm (0.09 DOF). A 3-minute still recording of 2,236 frames produced no false detections.
 

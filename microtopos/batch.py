@@ -86,6 +86,9 @@ def run_batch(recording: str | Path, outdir: str | Path, objective: str = "10x /
 
 
 def main(argv=None):
+    from . import safe_console
+
+    safe_console()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("recording")
     ap.add_argument("outdir")

@@ -56,3 +56,14 @@ def test_injected_failure_exits_nonzero(kind):
     env.pop("MICROTOPOS_SELFTEST_INJECT")
     good = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
     assert good.returncode == 0, good.stdout[-2000:]
+
+
+def test_console_output_never_crashes_on_a_narrow_codepage():
+    """Windows consoles use cp1252: printing σ crashed the frozen self-test before safe_console()."""
+    env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+    code = "print('PSF \\u03c3 0.51 px')"
+    bad = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=60)
+    assert bad.returncode != 0  # control: the plain print really fails on this codepage
+    good = subprocess.run([sys.executable, "-c", "from microtopos import safe_console; safe_console(); " + code],
+                          env=env, capture_output=True, timeout=60)
+    assert good.returncode == 0, good.stderr

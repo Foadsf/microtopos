@@ -112,6 +112,9 @@ def benchmark(w: int = 960, h: int = 540, reps: int = 20, window: int = 9, psf: 
 
 
 def main(argv=None):
+    from . import safe_console
+
+    safe_console()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--size", default="960x540")
     ap.add_argument("--reps", type=int, default=20)

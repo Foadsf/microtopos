@@ -843,6 +843,9 @@ def run(seeds=(11, 22, 33), out=print, real: str | None = None, only: str | None
 
 
 def main(argv=None):
+    from . import safe_console
+
+    safe_console()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--quick", action="store_true", help="one seed only")
     ap.add_argument("--gui", action="store_true", help="also drive the GUI offscreen")

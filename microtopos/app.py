@@ -24,6 +24,9 @@ def _quiet_qt(verbose: bool):
 
 
 def main():
+    from . import safe_console
+
+    safe_console()
     ap = argparse.ArgumentParser(description="MicroTopos: live stitching, shape from focus and surface metrology")
     ap.add_argument("--simulator", action="store_true", help="ignore cameras, use the synthetic specimen")
     ap.add_argument("--replay", metavar="DIR", help="play back a recording made with microtopos-record")

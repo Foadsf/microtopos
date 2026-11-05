@@ -86,7 +86,7 @@ NOTE: On Linux, Qt needs `libxcb-cursor0` for its X11 window plugin. If you see 
 | Option | Effect
 | `--simulator` | start on the synthetic specimen; cameras are still listed in step 1
 | `--replay DIR` | play back a recording made with *Record raw stream* or `microtopos-record`, at its recorded timing (a busy computer skips frames, as with a camera)
-| `--batch REC OUT [options]` | analyse every frame of a recording in order and write each sweep's report to `OUT` (options: `--objective`, `--z-um-per-frame`, `--direction up/down`, `--um-per-px`)
+| `--batch REC OUT [options]` | analyse every frame of a recording in order and write each sweep's report to `OUT` (options: `--objective NAME` from your objective list, `--objectives FILE`, `--list-objectives`, `--z-um-per-frame`, `--direction up/down`, `--um-per-px`)
 | `--bench` | measure the focus measure on the CPU and with OpenCL on this computer, with a parity check
 | `-v`, `--verbose` | print the live event log to the console (it is always shown under *Diagnostics*)
 | `--selftest [--quick] [--gui] [--json FILE]` | run the ground-truth self-test and exit; `--json` writes every row with versions and thresholds

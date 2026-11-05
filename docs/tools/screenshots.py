@@ -94,6 +94,14 @@ def main():
         if name == "lateral":
             w.tabs.setCurrentIndex(0)
             shot("live-lateral")  # the blue calibration line on the Live view
+        if name == "objective" and (not a.only or "dialog-objectives" in a.only):
+            from microtopos import objectives as objlib
+
+            dlg = w._edit_objectives()  # the editor with the Leitz NPL preset loaded, not saved
+            dlg.resize(980, 380)
+            dlg.apply_preset(objlib.LEITZ_NPL_PRESET)
+            shot("dialog-objectives", dlg)
+            dlg.reject()
     w._open_step(5)
 
     # a focus sweep, caught half-way, then its result

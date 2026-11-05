@@ -20,6 +20,23 @@ class Objective:
     magnification: float
     na: float
     immersion_n: float = 1.0
+    cover: str = ""  # cover-glass engraving: "0.17" (mm), "∞/0" or "0" (uncovered), "-" (either), "" unknown
+    maker: str = ""
+    series: str = ""
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "magnification": self.magnification, "na": self.na,
+                "immersion_n": self.immersion_n, "cover": self.cover, "maker": self.maker, "series": self.series}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Objective":
+        """Build from a stored dict; raises ValueError for a missing or non-numeric field (never guesses)."""
+        try:
+            return cls(name=str(d["name"]), magnification=float(d["magnification"]), na=float(d["na"]),
+                       immersion_n=float(d.get("immersion_n", 1.0)), cover=str(d.get("cover", "") or ""),
+                       maker=str(d.get("maker", "") or ""), series=str(d.get("series", "") or ""))
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(f"objective entry {d!r} is incomplete or not numeric: {e}") from None
 
     @property
     def is_oil(self) -> bool:
@@ -73,13 +90,11 @@ class Objective:
         return side | 1
 
 
-OBJECTIVES: dict[str, Objective] = {
-    o.name: o
-    for o in (
-        Objective("4x / 0.10", 4.0, 0.10),
-        Objective("10x / 0.25", 10.0, 0.25),
-        Objective("40x / 0.85", 40.0, 0.85),
-        Objective("100x / 1.25 oil", 100.0, 1.25, immersion_n=1.515),
-    )
-}
-OBJECTIVE_NAMES = list(OBJECTIVES)
+# The program's original objective set: the default for a new installation and the "Generic" preset. The user's
+# own set lives in objectives.json (see objectives.py); look objectives up with objectives.resolve(), not here.
+BUILTIN_OBJECTIVES: tuple[Objective, ...] = (
+    Objective("4x / 0.10", 4.0, 0.10),
+    Objective("10x / 0.25", 10.0, 0.25),
+    Objective("40x / 0.85", 40.0, 0.85),
+    Objective("100x / 1.25 oil", 100.0, 1.25, immersion_n=1.515),
+)

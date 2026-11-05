@@ -21,14 +21,16 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QCombo
                                QTextBrowser, QVBoxLayout, QWidget)
 
 from .. import __version__, export, metrology, units, zstack
+from .. import objectives as objlib
 from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
 from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
 from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import LiveEngine, SweepCapture
-from ..optics import OBJECTIVE_NAMES, OBJECTIVES
+from ..objectives import resolve, resolve_result
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
+from .objectives_dialog import ObjectivesDialog
 from .widgets import Banner, Chip, FlowWidget, ImagePanel, Toast, section
 
 OPTICS_NOTES = """
@@ -46,9 +48,11 @@ direction (Set Z…) for signed µm for that sweep; only a measured Z drive remo
 <p><b>Textureless or mirror-polished surfaces.</b> Shape from focus needs local contrast. Pixels without a clear focus
 peak are left blank (NaN) and excluded from roughness. Remedies: a light etch, oblique or dark-field lighting, or a
 pattern projected through the field diaphragm.</p>
-<p><b>40×/0.85 and 100×/1.25 oil objectives</b> are usually corrected for a 0.17 mm cover glass and transmitted light.
-On bare opaque metal without epi-illumination they lose contrast to spherical aberration and lack of light; the
-100× also needs oil on the specimen. Deconvolution cannot replace missing illumination.</p>
+<p><b>Cover glass.</b> Objectives engraved 0.17 (for example many 40×/0.85 and 100×/1.25 oil) are corrected for a
+0.17 mm cover glass and transmitted light. On bare opaque metal without epi-illumination they lose contrast to
+spherical aberration and lack of light; an oil objective also needs oil on the specimen. Objectives engraved 0 or
+∞/0 are made for uncovered specimens in reflected light; "-" means either. Deconvolution cannot replace missing
+illumination.</p>
 <p><b>Focus breathing</b> (a small magnification change with focus) is not corrected: it could not be measured
 reliably from defocused frames. Its effect is limited to the far-defocused frames at the image edges.</p>
 """
@@ -94,7 +98,7 @@ def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
     if progress:
         progress(0.2, "Recomputing metrology...")
     return metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
-                             OBJECTIVES[r["objective"]].lateral_cutoff_um, form_order, lam_s, lam_c)
+                             resolve_result(r).lateral_cutoff_um, form_order, lam_s, lam_c)
 
 
 def _rescale_job(r, factor, unit, progress=None, cancelled=None):
@@ -130,9 +134,12 @@ class MainWindow(QMainWindow):
         self.dark = self.settings.value("dark", True, type=bool)
         self.t = DARK if self.dark else LIGHT
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation) or Path.home() / ".microtopos")
+        self.data_dir = data_dir
         self.store = CalibrationStore(data_dir)
-        self.obj = OBJECTIVES[self.settings.value("objective", "10x / 0.25")] \
-            if self.settings.value("objective", "10x / 0.25") in OBJECTIVES else OBJECTIVES["10x / 0.25"]
+        self.objset = objlib.load_set(data_dir)  # the user's objectives; the built-in set if none was saved
+        objlib.set_active(self.objset)
+        self.obj = (self.objset.get(str(self.settings.value("objective", ""))) or self.objset.get("10x / 0.25")
+                    or self.objset.objectives[0])
         self.engine = LiveEngine(self.store, self.obj)
         self.bridge = Bridge()
         self.engine.verbose = verbose
@@ -176,6 +183,8 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self, interval=66, timeout=self._tick)  # 15 Hz: above the camera's 12.5 fps
         self.timer.start()
         self._refresh_checklist()
+        if self.objset.load_error:
+            self.notify(self.objset.load_error, "danger")
 
     # ================================================================== layout
     def _build(self):
@@ -599,15 +608,54 @@ class MainWindow(QMainWindow):
 
     def _page_objective(self):
         self.cmb_obj = QComboBox()
-        self.cmb_obj.addItems(OBJECTIVE_NAMES)
+        self.cmb_obj.addItems(self.objset.names)
         self.cmb_obj.setCurrentText(self.obj.name)
         self.cmb_obj.currentTextChanged.connect(self._on_objective)
+        self.btn_edit_obj = self._btn("Edit objectives…", self._edit_objectives,
+                                      "Add, edit or remove objectives, or load a preset such as Leitz NPL. "
+                                      "Calibrations stay with the objective's name.")
         self.lbl_optics = QLabel()
         self.lbl_optics.setObjectName("mono")
         self.lbl_optics.setWordWrap(True)
-        return section("2. Objective  (keys 1–4)", self.cmb_obj, self.lbl_optics,
-                       hint="Sets the numerical aperture used for focus windows, depth of field and the roughness "
-                            "S-filter. Change it whenever you turn the nosepiece.")
+        box = section(self._objective_title(), self.cmb_obj, self.btn_edit_obj, self.lbl_optics,
+                      hint="Sets the numerical aperture used for focus windows, depth of field and the roughness "
+                           "S-filter. Change it whenever you turn the nosepiece. Enter the objectives on your "
+                           "nosepiece as engraved (Edit objectives…); the lateral scale still needs a stage "
+                           "micrometer per objective (step 4).")
+        self.lbl_obj_title = box.findChild(QLabel, "title")
+        return box
+
+    def _objective_title(self) -> str:
+        n = min(len(self.objset.objectives), objlib.KEYED)
+        return "2. Objective  (key 1)" if n == 1 else f"2. Objective  (keys 1–{n})"
+
+    def _select_objective_index(self, i: int):
+        if 0 <= i < min(len(self.objset.objectives), objlib.KEYED):
+            self.cmb_obj.setCurrentText(self.objset.names[i])
+
+    def _edit_objectives(self) -> ObjectivesDialog:
+        """Open the objective editor (window-modal, non-blocking); returns it so tests can drive it."""
+        dlg = ObjectivesDialog(self, self.objset, self.store, self.data_dir)
+        dlg.committed.connect(self._objectives_changed)
+        dlg.open()
+        return dlg
+
+    def _objectives_changed(self, new_set, notes, renames):
+        self.objset = new_set
+        current = renames.get(self.obj.name, self.obj.name)
+        nxt = new_set.get(current) or new_set.objectives[0]
+        self.cmb_obj.blockSignals(True)
+        self.cmb_obj.clear()
+        self.cmb_obj.addItems(new_set.names)
+        self.cmb_obj.setCurrentText(nxt.name)
+        self.cmb_obj.blockSignals(False)
+        self.lbl_obj_title.setText(self._objective_title())
+        if nxt != self.obj:
+            self._on_objective(nxt.name)
+        else:
+            self._refresh_checklist()
+        msg = f"Objective list saved ({len(new_set.objectives)} objectives, {new_set.source})."
+        self.notify(" ".join([msg] + notes), "warning" if any("cleared" in n for n in notes) else "success")
 
     def _page_radiometric(self):
         self.btn_dark = self._btn("Record dark  (lamp off)", lambda: self._record("dark"),
@@ -819,8 +867,8 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda: None if self._typing() else fn())
             self.addAction(a)
 
-        for i, name in enumerate(OBJECTIVE_NAMES):
-            add(str(i + 1), lambda n=name: self.cmb_obj.setCurrentText(n))
+        for i in range(objlib.KEYED):  # keys follow the objective list, whatever it holds
+            add(str(i + 1), lambda i=i: self._select_objective_index(i))
         add(Qt.Key_Space, self._toggle_manual)
         add("R", self._reset_mosaic)
         add("Ctrl+S", self._save_session)
@@ -967,7 +1015,10 @@ class MainWindow(QMainWindow):
             self.lbl_readback.setText("Simulator: 640×360, randomised noise, MJPEG, tremor and focus breathing.")
 
     def _on_objective(self, name: str):
-        self.obj = OBJECTIVES[name]
+        obj = self.objset.get(name)
+        if obj is None:  # the combo is being refilled
+            return
+        self.obj = obj
         self.settings.setValue("objective", name)
         self.engine.set_objective(self.obj)
         if self.sim_source is not None:
@@ -982,13 +1033,13 @@ class MainWindow(QMainWindow):
             self.notify("The view changed abruptly but the magnification looks the same (stage jump or occlusion?). "
                         "The mosaic re-locates when you return to a mapped area.", "warning")
             return
-        mags = [OBJECTIVES[n].magnification for n in OBJECTIVE_NAMES]
-        g = guess_objective(self.obj.magnification, ratio, mags)
-        guess = OBJECTIVE_NAMES[g] if g is not None else None
+        names = self.objset.names
+        g = guess_objective(self.obj.magnification, ratio, self.objset.magnifications)
+        guess = names[g] if g is not None else None
         text = "Objective change suspected (the image changed abruptly)."
         if guess and guess != self.obj.name:
             text += f" Texture scale suggests <b>{guess}</b> (a guess)."
-        acts = [(n, lambda n=n: self.cmb_obj.setCurrentText(n)) for n in OBJECTIVE_NAMES]
+        acts = [(n, lambda n=n: self.cmb_obj.setCurrentText(n)) for n in names]
         acts.append(("Dismiss", lambda: None))
         self.banner.ask(text, acts)
 
@@ -1231,7 +1282,7 @@ class MainWindow(QMainWindow):
         rad = rkey is not None and rkey in c.darks and rkey in c.flats
         states = [
             ("Simulator" if sim else ("Live" if cam_ok else "No frames"), "info" if sim else ("success" if cam_ok else "danger")),
-            (self.obj.name.split(" /")[0], "success"),
+            (f"{self.obj.magnification:g}×", "success"),
             ("Done" if rad else ("Partial" if rkey in c.darks or rkey in c.flats else "Optional"),
              "success" if rad else "warning"),
             ("Calibrated" if c.lateral_um_per_px_full else "Nominal", "success" if c.lateral_um_per_px_full else "warning"),
@@ -1243,7 +1294,7 @@ class MainWindow(QMainWindow):
         nxt = next((i for i, (_, k) in enumerate(states) if k in ("danger",)), None)
         for i, b in enumerate(self.step_btns):
             b.setToolTip("Next step" if i == nxt else "")
-        um_full = c.um_per_px(1920)
+        um_full = c.um_per_px(1920, self.obj)
         self.chip_xy.set(f"XY {'CAL' if c.lateral_um_per_px_full else 'NOMINAL'} {um_full:.3f} µm/px",
                          "success" if c.lateral_um_per_px_full else "warning",
                          c.lateral_source or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
@@ -1255,7 +1306,9 @@ class MainWindow(QMainWindow):
         self.chip_src.set("SIMULATOR" if sim else "CAMERA", "info" if sim else "success")
         o = self.obj
         self.lbl_optics.setText(
-            f"NA {o.na:.2f}{'  oil n=1.515' if o.is_oil else ''}\nRayleigh {o.rayleigh_um:.2f} µm\n"
+            (f"{o.maker} {o.series}".strip() + "\n" if o.maker or o.series else "")
+            + f"{o.magnification:g}×  NA {o.na:.2f}{f'  immersion n={o.immersion_n:g}' if o.is_oil else '  dry'}"
+            + (f"  cover {o.cover}" if o.cover else "") + f"\nRayleigh {o.rayleigh_um:.2f} µm\n"
             f"Optical cutoff λ/2NA {o.lateral_cutoff_um:.2f} µm\nDepth of field {o.dof_um:.2f} µm\n"
             f"Pixel {um_full:.3f} µm at 1920 px ({c.lateral_status.value.lower()})")
         lines = [f"{k}: dark {'✓' if k in c.darks else '—'}, flat {'✓' if k in c.flats else '—'}"
@@ -1540,10 +1593,10 @@ class MainWindow(QMainWindow):
         if self.job is not None and self.job.isRunning():
             self.notify("Still reconstructing the previous sweep; this one was skipped.", "warning")
             return
-        obj = OBJECTIVES[cap.objective]
+        obj = cap.optics or resolve(cap.objective)  # the optics at capture, even if the list was edited since
         cal = self.store.get(obj)
         w = cap.shape[1]
-        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w)
+        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj)
         sign = DIRECTIONS.get(self.cmb_dir.currentText())
         if cap.z is not None and cap.simulated:
             z, unit, zstat, zcal = cap.z, units.UM, CalStatus.SIMULATED.value, None
@@ -1659,7 +1712,7 @@ class MainWindow(QMainWindow):
         r = self.result
         if r is None:
             return
-        job = Job(_metrology_job, r, self.sp_form.value(), self._lam_s(OBJECTIVES[r["objective"]]),
+        job = Job(_metrology_job, r, self.sp_form.value(), self._lam_s(resolve_result(r)),
                   self.sp_lc.value(), label="Metrology")
         self._start_job(job, lambda m, r=r: self._on_recomputed(r, m), main=True)
 
@@ -2073,7 +2126,8 @@ class MainWindow(QMainWindow):
                 extra.update(height_mosaic=lparts[0][1], height_mosaic_origin=list(lparts[0][2]),
                              height_mosaic_key=lparts[0][0])
         try:
-            export.save_session(p, self.result, {"objective": self.obj.name, "measure": self.cmb_measure.currentText(),
+            export.save_session(p, self.result, {"objective": self.obj.name, "objective_spec": self.obj.to_dict(),
+                                                 "measure": self.cmb_measure.currentText(),
                                                  "software": f"MicroTopos {__version__}"}, extra)
             self.notify(f"Saved {p}" + ("" if self.result is not None else " (mosaic only)"), "success")
         except OSError as e:
@@ -2087,12 +2141,14 @@ class MainWindow(QMainWindow):
         try:
             r, s = export.load_session(p)  # validated before anything in the window changes
             has = "height" in r
+            if has:  # pin the optics it was made with; an unknown objective fails here with a clear message
+                r["objective_spec"] = resolve_result(r).to_dict()
             if has and r["migrated"]:  # schema 1: recompute what it did not store, and say so
                 if "edf_proc" not in r:
                     r["edf_proc"] = cv2.resize(r["edf"], (r["height"].shape[1], r["height"].shape[0]),
                                                interpolation=cv2.INTER_AREA)
                 m = metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
-                                      OBJECTIVES[r["objective"]].lateral_cutoff_um, r.get("form_order", 1),
+                                      resolve_result(r).lateral_cutoff_um, r.get("form_order", 1),
                                       r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
                 kept = [w for w in r.get("warnings", []) if not metrology.is_metrology_warning(w)]
                 r["warnings"] = kept + m.pop("warnings") + [

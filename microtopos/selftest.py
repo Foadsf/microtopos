@@ -23,11 +23,18 @@ from .calibration import bgr_to_luma
 from .focus import MEASURES, focus_map, tile_scores
 from .kinematics import State, StateMachine
 from .mosaic import Mosaic
-from .optics import OBJECTIVES
+from .objectives import default_set, resolve
 from .registration import phase_shift, register_pair, register_sweep, warp_scale_shift
 from .simulator import SpecimenSimulator
 from .superres import dwell_superres
 from .verdict import CheckResult, Status, from_row, summarize
+
+BUILTIN = default_set()  # the self-test always uses the built-in objectives, whatever the user's list holds
+
+
+def _obj(name):
+    return resolve(name, objset=BUILTIN)
+
 
 THRESH = {
     "geom_offset_px": 0.05,
@@ -61,7 +68,7 @@ def _frames(sim, zs, **kw):
 
 
 def check_conventions(seed):
-    sim = SpecimenSimulator(seed, OBJECTIVES["40x / 0.85"])
+    sim = SpecimenSimulator(seed, _obj("40x / 0.85"))
     alb, _ = sim.truth_patch()
 
     def flat(bgr):  # undo the simulated dark level, gain and vignette (radiometry, not geometry)
@@ -95,7 +102,7 @@ def check_conventions(seed):
 
 
 def check_focus_measures(seed):
-    sim = SpecimenSimulator(seed, OBJECTIVES["40x / 0.85"])
+    sim = SpecimenSimulator(seed, _obj("40x / 0.85"))
     alb, _ = sim.truth_patch()
     ok, worst = True, ""
     for m in MEASURES:
@@ -107,7 +114,7 @@ def check_focus_measures(seed):
 
 
 def check_registration(seed):
-    sim = SpecimenSimulator(seed, OBJECTIVES["40x / 0.85"])
+    sim = SpecimenSimulator(seed, _obj("40x / 0.85"))
     zs = sim.sweep_trajectory()
     fr, tr = _frames(sim, zs)
     warps, pairs = register_sweep(fr, factor=2)
@@ -131,7 +138,7 @@ def check_registration(seed):
 
 
 def check_sff(seed, objective="40x / 0.85"):
-    obj = OBJECTIVES[objective]
+    obj = _obj(objective)
     sim = SpecimenSimulator(seed, obj)
     zs = sim.sweep_trajectory()
     fr, _ = _frames(sim, zs)
@@ -156,7 +163,7 @@ def check_sff(seed, objective="40x / 0.85"):
 def check_hand_sweep(seed):
     """Unknown z (hand-turned knob, variable speed, pause) with the sweep direction stated, as a user does:
     depth in frame units must rank-correlate POSITIVELY with truth (a signed test: inverted relief fails)."""
-    obj = OBJECTIVES["40x / 0.85"]
+    obj = _obj("40x / 0.85")
     sim = SpecimenSimulator(seed, obj)
     zs = sim.sweep_trajectory()
     fr, _ = _frames(sim, zs)
@@ -180,7 +187,7 @@ def check_hand_sweep(seed):
 
 
 def check_reversal(seed):
-    obj = OBJECTIVES["40x / 0.85"]
+    obj = _obj("40x / 0.85")
     sim = SpecimenSimulator(seed, obj)
     zs = sim.sweep_trajectory(reversal=True, back_fraction=(0.6, 0.8))
     up = zs[len(zs) // 3] > zs[0]
@@ -213,7 +220,7 @@ def check_reversal(seed):
 
 
 def check_textureless(seed):
-    obj = OBJECTIVES["40x / 0.85"]
+    obj = _obj("40x / 0.85")
     sim = SpecimenSimulator(seed, obj, textureless_patch=True)
     zs = sim.sweep_trajectory()
     fr, _ = _frames(sim, zs)
@@ -227,7 +234,7 @@ def check_textureless(seed):
 
 
 def check_state_machine(seed):
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     sim = SpecimenSimulator(seed, obj)
     fov = sim.out_w * sim.um_per_px
 
@@ -258,8 +265,8 @@ def check_state_machine(seed):
 def check_objective_change(seed):
     """Switch from a 10x to a 40x view mid-stream: expect one objective-change event and a 40x guess."""
     from .kinematics import guess_objective
-    s10 = SpecimenSimulator(seed, OBJECTIVES["10x / 0.25"])
-    s40 = SpecimenSimulator(seed + 1, OBJECTIVES["40x / 0.85"])
+    s10 = SpecimenSimulator(seed, _obj("10x / 0.25"))
+    s40 = SpecimenSimulator(seed + 1, _obj("40x / 0.85"))
     _, h40 = s40.truth_patch()
     s40.focus_z_um = float(np.median(h40))
     _, h10 = s10.truth_patch()
@@ -277,16 +284,15 @@ def check_objective_change(seed):
             sweeps += sum(e.kind == "sweep_started" for e in ev)
         rows.append((f"objective change detected ({variant})", seed, f"{len(events)} event(s), {sweeps} false sweeps",
                      "1, 0", len(events) == 1 and sweeps == 0))
-    mags = [o.magnification for o in OBJECTIVES.values()]
-    g = guess_objective(10.0, events[0].detail.get("magnification_ratio"), mags) if events else None
-    guess = list(OBJECTIVES)[g] if g is not None else None
+    g = guess_objective(10.0, events[0].detail.get("magnification_ratio"), BUILTIN.magnifications) if events else None
+    guess = BUILTIN.names[g] if g is not None else None
     return rows + [("objective guess from texture scale (heuristic)", seed, str(guess), "info", None)]
 
 
 def check_fast_pan(seed, speeds=(30, 60)):
     """Hand-speed pans with motion blur (30 ms exposure / 80 ms frame period): no false view changes, no separate
     areas, mosaic position error small. Speeds in preview pixels per frame (640 px wide)."""
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     rows = []
     for v in speeds:
         sim = SpecimenSimulator(seed, obj, world_margin=5.0)
@@ -312,7 +318,7 @@ def check_fast_pan(seed, speeds=(30, 60)):
 
 
 def check_mosaic(seed):
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     sim = SpecimenSimulator(seed, obj)
     fov = sim.out_w * sim.um_per_px
     m = Mosaic()
@@ -329,7 +335,7 @@ def check_mosaic(seed):
 def check_mosaic_jump(seed):
     """Tracking loss: a sudden jump back over mapped ground must re-locate, never stitch at the old position.
     Also: relaxing the pose graph must leave an unconnected (separate) area where it is."""
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     sim = SpecimenSimulator(seed, obj, world_margin=5.0)  # large enough that the jump stays on real specimen
     fov = sim.out_w * sim.um_per_px
     m = Mosaic()
@@ -364,7 +370,7 @@ def check_mosaic_jump(seed):
 def check_height_mosaic(seed):
     """Stitched heights: two overlapping patches of the true surface with an arbitrary 3 um offset between them
     must be levelled to agree; a patch must follow its keyframe when the pose graph moves it."""
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     sim = SpecimenSimulator(seed, obj)
     fov_px = sim.out_w
     m = Mosaic()
@@ -477,7 +483,7 @@ def check_signed_z(seed):
     """Signed height and spacing: known z up and down, a hand sweep with the direction stated, the same frames
     reversed, and every other frame kept (thinning) must all give the true +1.6 um step. Without a stated
     direction the result must say its orientation is unknown."""
-    obj = OBJECTIVES["40x / 0.85"]
+    obj = _obj("40x / 0.85")
     frames, zs = _terraces(seed)
     um = 0.5
     tol = 0.15
@@ -616,7 +622,7 @@ def check_metrology_edges(seed):
     edit[:, :6] = 0
     same = all(np.allclose(_fm(img, m, 7)[:, -20:], _fm(edit, m, 7)[:, -20:]) for m in ("Vollath F4", "Vollath F5"))
     rows.append(("Vollath F4/F5: editing the left edge leaves the right edge unchanged", seed, str(same), "True", same))
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     fw = sff.theoretical_fwhm_um(obj, 1.0, lambda im: _fm(im, "DoG band-pass", 9, 1.0), np.full((128, 128), 90.0,
                                                                                                     np.float32))
     rows.append(("DOF ruler on a blank crop: no estimate", seed, str(fw), "None", fw is None))
@@ -634,7 +640,7 @@ def check_sfilter(_seed):
 
 
 def check_superres(seed):
-    obj = OBJECTIVES["4x / 0.10"]
+    obj = _obj("4x / 0.10")
     sim = SpecimenSimulator(seed, obj, 320, 180)
     sim.tremor_px = 0.6
     _, hz = sim.truth_patch()
@@ -709,7 +715,7 @@ def check_exports(seed):
 
 
 def check_timing(seed):
-    obj = OBJECTIVES["40x / 0.85"]
+    obj = _obj("40x / 0.85")
     sim = SpecimenSimulator(seed, obj, 960, 540, world_margin=1.4)
     zs = sim.sweep_trajectory(n_frames=48)
     fr, _ = _frames(sim, zs)
@@ -750,7 +756,7 @@ def check_real_recording(folder: str) -> list:
     rms = math.sqrt(float(np.mean(np.square(errs)))) if errs else float("inf")
     rows.append(("real texture: stitching RMS (px)", 0, f"{rms:.2f} ({len(errs)}/40 tracked)", "< 1.0",
                  rms < 1.0 and len(errs) == 40))
-    obj = OBJECTIVES["10x / 0.25"]
+    obj = _obj("10x / 0.25")
     f0 = cv2.resize(luma[0], (960, 540), interpolation=cv2.INTER_AREA)
     um = obj.nominal_um_per_px(960)
     yy, xx = np.mgrid[0:540, 0:960].astype(np.float32)

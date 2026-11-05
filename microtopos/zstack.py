@@ -290,6 +290,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         **m,
         "edf": edf, "edf_proc": edf_proc.astype(np.float32), "height": height, "height_raw": fit.z_raw,
         "confidence": fit.confidence, "support": support, "um_per_px_capture": um_per_px, "objective": objective.name,
+        "objective_spec": objective.to_dict(),
         "frames_in": n_in, "frames_used": int(n), "reversal_at": reversal_at,
         "z_first": float(z[0]), "z_last": float(z[-1]), "fwhm_z": fit.fwhm_z_median,
         "z_orientation": orientation, "z_sign": z_sign if z_labels is None else None,
@@ -327,9 +328,9 @@ def rescale_heights(result: dict, factor: float, new_unit: str, settings: ZSetti
         out["z_first"], out["z_last"] = min(a, b), max(a, b)
     out["z_unit"] = units.canon(new_unit)
     st = settings or ZSettings()
-    from .optics import OBJECTIVES
+    from .objectives import resolve_result
     m = metrology.analyze(out["height"], out["edf_proc"], out["um_per_px"], out["z_unit"],
-                          OBJECTIVES[out["objective"]].lateral_cutoff_um, out.get("form_order", st.form_order),
+                          resolve_result(out).lateral_cutoff_um, out.get("form_order", st.form_order),
                           out.get("lambda_s_um"), out.get("lambda_c_um", 0.0))
     for k in metrology.PARAMETER_KEYS:
         out.pop(k, None)

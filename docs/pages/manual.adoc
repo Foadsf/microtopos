@@ -50,9 +50,26 @@ Demo:: simulator only: *Pan around*, *Focus sweep*, *Sweep + reversal*.
 
 MicroTopos sets the camera after the stream has started and again after a reconnect, because many cameras ignore settings made earlier. On Linux it switches off automatic exposure, in-camera sharpening and backlight compensation. When the camera has them, it also locks automatic white balance, automatic gain and the dynamic frame rate.
 
+[#objective-step]
 === 2. Objective
 
-Choose the objective in use (kbd:[1] 4×/0.10, kbd:[2] 10×/0.25, kbd:[3] 40×/0.85, kbd:[4] 100×/1.25 oil). The numerical aperture sets the focus window size, the depth of field used by the reconstruction, and the default roughness S-filter (λ~s~). Change it whenever you turn the nosepiece. A detected objective change asks you to confirm.
+Choose the objective in use. Keys kbd:[1] to kbd:[9] select the objectives in list order; the step's title shows how many keys are in use. The numerical aperture sets the focus window size, the depth of field used by the reconstruction, and the default roughness S-filter (λ~s~). Change it whenever you turn the nosepiece. A detected objective change asks you to confirm and suggests the objective whose magnification best fits the change of texture scale.
+
+The list starts with four generic objectives (4×/0.10, 10×/0.25, 40×/0.85, 100×/1.25 oil). Replace it with the objectives on your nosepiece: click *Edit objectives…*.
+
+image::dialog-objectives.png[The objective editor with the Leitz NPL preset loaded]
+
+Enter one row per objective, in nosepiece order, with the values engraved on it: magnification, numerical aperture (NA), the immersion index _n_ (1 for a dry objective, about 1.515 for oil) and the cover-glass note (`0.17` for a 0.17 mm cover glass, `0` or `∞/0` for uncovered specimens, `-` for either). Maker and series are optional. *Apply preset* fills the table with a known set, for example *Leitz NPL (5x, 10x, 20x, 50x Fluotar)*: NPL 5×/0.09, 10×/0.20 and 20×/0.40 (`∞/-`) and NPL Fluotar 50×/0.85 (`∞/0`), all dry. *OK* stays disabled while a value is impossible: an NA of 0 or less, an NA above the immersion index (a dry objective cannot exceed NA 1), a magnification out of range, or two objectives with the same name.
+
+The list is saved as `objectives.json` next to `calibration.json` in the data folder, with its origin (preset or edited), date and revision. Calibrations belong to the objective's *name*:
+
+* Renaming an objective takes its calibration along. A rename onto a name that already holds a calibration is refused.
+* Removing an objective keeps its calibration; it comes back when you add an objective with the same name again.
+* Changing an objective's magnification clears its lateral scale, because the stage-micrometer value belonged to the old nameplate. Dark and flat frames and the Z estimate are kept.
+
+Results and sessions record the optics of the objective they were made with, so editing the list never changes an existing result. Sessions from older versions that name a built-in objective still open after you replace the list.
+
+IMPORTANT: The nameplate magnification does not give the true pixel size. The camera's sensor pitch and any relay lens between the eyepiece tube and the sensor are unknown, so calibrate the lateral scale once per objective with a stage micrometer (step 4). Until then lengths are *nominal*.
 
 === 3. Dark & flat
 
@@ -114,7 +131,7 @@ Diagnostics:: the live event log, for bug reports.
 [cols="1,3",options="header"]
 |===
 | Key | Action
-| kbd:[1] – kbd:[4] | select objective 4×, 10×, 40×, 100×
+| kbd:[1] – kbd:[9] | select the first, second, … objective in the objective list
 | kbd:[Space] | start / stop a manual Z capture
 | kbd:[R] | reset the mosaic
 | kbd:[Ctrl+S] / kbd:[Ctrl+O] | save / open a session

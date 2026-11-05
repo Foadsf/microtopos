@@ -45,6 +45,7 @@ class SweepCapture:
     exposure: float | None = None
     linearize: bool = False
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
+    optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
 
 
 class SweepBuffer:
@@ -227,7 +228,8 @@ class LiveEngine:
         z = None if any(v is None for v in buf.z) else np.array(buf.z)
         cap = SweepCapture(list(buf.frames), z, pose, self.objective.name, shape, simulated, _completeness(buf.tiles),
                            list(buf.seqs), list(buf.stamps), getattr(self.source, "source_id", ""),
-                           self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape)
+                           self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape,
+                           self.objective)
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -376,7 +378,7 @@ class LiveEngine:
                 continue
             self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu, zkey, rid)
             self.mosaic_version += 1
-        um = self.store.get(self.objective).um_per_px(prev.shape[1])
+        um = self.store.get(self.objective).um_per_px(prev.shape[1], self.objective)
         fm = focus_map(prev, "DoG band-pass", 9, self.objective.psf_sigma_px(um))
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()

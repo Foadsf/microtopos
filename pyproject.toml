@@ -1,6 +1,6 @@
 [project]
 name = "microtopos"
-version = "0.7.0"
+version = "0.8.0"
 description = "Encoderless computational microscopy: live X-Y stitching, shape-from-focus height maps and surface metrology for manual microscopes"
 readme = "README.md"
 license = "GPL-3.0-or-later"

@@ -41,7 +41,7 @@ uv run microtopos-bench        # CPU vs OpenCL focus-measure timing with a parit
 
 Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Python 3.11 the Qt bindings abort with a reference-count error, so 3.11 is not supported.
 
-## Status (main, after v0.7)
+## Status (v0.8, November 2026)
 
 Early but working. Tested with a Bresser MikrOkular Full HD eyepiece camera on Linux Mint: live capture,
 automatic focus-sweep detection, height maps and stitching all run on real specimens. The algorithms are
@@ -50,7 +50,7 @@ quantitatively** (no calibrated reference sample measured so far), and stitching
 checked visually. The Windows and macOS builds pass their self-tests on the build servers but have not been run
 on a real desktop.
 
-After an external source review (November 2026), main now has:
+v0.8 follows an external source review (November 2026). It adds:
 
 - a self-test gate that cannot pass a failing NumPy verdict;
 - signed hand-sweep heights with source-frame spacing;
@@ -60,8 +60,6 @@ After an external source review (November 2026), main now has:
 - atomic exports with validity masks;
 - versioned sessions;
 - several metrology edge-case fixes.
-
-These are not in a release yet.
 
 ## Workflow
 

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import html
+import logging
 import math
 import time
 import os
 from pathlib import Path
+
+logger = logging.getLogger("microtopos.gui")
 
 import cv2
 import numpy as np
@@ -86,7 +89,14 @@ def _sr_job(frames, psf, progress=None, cancelled=None):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, simulator_only: bool = False, replay: str | None = None, verbose: bool = False):
+    def __init__(
+        self,
+        simulator_only: bool = False,
+        replay: str | None = None,
+        verbose: bool = False,
+        fusion: str = "sharpest",
+        crop: tuple | None = None,
+    ):
         super().__init__()
         opencv_threads()
         self.settings = QSettings("MicroTopos", "MicroTopos")
@@ -97,6 +107,10 @@ class MainWindow(QMainWindow):
         self.obj = OBJECTIVES[self.settings.value("objective", "10x / 0.25")] \
             if self.settings.value("objective", "10x / 0.25") in OBJECTIVES else OBJECTIVES["10x / 0.25"]
         self.engine = LiveEngine(self.store, self.obj)
+        self.fusion = fusion
+        self.crop = crop
+        if hasattr(self.engine, "mosaic"):
+            self.engine.mosaic.fusion = fusion
         self.bridge = Bridge()
         self.engine.verbose = verbose
         self.engine.on_sweep = self.bridge.sweep.emit
@@ -347,14 +361,16 @@ class MainWindow(QMainWindow):
                 def initializeGL(self):
                     try:
                         super().initializeGL()
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("OpenGL SafeGL initializeGL failed: %s", exc)
                         self.failed = True
 
                 def paintGL(self, *a, **k):
                     if not self.failed:
                         try:
                             super().paintGL(*a, **k)
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug("OpenGL SafeGL paintGL failed: %s", exc)
                             self.failed = True
 
             self.gl = SafeGL()
@@ -364,7 +380,8 @@ class MainWindow(QMainWindow):
             self.gl_surf.setVisible(False)  # an empty surface has no mesh: drawing it raises in pyqtgraph
             self.gl.addItem(self.gl_surf)
             lay.addWidget(self.gl, 1)
-        except Exception:
+        except Exception as exc:
+            logger.warning("OpenGL 3D view unavailable; falling back to 2D shaded relief: %s", exc)
             self.gl = None
         self.relief = ImagePanel(self.t, "No height map yet.")
         self.relief.setVisible(self.gl is None)

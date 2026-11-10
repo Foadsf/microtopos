@@ -18,10 +18,13 @@ import time
 from dataclasses import dataclass
 
 import cv2
+import logging
 import numpy as np
 
 from .optics import Objective
 from .simulator import SpecimenSimulator
+
+logger = logging.getLogger("microtopos.camera")
 
 
 @dataclass
@@ -39,7 +42,8 @@ def list_cameras() -> list[CameraInfo]:
             idx = int(re.sub(r"\D", "", dev))
             try:
                 name = open(f"/sys/class/video4linux/video{idx}/name").read().strip()
-            except OSError:
+            except OSError as exc:
+                logger.debug("Could not read sysfs name for video%d: %s", idx, exc)
                 name = dev
             if _v4l2_is_capture(dev):
                 cams.append(CameraInfo(idx, name, dev))
@@ -58,7 +62,8 @@ def _v4l2_is_capture(dev: str) -> bool:
             out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
                                  timeout=3).stdout
             return "[0]:" in out
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError) as exc:
+            logger.debug("v4l2-ctl probe failed for %s: %s", dev, exc)
             return False
     return True
 
@@ -251,8 +256,8 @@ class CameraSource(FrameSource):
                         cap = self.open()
                         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
                         n_total = 0  # re-apply exposure and sharpness on the reopened device
-                    except RuntimeError:
-                        pass
+                    except RuntimeError as exc:
+                        logger.debug("Device reopen attempt failed: %s", exc)
                     last_ok = time.perf_counter()
                 time.sleep(0.01)
                 continue
@@ -263,6 +268,7 @@ class CameraSource(FrameSource):
                 try:
                     self.applied = self._apply_controls(cap)
                 except Exception as e:  # a missing control must not stop the stream
+                    logger.warning("Failed setting camera control on %s: %s", self.info.name, e)
                     self.applied = {"error": str(e)}
             n_total += 1
             if raw.ndim == 3:  # backend already decoded

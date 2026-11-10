@@ -12,7 +12,7 @@ import math
 
 import cv2
 import numpy as np
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, QhullError
 from scipy.spatial.distance import pdist
 from skimage.feature import graycomatrix, graycoprops
 from skimage.measure import label, regionprops
@@ -224,7 +224,7 @@ def grains(img: np.ndarray, um_per_px: float, h_rel: float = 0.15) -> dict:
         try:
             hull = pts[ConvexHull(pts).vertices]
             feret.append(float(pdist(hull).max()) * um_per_px)
-        except Exception:  # degenerate (collinear) region
+        except (QhullError, ValueError):  # degenerate (collinear/few points) region
             feret.append(float(rp.feret_diameter_max) * um_per_px)
     out = {"grain_count": len(areas), "watershed_labels": labels}
     # Heyn mean lineal intercept on every 8th row and column: boundary crossings per unit line length

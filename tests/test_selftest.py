@@ -18,7 +18,7 @@ def _id(c):
                                    if _id(c) in KNOWN else c for c in CHECKS], ids=_id)
 def test_check(check):
     rows = check(11)
-    failed = [r for r in rows if r[4] is False]
+    failed = [r for r in rows if r[4] is not None and not bool(r[4])]
     assert not failed, "\n".join(f"{r[0]}: measured {r[2]}, threshold {r[3]}" for r in failed)
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -18,6 +19,8 @@ import cv2
 import numpy as np
 
 from .optics import OBJECTIVES, SENSOR_FULL_WIDTH_PX, Objective
+
+logger = logging.getLogger("microtopos.calibration")
 
 
 class CalStatus(str, Enum):
@@ -106,7 +109,8 @@ class CalibrationStore:
         if self._json.exists():
             try:
                 meta = json.loads(self._json.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Unable to load objective calibration metadata from %s: %s", self._json, exc)
                 meta = {}
             for name, d in meta.items():
                 if name in self.cals:

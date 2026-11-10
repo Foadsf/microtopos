@@ -605,8 +605,8 @@ def run(seeds=(11, 22, 33), out=print, real: str | None = None) -> bool:
     for name, seed, meas, thr, ok in rows:
         res = "info" if ok is None else ("PASS" if ok else "FAIL")
         out(f"{name:<{w}}  {seed:<4}  {meas:<44} {thr:<14} {res}")
-    n_fail = sum(1 for r in rows if r[4] is False)
-    n_pass = sum(1 for r in rows if r[4] is True)
+    n_fail = sum(1 for r in rows if r[4] is not None and not bool(r[4]))
+    n_pass = sum(1 for r in rows if r[4] is not None and bool(r[4]))
     out(f"\n{n_pass} passed, {n_fail} failed, {sum(1 for r in rows if r[4] is None)} info  "
         f"({time.perf_counter() - t0:.0f} s)")
     return n_fail == 0

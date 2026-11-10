@@ -26,7 +26,12 @@ microtopos-selftest = "microtopos.selftest:main"
 microtopos-record = "microtopos.record:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "hypothesis>=6.168.5",
+    "mypy>=2.4.1",
+    "pytest>=8",
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["hatchling>=1.24"]
@@ -34,6 +39,18 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 120
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

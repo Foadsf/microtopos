@@ -48,8 +48,9 @@ def list_cameras() -> list[CameraInfo]:
             if _v4l2_is_capture(dev):
                 cams.append(CameraInfo(idx, name, dev))
         return cams
+    api = cv2.CAP_DSHOW if sys.platform.startswith("win32") else cv2.CAP_ANY
     for idx in range(4):
-        cap = cv2.VideoCapture(idx)
+        cap = cv2.VideoCapture(idx, api)
         if cap.isOpened():
             cams.append(CameraInfo(idx, f"Camera {idx} ({cap.getBackendName()})"))
         cap.release()
@@ -143,7 +144,7 @@ class CameraSource(FrameSource):
         self.readback: dict = {}
 
     def open(self) -> cv2.VideoCapture:
-        api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
+        api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else (cv2.CAP_DSHOW if sys.platform.startswith("win32") else cv2.CAP_ANY)
         cap = cv2.VideoCapture(self.info.index, api)
         if not cap.isOpened():
             raise RuntimeError(f"cannot open camera {self.info.name}")

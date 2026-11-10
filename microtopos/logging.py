@@ -90,6 +90,13 @@ def configure_logging(
     else:
         formatter = logging.Formatter(LOG_FORMAT)
 
+    # Configure OpenCV internal C++ logger level to avoid intrusive probe warnings
+    try:
+        import cv2.utils.logging as cv_log
+        cv_log.setLogLevel(cv_log.LOG_LEVEL_DEBUG if verbose else cv_log.LOG_LEVEL_ERROR)
+    except (ImportError, AttributeError):
+        pass
+
     # Console / stream handler
     stream_out = stream if stream is not None else sys.stderr
     stream_handler = logging.StreamHandler(stream_out)

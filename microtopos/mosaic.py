@@ -93,6 +93,149 @@ class BacklashModel:
 
         return corr_x, corr_y
 
+    def update_from_revisit(
+        self,
+        dx_obs: float,
+        dy_obs: float,
+        dir_x: int,
+        dir_y: int,
+        learning_rate: float = 0.2,
+    ) -> None:
+        """Dynamically learn backlash from measured revisit offsets after directional reversals."""
+        if dir_x != 0 and abs(dx_obs) > 1e-3:
+            target_bx = abs(dx_obs)
+            self.backlash_x = (1.0 - learning_rate) * self.backlash_x + learning_rate * target_bx
+        if dir_y != 0 and abs(dy_obs) > 1e-3:
+            target_by = abs(dy_obs)
+            self.backlash_y = (1.0 - learning_rate) * self.backlash_y + learning_rate * target_by
+
+
+def stage_repeatability_benchmark(
+    target_pos: tuple[float, float] = (100.0, 100.0),
+    cycles: int = 100,
+    backlash: tuple[float, float] = (0.25, 0.31),
+    noise_sigma: float = 0.05,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Measure stage bidirectional repeatability over 100 return cycles.
+
+    Returns:
+        mean_error_x, std_error_x, max_error_x, p95_error_x,
+        mean_error_y, std_error_y, max_error_y, p95_error_y,
+        mean_error_euclidean, p95_error_euclidean
+    """
+    rng = np.random.default_rng(seed)
+    model = BacklashModel(backlash_x=backlash[0], backlash_y=backlash[1])
+    errors_x, errors_y = [], []
+
+    current_x, current_y = 0.0, 0.0
+    for i in range(cycles):
+        approach_dir = 1 if i % 2 == 0 else -1
+        intermediate_x = target_pos[0] + approach_dir * 10.0
+        intermediate_y = target_pos[1] + approach_dir * 10.0
+
+        dx1 = intermediate_x - current_x
+        dy1 = intermediate_y - current_y
+        current_x += dx1
+        current_y += dy1
+
+        dx2 = target_pos[0] - current_x
+        dy2 = target_pos[1] - current_y
+        corr_x, corr_y = model.apply(dx2, dy2)
+        noise_x = rng.normal(0.0, noise_sigma)
+        noise_y = rng.normal(0.0, noise_sigma)
+
+        actual_x = current_x + dx2 - corr_x + noise_x
+        actual_y = current_y + dy2 - corr_y + noise_y
+
+        errors_x.append(abs(actual_x - target_pos[0]))
+        errors_y.append(abs(actual_y - target_pos[1]))
+        current_x, current_y = actual_x, actual_y
+
+    ex = np.array(errors_x)
+    ey = np.array(errors_y)
+    e_euc = np.hypot(ex, ey)
+
+    return {
+        "cycles": float(cycles),
+        "mean_error_x": float(np.mean(ex)),
+        "std_error_x": float(np.std(ex)),
+        "max_error_x": float(np.max(ex)),
+        "p95_error_x": float(np.percentile(ex, 95)),
+        "mean_error_y": float(np.mean(ey)),
+        "std_error_y": float(np.std(ey)),
+        "max_error_y": float(np.max(ey)),
+        "p95_error_y": float(np.percentile(ey, 95)),
+        "mean_error_euclidean": float(np.mean(e_euc)),
+        "p95_error_euclidean": float(np.percentile(e_euc, 95)),
+    }
+
+
+def revisit_registration_benchmark(
+    cycles: int = 100,
+    seed: int = 42,
+    noise_sigma: float = 1.0,
+) -> dict[str, float]:
+    """Execute 100 revisit registration trials with subpixel offsets and realistic noise.
+
+    Verifies the Copilot milestone: mean error < 0.1 px, 95th percentile < 0.2 px.
+    """
+    rng = np.random.default_rng(seed)
+    h, w = 240, 320
+    y, x = np.mgrid[:h, :w]
+    base = 128.0 + 40.0 * np.sin(x / 8.0) * np.cos(y / 8.0) + 30.0 * np.sin(x / 3.0 + y / 4.0)
+    for _ in range(40):
+        cx, cy = rng.integers(20, w - 20), rng.integers(20, h - 20)
+        base[max(0, cy - 2) : min(h, cy + 3), max(0, cx - 2) : min(w, cx + 3)] += 60.0
+    base = np.clip(base, 0, 255).astype(np.float32)
+
+    errors = []
+    win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+
+    for _ in range(cycles):
+        true_dx = float(rng.uniform(-2.0, 2.0))
+        true_dy = float(rng.uniform(-2.0, 2.0))
+
+        M = np.float32([[1, 0, true_dx], [0, 1, true_dy]])
+        shifted = cv2.warpAffine(base, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+
+        f1 = np.clip(base + rng.normal(0, noise_sigma, base.shape), 0, 255).astype(np.float32)
+        f2 = np.clip(shifted + rng.normal(0, noise_sigma, base.shape), 0, 255).astype(np.float32)
+
+        est_dx, est_dy, _ = phase_shift(f1, f2, win)
+
+        try:
+            crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+            _, W = cv2.findTransformECC(
+                f1,
+                f2,
+                np.float32([[1, 0, est_dx], [0, 1, est_dy]]),
+                cv2.MOTION_TRANSLATION,
+                crit,
+                None,
+                1,
+            )
+            if np.isfinite(W).all() and math.hypot(W[0, 2] - est_dx, W[1, 2] - est_dy) < 1.0:
+                est_dx, est_dy = float(W[0, 2]), float(W[1, 2])
+        except cv2.error:
+            pass
+
+        err = math.hypot(est_dx - true_dx, est_dy - true_dy)
+        errors.append(err)
+
+    arr = np.array(errors)
+    return {
+        "trials": float(cycles),
+        "mean_error_px": float(np.mean(arr)),
+        "std_error_px": float(np.std(arr)),
+        "max_error_px": float(np.max(arr)),
+        "p95_error_px": float(np.percentile(arr, 95)),
+        "p99_error_px": float(np.percentile(arr, 99)),
+        "sub_0_1_rate": float(np.mean(arr < 0.1)),
+        "sub_0_2_rate": float(np.mean(arr < 0.2)),
+    }
+
+
 
 class PoseGraph:
     """Pose graph representation with keyframe nodes and relative displacement constraints."""
@@ -590,6 +733,37 @@ class Mosaic:
         conf, origin = self.confidence_map()
         uncert = np.where(np.isfinite(conf), np.maximum(0.05, 1.0 - conf), np.nan).astype(np.float32)
         return uncert, origin
+
+    def residual_map(self) -> tuple[np.ndarray, tuple[int, int]]:
+        """Per-pixel registration residual map (in pixels) across overlapping keyframe regions."""
+        img, (x0, y0) = self.image()
+        if len(self.keyframes) < 2 or not np.isfinite(img).any():
+            return np.full_like(img, np.nan), (x0, y0)
+        t = self.tile
+        txs = [k[0] for k in self.tiles]
+        tys = [k[1] for k in self.tiles]
+        X0, Y0 = min(txs), min(tys)
+        res_canvas = np.full(((max(tys) - Y0 + 1) * t, (max(txs) - X0 + 1) * t), np.nan, np.float32)
+
+        for (i, j, dx, dy, _wt) in self.pose_graph.edges:
+            if i < len(self.keyframes) and j < len(self.keyframes):
+                ki, kj = self.keyframes[i], self.keyframes[j]
+                actual_dx = kj.x - ki.x
+                actual_dy = kj.y - ki.y
+                res = math.hypot(actual_dx - dx, actual_dy - dy)
+                x_center = int(round((ki.x + kj.x) / 2.0 - X0 * t))
+                y_center = int(round((ki.y + kj.y) / 2.0 - Y0 * t))
+                h_half, w_half = t // 2, t // 2
+                ys = slice(max(0, y_center - h_half), min(res_canvas.shape[0], y_center + h_half))
+                xs = slice(max(0, x_center - w_half), min(res_canvas.shape[1], x_center + w_half))
+                curr = res_canvas[ys, xs]
+                res_canvas[ys, xs] = np.where(np.isnan(curr), res, np.maximum(curr, res))
+
+        H, W = img.shape
+        res_crop = res_canvas[y0 - Y0 * t : y0 - Y0 * t + H, x0 - X0 * t : x0 - X0 * t + W]
+        res_crop = np.where(np.isfinite(img), np.where(np.isnan(res_crop), 0.02, res_crop), np.nan)
+        return res_crop.astype(np.float32), (x0, y0)
+
 
     # ---------------------------------------------------------------- 2.5D
     def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str) -> None:

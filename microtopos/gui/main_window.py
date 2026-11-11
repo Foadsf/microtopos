@@ -14,8 +14,8 @@ logger = logging.getLogger("microtopos.gui")
 import cv2
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QObject, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         verbose: bool = False,
         fusion: str = "sharpest",
         crop: tuple | None = None,
+        reset_geometry: bool = False,
     ):
         super().__init__()
         opencv_threads()
@@ -137,13 +138,36 @@ class MainWindow(QMainWindow):
         self._build()
         self._shortcuts()
         self.engine.start()
-        self.cameras = [] if replay else list_cameras()  # --simulator still lists cameras, it only starts on the sim
+        self.cameras = [] if (replay or simulator_only) else list_cameras()
         self._fill_sources()
         self._set_rotation(self.sp_rot.value())
         self._apply_theme()
-        g = self.settings.value("geometry")
-        if g is not None:
-            self.restoreGeometry(g)
+
+        if reset_geometry:
+            primary = QGuiApplication.primaryScreen()
+            if primary:
+                avail = primary.availableGeometry()
+                w = min(1560, avail.width() - 40)
+                h = min(940, avail.height() - 40)
+                self.resize(w, h)
+                self.move(avail.center().x() - w // 2, avail.center().y() - h // 2)
+        else:
+            g = self.settings.value("geometry")
+            if g is not None:
+                self.restoreGeometry(g)
+                # Ensure window is visible on an active connected screen
+                geo = self.geometry()
+                screens = QGuiApplication.screens()
+                intersects = any(s.geometry().intersects(geo) for s in screens)
+                if not intersects or QGuiApplication.screenAt(geo.center()) is None:
+                    primary = QGuiApplication.primaryScreen()
+                    if primary:
+                        avail = primary.availableGeometry()
+                        w = min(geo.width(), avail.width() - 40)
+                        h = min(geo.height(), avail.height() - 40)
+                        geo.setSize(QSize(max(800, w), max(600, h)))
+                        geo.moveCenter(avail.center())
+                        self.setGeometry(geo)
         st = self.settings.value("state")
         if st is not None:
             self.restoreState(st)

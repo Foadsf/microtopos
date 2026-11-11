@@ -214,3 +214,80 @@ def test_validate_warp_matrix():
 
     W_excessive = np.float32([[1.0, 0.0, 50000.0], [0.0, 1.0, 0.0]])
     assert not validate_warp_matrix(W_excessive)
+
+
+def test_lens_distortion_model():
+    """Scientific regression: LensDistortionModel correctly models camera intrinsics, undistorts frames, and serializes."""
+    from microtopos.calibration import LensDistortionModel
+
+    K = np.array([[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    dist = np.array([-0.15, 0.05, 0.0, 0.0, 0.0], dtype=np.float64)
+    model = LensDistortionModel(camera_matrix=K, dist_coeffs=dist, image_size=(640, 480))
+    d = model.to_dict()
+    assert "camera_matrix" in d and "dist_coeffs" in d
+    model2 = LensDistortionModel.from_dict(d)
+    assert np.allclose(model2.camera_matrix, K)
+    assert np.allclose(model2.dist_coeffs, dist)
+
+    test_img = np.zeros((480, 640), dtype=np.uint8)
+    cv2.rectangle(test_img, (50, 50), (590, 430), 255, 2)
+    undist = model.undistort(test_img)
+    assert undist.shape == test_img.shape
+
+
+def test_backlash_learning():
+    """Scientific regression: BacklashModel learns directional backlash from measured revisit offsets."""
+    model = BacklashModel(backlash_x=0.0, backlash_y=0.0)
+    for _ in range(25):
+        model.update_from_revisit(dx_obs=0.8, dy_obs=0.5, dir_x=1, dir_y=-1, learning_rate=0.25)
+    assert abs(model.backlash_x - 0.8) < 0.05
+    assert abs(model.backlash_y - 0.5) < 0.05
+
+
+def test_joint_intensity_height_registration():
+    """Scientific regression: register_joint_intensity_height locks onto topographic gradients when optical contrast is low."""
+    from microtopos.registration import register_joint_intensity_height
+
+    img1 = np.full((120, 160), 128.0, dtype=np.float32)
+    h1 = np.zeros((120, 160), dtype=np.float32)
+    h1[40:80, 40:120] = 50.0
+
+    M = np.float32([[1, 0, 8.0], [0, 1, -4.0]])
+    img2 = cv2.warpAffine(img1, M, (160, 120))
+    h2 = cv2.warpAffine(h1, M, (160, 120))
+
+    dx, dy, _ = register_joint_intensity_height(img1, h1, img2, h2, weight_height=0.7)
+    assert abs(dx - 8.0) < 0.5
+    assert abs(dy - (-4.0)) < 0.5
+
+
+def test_revisit_registration_benchmark_milestone():
+    """Scientific milestone verification: 100 revisit trials achieve mean error < 0.1 px and p95 < 0.2 px."""
+    from microtopos.mosaic import revisit_registration_benchmark
+
+    res = revisit_registration_benchmark(cycles=100)
+    assert res["mean_error_px"] < 0.10, f"Mean error {res['mean_error_px']} exceeded 0.1 px"
+    assert res["p95_error_px"] < 0.20, f"95th percentile {res['p95_error_px']} exceeded 0.2 px"
+    assert res["sub_0_1_rate"] >= 0.95
+
+
+def test_stage_repeatability_benchmark():
+    """Scientific regression: stage_repeatability_benchmark calculates repeatability statistics across 100 cycles."""
+    from microtopos.mosaic import stage_repeatability_benchmark
+
+    res = stage_repeatability_benchmark(cycles=100)
+    assert res["cycles"] == 100.0
+    assert res["mean_error_euclidean"] > 0.0
+    assert res["p95_error_euclidean"] > 0.0
+
+
+def test_mosaic_residual_map():
+    """Scientific regression: Mosaic.residual_map computes spatial alignment residuals."""
+    m = Mosaic()
+    f1 = _synthetic_texture(128, 128, seed=1)
+    f2 = _synthetic_texture(128, 128, seed=2)
+    m.track(f1)
+    m.track(f2)
+    res_map, origin = m.residual_map()
+    assert res_map.ndim == 2
+

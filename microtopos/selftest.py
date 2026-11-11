@@ -534,6 +534,58 @@ def check_timing(seed):
              else None)]
 
 
+def check_revisit_and_calibration(seed):
+    """Check revisit registration accuracy (< 0.1 px), backlash learning, and lens distortion model."""
+    from .calibration import LensDistortionModel
+    from .mosaic import BacklashModel, revisit_registration_benchmark
+
+    rows = []
+    bench = revisit_registration_benchmark(cycles=25, seed=seed)
+    mean_err = bench["mean_error_px"]
+    p95_err = bench["p95_error_px"]
+    rows.append((
+        "revisit registration: 25 cycles mean error (px)",
+        seed,
+        f"{mean_err:.4f}",
+        "< 0.100",
+        mean_err < 0.10,
+    ))
+    rows.append((
+        "revisit registration: 25 cycles 95th pct error (px)",
+        seed,
+        f"{p95_err:.4f}",
+        "< 0.200",
+        p95_err < 0.20,
+    ))
+
+    b_model = BacklashModel(0.0, 0.0)
+    for _ in range(20):
+        b_model.update_from_revisit(dx_obs=0.5, dy_obs=0.3, dir_x=1, dir_y=-1, learning_rate=0.25)
+    b_ok = abs(b_model.backlash_x - 0.5) < 0.05 and abs(b_model.backlash_y - 0.3) < 0.05
+    rows.append((
+        "backlash model: online learning from revisit offsets",
+        seed,
+        f"bx={b_model.backlash_x:.2f} by={b_model.backlash_y:.2f}",
+        "bx~0.5 by~0.3",
+        b_ok,
+    ))
+
+    K = np.array([[600.0, 0, 160.0], [0, 600.0, 120.0], [0, 0, 1.0]], dtype=np.float64)
+    dist = np.array([-0.1, 0.02, 0, 0, 0], dtype=np.float64)
+    l_model = LensDistortionModel(K, dist, (320, 240))
+    dummy = np.full((240, 320), 128, dtype=np.uint8)
+    undist = l_model.undistort(dummy)
+    l_ok = undist.shape == dummy.shape
+    rows.append((
+        "lens distortion: Brown-Conrady undistortion pipeline",
+        seed,
+        "undistort ok" if l_ok else "fail",
+        "shape match",
+        l_ok,
+    ))
+    return rows
+
+
 def check_real_recording(folder: str) -> list:
     """Real specimen texture and camera noise from a recording (needs a lit, still recording of >= 40 frames).
 
@@ -586,7 +638,7 @@ CHECKS = [check_conventions, check_focus_measures, check_registration, check_sff
           lambda s: check_sff(s, "10x / 0.25"), check_hand_sweep, check_reversal, check_textureless,
           check_state_machine, check_objective_change, check_fast_pan, check_mosaic, check_mosaic_jump, check_height_mosaic,
           check_superres]
-ONCE = [check_metrology_extra, check_sfilter, check_exports, check_timing]
+ONCE = [check_metrology_extra, check_sfilter, check_exports, check_timing, check_revisit_and_calibration]
 
 
 def run(seeds=(11, 22, 33), out=print, real: str | None = None) -> bool:

@@ -167,3 +167,78 @@ def bgr_to_luma(bgr: np.ndarray, linearize: bool = False) -> np.ndarray:
         lin = 255.0 * (bgr.astype(np.float32) / 255.0) ** 2.2
         return (0.0722 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.2126 * lin[..., 2]).astype(np.float32)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+
+@dataclass
+class LensDistortionModel:
+    """Lens geometric distortion parameters (Brown-Conrady model) to correct optical aberrations."""
+
+    camera_matrix: np.ndarray  # 3x3 float64
+    dist_coeffs: np.ndarray  # 1x5 or 1x8 float64 [k1, k2, p1, p2, k3, ...]
+    image_size: tuple[int, int] = (0, 0)  # (w, h)
+    _map1: np.ndarray | None = field(default=None, repr=False)
+    _map2: np.ndarray | None = field(default=None, repr=False)
+
+    def undistort(self, img: np.ndarray) -> np.ndarray:
+        """Undistort an image, using cached rectification maps for fast streaming execution."""
+        h, w = img.shape[:2]
+        if self._map1 is None or self._map2 is None or (w, h) != self.image_size:
+            self.image_size = (w, h)
+            new_cam_mat, _ = cv2.getOptimalNewCameraMatrix(self.camera_matrix, self.dist_coeffs, (w, h), 0)
+            self._map1, self._map2 = cv2.initUndistortRectifyMap(
+                self.camera_matrix, self.dist_coeffs, None, new_cam_mat, (w, h), cv2.CV_16SC2
+            )
+        return cv2.remap(img, self._map1, self._map2, cv2.INTER_LINEAR)
+
+    def to_dict(self) -> dict:
+        return {
+            "camera_matrix": self.camera_matrix.tolist(),
+            "dist_coeffs": self.dist_coeffs.tolist(),
+            "image_size": list(self.image_size),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> LensDistortionModel:
+        return cls(
+            camera_matrix=np.array(data["camera_matrix"], dtype=np.float64),
+            dist_coeffs=np.array(data["dist_coeffs"], dtype=np.float64),
+            image_size=tuple(data.get("image_size", (0, 0))),
+        )
+
+
+def calibrate_lens_from_checkerboard(
+    images: list[np.ndarray],
+    board_size: tuple[int, int] = (9, 6),
+    square_size_mm: float = 1.0,
+) -> tuple[LensDistortionModel, float]:
+    """Calibrate camera intrinsics and lens distortion from a set of checkerboard calibration images.
+
+    Returns:
+        (model, rms_reprojection_error)
+    """
+    objp = np.zeros((board_size[0] * board_size[1], 3), np.float32)
+    objp[:, :2] = np.mgrid[0 : board_size[0], 0 : board_size[1]].T.reshape(-1, 2) * square_size_mm
+
+    objpoints = []
+    imgpoints = []
+    img_size = None
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
+    for img in images:
+        gray = bgr_to_luma(img) if img.ndim == 3 else img.astype(np.uint8)
+        if img_size is None:
+            img_size = (gray.shape[1], gray.shape[0])
+        ret, corners = cv2.findChessboardCorners(gray.astype(np.uint8), board_size, None)
+        if ret:
+            objpoints.append(objp)
+            corners_sub = cv2.cornerSubPix(gray.astype(np.uint8), corners, (11, 11), (-1, -1), criteria)
+            imgpoints.append(corners_sub)
+
+    if not objpoints or img_size is None:
+        raise ValueError(f"No checkerboard patterns found in the provided {len(images)} images.")
+
+    rms, mtx, dist, _rvecs, _tvecs = cv2.calibrateCamera(objpoints, imgpoints, img_size, None, None)
+    model = LensDistortionModel(camera_matrix=mtx, dist_coeffs=dist, image_size=img_size)
+    return model, float(rms)
+

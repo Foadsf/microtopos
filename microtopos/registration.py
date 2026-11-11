@@ -148,3 +148,75 @@ def warp_scale_shift(W: np.ndarray, shape: tuple[int, int]) -> tuple[float, floa
     p = W[:, :2] @ c + W[:, 2]
     s = math.sqrt(max(float(np.linalg.det(W[:, :2])), 1e-12))
     return s, float(p[0] - c[0]), float(p[1] - c[1])
+
+
+def register_joint_intensity_height(
+    template_img: np.ndarray,
+    template_height: np.ndarray | None,
+    moving_img: np.ndarray,
+    moving_height: np.ndarray | None,
+    weight_height: float = 0.5,
+) -> tuple[float, float, float]:
+    """Jointly register two observations using optical intensity and 2.5D topographic surface gradient.
+
+    When optical contrast is low or specular, topographic gradient information provides robust spatial lock.
+
+    Returns:
+        (dx, dy, correlation)
+    """
+    t_img = template_img.astype(np.float32)
+    m_img = moving_img.astype(np.float32)
+
+    t_norm = (t_img - np.nanmean(t_img)) / (np.nanstd(t_img) + 1e-6)
+    m_norm = (m_img - np.nanmean(m_img)) / (np.nanstd(m_img) + 1e-6)
+
+    has_height = (
+        template_height is not None
+        and moving_height is not None
+        and np.isfinite(template_height).any()
+        and np.isfinite(moving_height).any()
+    )
+
+    if has_height:
+        th = np.nan_to_num(template_height, nan=float(np.nanmedian(template_height)))
+        mh = np.nan_to_num(moving_height, nan=float(np.nanmedian(moving_height)))
+
+        gx_t = cv2.Sobel(th.astype(np.float32), cv2.CV_32F, 1, 0)
+        gy_t = cv2.Sobel(th.astype(np.float32), cv2.CV_32F, 0, 1)
+        grad_t = np.hypot(gx_t, gy_t)
+        grad_t = (grad_t - np.mean(grad_t)) / (np.std(grad_t) + 1e-6)
+
+        gx_m = cv2.Sobel(mh.astype(np.float32), cv2.CV_32F, 1, 0)
+        gy_m = cv2.Sobel(mh.astype(np.float32), cv2.CV_32F, 0, 1)
+        grad_m = np.hypot(gx_m, gy_m)
+        grad_m = (grad_m - np.mean(grad_m)) / (np.std(grad_m) + 1e-6)
+
+        wh = np.clip(weight_height, 0.0, 1.0)
+        t_joint = (1.0 - wh) * t_norm + wh * grad_t
+        m_joint = (1.0 - wh) * m_norm + wh * grad_m
+    else:
+        t_joint = t_norm
+        m_joint = m_norm
+
+    h, w = t_joint.shape[:2]
+    win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+    dx, dy, resp = phase_shift(t_joint, m_joint, win)
+
+    try:
+        crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+        _, W = cv2.findTransformECC(
+            t_joint,
+            m_joint,
+            np.float32([[1, 0, dx], [0, 1, dy]]),
+            cv2.MOTION_TRANSLATION,
+            crit,
+            None,
+            1,
+        )
+        if np.isfinite(W).all() and math.hypot(W[0, 2] - dx, W[1, 2] - dy) < 2.0:
+            dx, dy = float(W[0, 2]), float(W[1, 2])
+    except cv2.error:
+        pass
+
+    return dx, dy, resp
+

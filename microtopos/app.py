@@ -54,6 +54,21 @@ def main():
         action="store_true",
         help="create a self-contained diagnostic zip bundle with logs, config and environment details, then exit",
     )
+    ap.add_argument(
+        "--benchmark-revisit",
+        action="store_true",
+        help="run 100-cycle revisit registration accuracy benchmark (<0.1 px target) and exit",
+    )
+    ap.add_argument(
+        "--benchmark-stage",
+        action="store_true",
+        help="run 100-cycle stage bidirectional repeatability benchmark and exit",
+    )
+    ap.add_argument(
+        "--reset-geometry",
+        action="store_true",
+        help="reset window size and position to primary screen center",
+    )
     ap.add_argument("--version", action="version", version=f"MicroTopos {__version__}")
     args = ap.parse_args()
 
@@ -64,6 +79,39 @@ def main():
     if args.diagnostics:
         bundle_path = create_diagnostic_bundle()
         print(f"Diagnostic bundle exported to: {bundle_path.resolve()}")
+        sys.exit(0)
+
+    if args.benchmark_revisit:
+        from .mosaic import revisit_registration_benchmark
+        res = revisit_registration_benchmark(cycles=100)
+        print("=" * 60)
+        print("MicroTopos Revisit Registration Benchmark (100 cycles)")
+        print("=" * 60)
+        print(f"  Mean Error:        {res['mean_error_px']:.4f} px (Target: < 0.1000 px)")
+        print(f"  Std Dev:           {res['std_error_px']:.4f} px")
+        print(f"  Max Error:         {res['max_error_px']:.4f} px")
+        print(f"  95th Percentile:   {res['p95_error_px']:.4f} px (Target: < 0.2000 px)")
+        print(f"  99th Percentile:   {res['p99_error_px']:.4f} px")
+        print(f"  Sub-0.1 px Rate:   {res['sub_0_1_rate'] * 100:.1f} %")
+        print(f"  Sub-0.2 px Rate:   {res['sub_0_2_rate'] * 100:.1f} %")
+        print("=" * 60)
+        passed = res["mean_error_px"] < 0.1 and res["p95_error_px"] < 0.2
+        print(f"Status: {'PASS [Sub-0.1 px Revisit Error Milestone Achieved]' if passed else 'FAIL'}")
+        sys.exit(0 if passed else 1)
+
+    if args.benchmark_stage:
+        from .mosaic import stage_repeatability_benchmark
+        res = stage_repeatability_benchmark(cycles=100)
+        print("=" * 60)
+        print("MicroTopos Stage Repeatability Benchmark (100 cycles)")
+        print("=" * 60)
+        print(f"  Mean X Error:      {res['mean_error_x']:.4f} um")
+        print(f"  95th Pct X Error:  {res['p95_error_x']:.4f} um")
+        print(f"  Mean Y Error:      {res['mean_error_y']:.4f} um")
+        print(f"  95th Pct Y Error:  {res['p95_error_y']:.4f} um")
+        print(f"  Mean Euclidean:    {res['mean_error_euclidean']:.4f} um")
+        print(f"  95th Pct Euclidean:{res['p95_error_euclidean']:.4f} um")
+        print("=" * 60)
         sys.exit(0)
 
     if args.selftest is not None:
@@ -92,6 +140,7 @@ def main():
             verbose=args.verbose,
             fusion=args.fusion,
             crop=args.crop,
+            reset_geometry=args.reset_geometry,
         )
         w.show()
         sys.exit(app.exec())

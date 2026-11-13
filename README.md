@@ -33,6 +33,8 @@ uv run microtopos --simulator  # GUI with the synthetic specimen only
 uv run microtopos-selftest     # ground-truth checks, 3 seeds; --quick for one seed, --gui adds a GUI run,
                                # --json FILE writes every row with thresholds and versions
 uv run --group dev pytest      # the same checks, pipeline tests and an offscreen GUI smoke test
+uv run --group dev pytest -m slow  # full generalisation matrix (tests/test_gen_*.py: seeds x objectives x
+                                   # conditions, negative controls); the default run keeps a subset
 uv run microtopos-record DIR   # record the camera (also: "Record raw stream" in the GUI)
 uv run microtopos --replay DIR # replay a recording at its recorded timing (frames may be skipped under load)
 uv run microtopos-batch DIR OUT  # analyse EVERY frame of a recording in order, reconstruct each sweep

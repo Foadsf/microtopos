@@ -29,10 +29,18 @@ def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, 
         ly = np.abs(cv2.filter2D(img, cv2.CV_32F, k.T, borderType=cv2.BORDER_REFLECT))
         return _box(lx + ly, window)
     if measure in ("Vollath F4", "Vollath F5"):
-        i1 = np.roll(img, -1, axis=1)
+        i1 = img.copy()
+        if img.shape[1] > 1:
+            i1[:, :-1] = img[:, 1:]
+            i1[:, -1] = img[:, -1]
         p1 = _box(img * i1, window)
         if measure == "Vollath F4":
-            i2 = np.roll(img, -2, axis=1)
+            i2 = img.copy()
+            if img.shape[1] > 2:
+                i2[:, :-2] = img[:, 2:]
+                i2[:, -2:] = img[:, -1:]
+            elif img.shape[1] > 1:
+                i2[:, :] = img[:, -1:]
             return np.maximum(p1 - _box(img * i2, window), 0.0)
         # F5 = sum I(x)I(x+1) - N * mean(I)^2  (local version)
         m = _box(img, window)

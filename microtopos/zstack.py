@@ -44,11 +44,12 @@ def rescale_warp(W: np.ndarray, f: float) -> np.ndarray:
 
 def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective: Objective, um_per_px: float,
                 z_unit: str, z_um_per_frame: float | None = None, settings: ZSettings | None = None,
-                progress=None, cancelled=None) -> dict:
+                progress=None, cancelled=None, frame_indices: np.ndarray | None = None, z_sign: int = 1) -> dict:
     """frames: radiometrically corrected luma (uint8 or float32), all the same size; um_per_px is THEIR pixel size.
 
     z_labels: physical z per frame (simulator ground truth or a motorised drive), or None for a hand sweep.
     z_um_per_frame: user's knob calibration; used only when z_labels is None.
+    frame_indices: original capture frame positions when long sweeps were thinned 2:1.
     """
     st = settings or ZSettings()
     t_all = time.perf_counter()
@@ -84,6 +85,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         a, b = sff.monotonic_segments_from_z(z_all)[0]
         idx = np.arange(a, b)
         z = z_all[idx]
+        frame_span = float(max(0, len(idx) - 1))
         if b - a < n_in:
             reversal_at = int(b if a == 0 else a)
     else:
@@ -95,7 +97,15 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
             idx = np.arange(n_in)
         keep = sff.drop_pauses(tiles[idx])
         idx = idx[keep]
-        z = np.arange(len(idx), dtype=np.float64) * (z_um_per_frame or 1.0)
+        step_dir = 1.0 if z_sign >= 0 else -1.0
+        if frame_indices is not None and len(frame_indices) == n_in:
+            fi = np.asarray(frame_indices, dtype=np.float64)[idx]
+            z = (fi - fi[0]) * float(z_um_per_frame or 1.0) * step_dir
+            frame_span = float(abs(fi[-1] - fi[0])) if fi.size > 1 else 0.0
+        else:
+            z = np.arange(len(idx), dtype=np.float64) * float(z_um_per_frame or 1.0) * step_dir
+            frame_span = float(max(0, len(idx) - 1))
+        warnings.append("Hand sweep without axial encoder: depth sign (+up/-down) depends on focus knob turn direction.")
     if reversal_at is not None:
         warnings.append(f"Focus direction reversed at frame {reversal_at}; used the longer monotonic part "
                         f"({len(idx)} of {n_in} frames).")
@@ -160,7 +170,8 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     if z_labels is None and np.isfinite(fit.fwhm_z_median) and fit.fwhm_z_median > 0:
         fw_um = sff.theoretical_fwhm_um(objective, um_proc, lambda im: focus_map(im, st.measure, window, psf_px),
                                        edf_proc)
-        dof_ruler = fw_um / (fit.fwhm_z_median / (z_um_per_frame or 1.0))
+        if np.isfinite(fw_um):
+            dof_ruler = fw_um / (fit.fwhm_z_median / (z_um_per_frame or 1.0))
 
     timings["total"] = round(time.perf_counter() - t_all, 3)
     if progress:
@@ -169,7 +180,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         **m,
         "edf": edf, "edf_proc": edf_proc.astype(np.float32), "height": height, "height_raw": fit.z_raw,
         "confidence": fit.confidence, "um_per_px_capture": um_per_px, "objective": objective.name,
-        "frames_in": n_in, "frames_used": int(len(idx)), "reversal_at": reversal_at,
+        "frames_in": n_in, "frames_used": int(len(idx)), "frame_span": frame_span, "reversal_at": reversal_at,
         "z_first": float(z[0]), "z_last": float(z[-1]), "fwhm_z": fit.fwhm_z_median,
         "dof_ruler_um_per_frame": dof_ruler, "ecc_mean": float(eccs.mean()) if eccs.size else None,
         "ecc_min": float(eccs.min()) if eccs.size else None, "registration_fallbacks": fails,

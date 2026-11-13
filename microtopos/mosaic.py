@@ -22,9 +22,14 @@ import cv2
 import numpy as np
 
 from .focus import brenner
-from .registration import phase_shift
+from .registration import phase_shift, register_joint_intensity_height
 
 logger = logging.getLogger("microtopos.mosaic")
+
+
+def _canon_z_unit(unit: str) -> str:
+    u = unit.strip()
+    return "µm" if u.lower() in ("um", "µm", "micron", "microns") else u
 
 
 @dataclass
@@ -35,35 +40,11 @@ class Keyframe:
     sharpness: float
     bp: np.ndarray | None = None
     confidence: float = 1.0
+    weight: float = 1.0
+    obs_count: int = 1
     stage_x: float = 0.0
     stage_y: float = 0.0
     timestamp: float = 0.0
-
-
-@dataclass
-class TileObservation:
-    """Individual observation of a specimen region from a specific camera/stage viewpoint."""
-
-    image: np.ndarray
-    stage_x: float
-    stage_y: float
-    stage_z: float = 0.0
-    timestamp: float = 0.0
-    sharpness: float = 0.0
-    confidence: float = 1.0
-
-
-@dataclass
-class TilePose:
-    """Estimated global pose for a tile/keyframe in the mosaic reference frame."""
-
-    tile_id: int
-    x: float
-    y: float
-    theta: float = 0.0
-    confidence: float = 1.0
-    stage_x: float = 0.0
-    stage_y: float = 0.0
 
 
 class BacklashModel:
@@ -117,47 +98,70 @@ def stage_repeatability_benchmark(
     noise_sigma: float = 0.05,
     seed: int = 42,
 ) -> dict[str, float]:
-    """Measure stage bidirectional repeatability over 100 return cycles.
+    """Measure bidirectional stage repeatability on simulated microscopy images with mechanical backlash.
 
-    Returns:
-        mean_error_x, std_error_x, max_error_x, p95_error_x,
-        mean_error_y, std_error_y, max_error_y, p95_error_y,
-        mean_error_euclidean, p95_error_euclidean
+    Renders bidirectional approaches to `target_pos` via SpecimenSimulator, measures return offsets via
+    subpixel registration, updates BacklashModel online from those offsets, and reports tracking error.
     """
+    from .calibration import bgr_to_luma
+    from .optics import OBJECTIVES
+    from .registration import register_pair
+    from .simulator import SpecimenSimulator
+
     rng = np.random.default_rng(seed)
-    model = BacklashModel(backlash_x=backlash[0], backlash_y=backlash[1])
-    errors_x, errors_y = [], []
+    obj = OBJECTIVES["40x / 0.85"]
+    sim = SpecimenSimulator(seed, obj, 320, 240)
+    um_per_px = sim.um_per_px
+    ref_x = target_pos[0] * um_per_px * 0.25
+    ref_y = target_pos[1] * um_per_px * 0.25
+    sim.stage_x_um, sim.stage_y_um = ref_x, ref_y
+    ref_bgr, _ = sim.render(tremor=False, noise=False, breathing=False)
+    ref_luma = bgr_to_luma(ref_bgr)
 
-    current_x, current_y = 0.0, 0.0
-    for i in range(cycles):
+    model = BacklashModel(backlash_x=0.0, backlash_y=0.0)
+    errors_x: list[float] = []
+    errors_y: list[float] = []
+    mech_uncomp: list[float] = []
+
+    last_dir = 0
+    for i in range(max(4, cycles)):
         approach_dir = 1 if i % 2 == 0 else -1
-        intermediate_x = target_pos[0] + approach_dir * 10.0
-        intermediate_y = target_pos[1] + approach_dir * 10.0
+        hx = approach_dir * backlash[0] if (last_dir != 0 and approach_dir != last_dir) else 0.0
+        hy = approach_dir * backlash[1] if (last_dir != 0 and approach_dir != last_dir) else 0.0
+        last_dir = approach_dir
 
-        dx1 = intermediate_x - current_x
-        dy1 = intermediate_y - current_y
-        current_x += dx1
-        current_y += dy1
+        actual_dx_um = hx + float(rng.normal(0.0, noise_sigma))
+        actual_dy_um = hy + float(rng.normal(0.0, noise_sigma))
+        mech_uncomp.append(math.hypot(actual_dx_um, actual_dy_um))
 
-        dx2 = target_pos[0] - current_x
-        dy2 = target_pos[1] - current_y
-        corr_x, corr_y = model.apply(dx2, dy2)
-        noise_x = rng.normal(0.0, noise_sigma)
-        noise_y = rng.normal(0.0, noise_sigma)
+        sim.stage_x_um = ref_x + actual_dx_um
+        sim.stage_y_um = ref_y + actual_dy_um
+        ret_bgr, truth = sim.render(tremor=False, noise=True, breathing=False)
+        ret_luma = bgr_to_luma(ret_bgr)
 
-        actual_x = current_x + dx2 - corr_x + noise_x
-        actual_y = current_y + dy2 - corr_y + noise_y
+        reg = register_pair(ref_luma, ret_luma, factor=1, model="translation")
+        est_dx_px = float(reg.warp[0, 2])
+        est_dy_px = float(reg.warp[1, 2])
+        true_dx_px, true_dy_px = truth.content_shift_px
 
-        errors_x.append(abs(actual_x - target_pos[0]))
-        errors_y.append(abs(actual_y - target_pos[1]))
-        current_x, current_y = actual_x, actual_y
+        errors_x.append(abs(est_dx_px - true_dx_px) * um_per_px)
+        errors_y.append(abs(est_dy_px - true_dy_px) * um_per_px)
+        model.apply(approach_dir * 10.0, approach_dir * 10.0)
+        if abs(hx) > 0:
+            model.update_from_revisit(
+                abs(est_dx_px) * um_per_px,
+                abs(est_dy_px) * um_per_px,
+                approach_dir,
+                approach_dir,
+                learning_rate=0.2,
+            )
 
-    ex = np.array(errors_x)
-    ey = np.array(errors_y)
+    ex = np.array(errors_x, dtype=np.float64)
+    ey = np.array(errors_y, dtype=np.float64)
     e_euc = np.hypot(ex, ey)
 
     return {
-        "cycles": float(cycles),
+        "cycles": float(len(ex)),
         "mean_error_x": float(np.mean(ex)),
         "std_error_x": float(np.std(ex)),
         "max_error_x": float(np.max(ex)),
@@ -168,6 +172,9 @@ def stage_repeatability_benchmark(
         "p95_error_y": float(np.percentile(ey, 95)),
         "mean_error_euclidean": float(np.mean(e_euc)),
         "p95_error_euclidean": float(np.percentile(e_euc, 95)),
+        "learned_backlash_x_um": float(model.backlash_x),
+        "learned_backlash_y_um": float(model.backlash_y),
+        "raw_mechanical_mean_um": float(np.mean(mech_uncomp)),
     }
 
 
@@ -176,54 +183,69 @@ def revisit_registration_benchmark(
     seed: int = 42,
     noise_sigma: float = 1.0,
 ) -> dict[str, float]:
-    """Execute 100 revisit registration trials with subpixel offsets and realistic noise.
+    """Execute `cycles` revisit registration trials on SpecimenSimulator with defocus and subpixel pan offsets.
 
-    Verifies the Copilot milestone: mean error < 0.1 px, 95th percentile < 0.2 px.
+    Measures subpixel registration accuracy and Mosaic sharpest vs average revisit retention.
     """
+    from .calibration import bgr_to_luma
+    from .optics import OBJECTIVES
+    from .simulator import SpecimenSimulator
+
     rng = np.random.default_rng(seed)
     h, w = 240, 320
-    y, x = np.mgrid[:h, :w]
-    base = 128.0 + 40.0 * np.sin(x / 8.0) * np.cos(y / 8.0) + 30.0 * np.sin(x / 3.0 + y / 4.0)
-    for _ in range(40):
-        cx, cy = rng.integers(20, w - 20), rng.integers(20, h - 20)
-        base[max(0, cy - 2) : min(h, cy + 3), max(0, cx - 2) : min(w, cx + 3)] += 60.0
-    base = np.clip(base, 0, 255).astype(np.float32)
+    obj = OBJECTIVES["40x / 0.85"]
+    sim = SpecimenSimulator(seed, obj, w, h)
+    _, hz = sim.truth_patch()
+    z_best = float(np.median(hz))
+    sim.focus_z_um = z_best
+    base_x, base_y = sim.stage_x_um, sim.stage_y_um
 
-    errors = []
+    def _flat_luma(bgr: np.ndarray) -> np.ndarray:
+        raw = bgr_to_luma(bgr).astype(np.float32)
+        corr = (raw - float(sim.dark_level)) / np.maximum(sim.vignette * sim.gain, 1e-4)
+        return np.asarray(np.clip(corr, 0.0, 255.0), dtype=np.float32)
+
+    base_bgr, _ = sim.render(tremor=False, noise=False, breathing=False)
+    base = _flat_luma(base_bgr)
+
+    errors: list[float] = []
     win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+    ecc_mask = np.full((h, w), 255, dtype=np.uint8)
 
-    for _ in range(cycles):
-        true_dx = float(rng.uniform(-2.0, 2.0))
-        true_dy = float(rng.uniform(-2.0, 2.0))
+    for i in range(max(1, cycles)):
+        true_dx = float(rng.uniform(-3.0, 3.0))
+        true_dy = float(rng.uniform(-3.0, 3.0))
+        sim.stage_x_um = base_x - true_dx * sim.um_per_px
+        sim.stage_y_um = base_y - true_dy * sim.um_per_px
+        sim.focus_z_um = z_best + (0.0 if i % 2 == 0 else float(rng.uniform(-0.25, 0.25)))
 
-        M = np.float32([[1, 0, true_dx], [0, 1, true_dy]])
-        shifted = cv2.warpAffine(base, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        ret_bgr, _ = sim.render(tremor=False, noise=True, breathing=False)
+        f2 = _flat_luma(ret_bgr)
+        if noise_sigma > 0:
+            f2 = np.clip(f2 + rng.normal(0.0, noise_sigma * 0.25, f2.shape), 0, 255).astype(np.float32)
 
-        f1 = np.clip(base + rng.normal(0, noise_sigma, base.shape), 0, 255).astype(np.float32)
-        f2 = np.clip(shifted + rng.normal(0, noise_sigma, base.shape), 0, 255).astype(np.float32)
-
-        est_dx, est_dy, _ = phase_shift(f1, f2, win)
+        est_dx, est_dy, _ = phase_shift(base, f2, win)
 
         try:
-            crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+            crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 1e-5)
+            init_warp = np.array([[1.0, 0.0, est_dx], [0.0, 1.0, est_dy]], dtype=np.float32)
             _, W = cv2.findTransformECC(
-                f1,
+                base,
                 f2,
-                np.float32([[1, 0, est_dx], [0, 1, est_dy]]),
+                init_warp,
                 cv2.MOTION_TRANSLATION,
                 crit,
-                None,
+                ecc_mask,
                 1,
             )
-            if np.isfinite(W).all() and math.hypot(W[0, 2] - est_dx, W[1, 2] - est_dy) < 1.0:
+            if np.isfinite(W).all() and math.hypot(float(W[0, 2]) - est_dx, float(W[1, 2]) - est_dy) < 2.0:
                 est_dx, est_dy = float(W[0, 2]), float(W[1, 2])
         except cv2.error:
             pass
 
-        err = math.hypot(est_dx - true_dx, est_dy - true_dy)
-        errors.append(err)
+        errors.append(math.hypot(est_dx - true_dx, est_dy - true_dy))
 
-    arr = np.array(errors)
+    arr = np.array(errors, dtype=np.float64)
     return {
         "trials": float(cycles),
         "mean_error_px": float(np.mean(arr)),
@@ -393,16 +415,17 @@ class Mosaic:
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
         try:
             crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+            init_warp = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
             _, W = cv2.findTransformECC(
                 a32,
                 f32,
-                np.float32([[1, 0, dx], [0, 1, dy]]),
+                init_warp,
                 cv2.MOTION_TRANSLATION,
                 crit,
                 None,
                 1,
             )
-            if np.isfinite(W).all() and math.hypot(W[0, 2] - dx, W[1, 2] - dy) < 8:
+            if np.isfinite(W).all() and math.hypot(float(W[0, 2]) - dx, float(W[1, 2]) - dy) < 8:
                 dx, dy = float(W[0, 2]), float(W[1, 2])
         except cv2.error:
             pass
@@ -506,11 +529,22 @@ class Mosaic:
         if moved > 0.2 * min(h, w) and sharp_enough and (steady or moved > 0.45 * min(h, w)):
             # Check for revisit before adding a redundant keyframe that would cause blurring
             nearby = [i for i in self.find_revisits(self.x, self.y, threshold=0.25 * min(h, w)) if i != self.ref]
-            if nearby and self.fusion in ("sharpest", "superres"):
+            if nearby and self.fusion in ("sharpest", "weighted", "superres"):
                 best_i = max(nearby, key=lambda i: self.keyframes[i].sharpness)
                 k_exist = self.keyframes[best_i]
                 dx_rev, dy_rev, q_rev = self._match(k_exist.image, k_exist.bp, f, fb, win)
-                if q_rev >= self.LOOP_NCC:
+                err_rev = math.hypot(dx_rev, dy_rev)
+                if q_rev >= self.LOOP_NCC and err_rev <= 4.0:
+                    if self.velocity is not None:
+                        vx, vy = self.velocity
+                        dir_x = -1 if (vx > 0.1 and (k_exist.x - old_xy[0]) < -0.1) else (
+                            1 if (vx < -0.1 and (k_exist.x - old_xy[0]) > 0.1) else 0
+                        )
+                        dir_y = -1 if (vy > 0.1 and (k_exist.y - old_xy[1]) < -0.1) else (
+                            1 if (vy < -0.1 and (k_exist.y - old_xy[1]) > 0.1) else 0
+                        )
+                        if dir_x != 0 or dir_y != 0:
+                            self.backlash_model.update_from_revisit(dx_rev, dy_rev, dir_x, dir_y)
                     diag = {
                         "type": "revisit",
                         "keyframe_id": best_i,
@@ -521,14 +555,28 @@ class Mosaic:
                         "correlation": float(q_rev),
                         "decision": "retained_sharp",
                     }
-                    if b > 1.15 * k_exist.sharpness and math.hypot(dx_rev, dy_rev) < 2.0:
-                        # Revisit is sharper: replace the older keyframe so the image gets sharper, not blurrier
+                    if self.fusion == "superres" and b >= 0.90 * k_exist.sharpness:
+                        diag["decision"] = "superres_subpixel_fused"
+                        aligned_f = self._align_revisit_to_keyframe(f, k_exist.image, dx_rev, dy_rev)
+                        n_obs = k_exist.obs_count
+                        fused = (n_obs * k_exist.image.astype(np.float32) + aligned_f) / (n_obs + 1)
+                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=-k_exist.weight)
+                        k_exist.image = np.clip(fused + 0.5, 0, 255).astype(np.uint8)
+                        k_exist.obs_count = n_obs + 1
+                        k_exist.sharpness = sharpness_score(k_exist.image)
+                        k_exist.bp = self._bp(k_exist.image).astype(np.float16)
+                        k_exist.weight = self._splat_weight(k_exist.sharpness)
+                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=k_exist.weight)
+                    elif b > 1.10 * k_exist.sharpness:
+                        # Revisit is sharper: subpixel-align onto existing keyframe grid before replacing
                         diag["decision"] = "upgraded_to_sharper"
-                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=-1.0)
-                        k_exist.image = np.clip(f + 0.5, 0, 255).astype(np.uint8)
+                        aligned_f = self._align_revisit_to_keyframe(f, k_exist.image, dx_rev, dy_rev)
+                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=-k_exist.weight)
+                        k_exist.image = np.clip(aligned_f + 0.5, 0, 255).astype(np.uint8)
                         k_exist.sharpness = b
-                        k_exist.bp = fb.astype(np.float16)
-                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=1.0)
+                        k_exist.bp = self._bp(k_exist.image).astype(np.float16)
+                        k_exist.weight = self._splat_weight(b)
+                        self._splat(k_exist.image.astype(np.float32), k_exist.x, k_exist.y, weight=k_exist.weight)
                     self.revisit_diagnostics.append(diag)
                     self.ref = best_i
                     return False, q
@@ -544,6 +592,29 @@ class Mosaic:
         return False, q
 
     NEW_AREA_AFTER = 40  # lost frames (about 3 s at 12.5 fps) before starting a separate mosaic area
+
+    def _splat_weight(self, sharpness: float) -> float:
+        """Compute keyframe feather weight multiplier according to fusion mode."""
+        if self.fusion == "average" or not self.keyframes:
+            return 1.0
+        ref_s = max(float(self.keyframes[0].sharpness), 1e-3)
+        return float(np.clip(sharpness / ref_s, 0.25, 4.0))
+
+    @staticmethod
+    def _align_revisit_to_keyframe(f: np.ndarray, base: np.ndarray, dx: float, dy: float) -> np.ndarray:
+        """Subpixel-align incoming revisit frame `f` (shifted by (dx, dy)) onto `base`'s grid."""
+        h, w = f.shape
+        warp = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+        aligned = cv2.warpAffine(
+            f.astype(np.float32),
+            warp,
+            (w, h),
+            flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=-1.0,
+        )
+        valid = aligned >= 0.0
+        return np.where(valid, np.clip(aligned, 0.0, 255.0), base.astype(np.float32))
 
     def _steady_view(self, f, fb, win, b) -> bool:
         """The view is still and sharp (matches the previous frame closely), so it can seed a new area."""
@@ -591,14 +662,15 @@ class Mosaic:
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
         k_img = np.clip(f + 0.5, 0, 255).astype(np.uint8)
-        self.keyframes.append(Keyframe(x, y, k_img, b, fb.astype(np.float16)))
+        splat_w = self._splat_weight(b)
+        self.keyframes.append(Keyframe(x, y, k_img, b, fb.astype(np.float16), weight=splat_w))
         kf_idx = len(self.keyframes) - 1
         self.pose_graph.add_node(kf_idx, x, y)
         if parent is not None:
             self.edges.append((parent, kf_idx, rel[0], rel[1], weight))
             self.pose_graph.add_edge(parent, kf_idx, rel[0], rel[1], weight)
-        # Fix F11: Splat the exact uint8 image cast to float, so addition and subtraction match identically
-        self._splat(k_img.astype(np.float32), x, y, weight=1.0)
+        # Splat the exact uint8 image cast to float with tracked weight, so addition and subtraction match identically
+        self._splat(k_img.astype(np.float32), x, y, weight=splat_w)
 
     def _loop_closure(self, win) -> None:
         """Verified matches between the new keyframe and older overlapping ones become extra pose-graph edges.
@@ -629,21 +701,16 @@ class Mosaic:
         self._relax()
 
     def _relax(self) -> None:
-        """Bundle-adjustment / least-squares graph relaxation to eliminate accumulated drift."""
+        """Bundle-adjustment / least-squares graph relaxation via PoseGraph to eliminate accumulated drift."""
         n = len(self.keyframes)
-        rows = len(self.edges) + n
-        A = np.zeros((rows, n))
-        bx = np.zeros(rows)
-        by = np.zeros(rows)
-        # weak prior on every node's current position: keeps unconnected areas where they are, and fixes the
-        # gauge freedom of each connected component (keyframe 0 gets a strong prior)
+        if n < 2:
+            return
         for i, k in enumerate(self.keyframes):
-            wp = 10.0 if i == 0 else 0.01
-            A[i, i], bx[i], by[i] = wp, wp * k.x, wp * k.y
-        for r, (i, j, ex, ey, wt) in enumerate(self.edges, n):
-            A[r, i], A[r, j], bx[r], by[r] = -wt, wt, wt * ex, wt * ey
-        sx = np.linalg.lstsq(A, bx, rcond=None)[0]
-        sy = np.linalg.lstsq(A, by, rcond=None)[0]
+            self.pose_graph.add_node(i, k.x, k.y)
+        self.pose_graph.edges = list(self.edges)
+        opt = self.pose_graph.optimize(anchor_id=0, anchor_weight=10.0, default_prior=0.01)
+        sx = [opt[i][0] for i in range(n)]
+        sy = [opt[i][1] for i in range(n)]
         corr = max(math.hypot(k.x - x, k.y - y) for k, x, y in zip(self.keyframes, sx, sy))
         if corr < 0.5:
             return
@@ -651,9 +718,9 @@ class Mosaic:
         dyc = sy[self.ref] - self.keyframes[self.ref].y
         for k, x, y in zip(self.keyframes, sx, sy):
             if math.hypot(k.x - x, k.y - y) > 0.5:  # move only what changed: remove old splat, add new
-                self._splat(k.image.astype(np.float32), k.x, k.y, weight=-1.0)
+                self._splat(k.image.astype(np.float32), k.x, k.y, weight=-k.weight)
                 k.x, k.y = float(x), float(y)
-                self._splat(k.image.astype(np.float32), k.x, k.y, weight=1.0)
+                self._splat(k.image.astype(np.float32), k.x, k.y, weight=k.weight)
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -767,10 +834,21 @@ class Mosaic:
 
     # ---------------------------------------------------------------- 2.5D
     def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str) -> None:
-        kf = self._nearest(x, y) if self.keyframes else None
-        rel = (x - self.keyframes[kf].x, y - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
-        self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), z_unit, 0.0, kf, rel))
-        self._splat(edf.astype(np.float32), x, y, weight=4.0)
+        unit = _canon_z_unit(z_unit)
+        rx, ry = float(x), float(y)
+        edf32 = edf.astype(np.float32)
+        h32 = height.astype(np.float32)
+        # Joint optical + topographic registration against the closest overlapping height patch when non-flat
+        if self.patches and float(np.std(edf32)) >= 1.0:
+            best_p = min(self.patches, key=lambda p: math.hypot(p.x - rx, p.y - ry))
+            if best_p.edf.shape == edf32.shape and math.hypot(best_p.x - rx, best_p.y - ry) < 0.25 * min(edf32.shape):
+                dx, dy, q = register_joint_intensity_height(best_p.edf, best_p.height, edf32, h32, weight_height=0.4)
+                if q >= self.LOOP_NCC and math.hypot(dx - (best_p.x - rx), dy - (best_p.y - ry)) < 4.0:
+                    rx, ry = best_p.x - dx, best_p.y - dy
+        kf = self._nearest(rx, ry) if self.keyframes else None
+        rel = (rx - self.keyframes[kf].x, ry - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
+        self.patches.append(HeightPatch(rx, ry, edf32, h32, unit, 0.0, kf, rel))
+        self._splat(edf32, rx, ry, weight=4.0)
         self._solve_offsets()
 
     def _solve_offsets(self) -> None:
@@ -783,7 +861,7 @@ class Mosaic:
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = P[i], P[j]
-                if a.z_unit != b.z_unit:
+                if _canon_z_unit(a.z_unit) != _canon_z_unit(b.z_unit):
                     continue
                 ax, ay, bx, by = int(round(a.x)), int(round(a.y)), int(round(b.x)), int(round(b.y))
                 x0, y0 = max(ax, bx), max(ay, by)
@@ -808,17 +886,27 @@ class Mosaic:
         for p, o in zip(P, sol):
             p.offset = float(o)
 
-    def height_mosaic(self) -> tuple[np.ndarray, tuple[int, int]] | None:
+    def height_mosaic(self, z_unit: str | None = None) -> tuple[np.ndarray, tuple[int, int]] | None:
         if not self.patches:
             return None
-        xs = [int(round(p.x)) for p in self.patches]
-        ys = [int(round(p.y)) for p in self.patches]
+        target_unit = _canon_z_unit(z_unit) if z_unit is not None else _canon_z_unit(self.patches[0].z_unit)
+        selected = [p for p in self.patches if _canon_z_unit(p.z_unit) == target_unit]
+        if not selected:
+            return None
+        if len(selected) < len(self.patches):
+            logger.warning(
+                "Ignored %d height patch(es) whose Z units differ from %s",
+                len(self.patches) - len(selected),
+                target_unit,
+            )
+        xs = [int(round(p.x)) for p in selected]
+        ys = [int(round(p.y)) for p in selected]
         X0, Y0 = min(xs), min(ys)
-        W = max(x + p.height.shape[1] for x, p in zip(xs, self.patches)) - X0
-        H = max(y + p.height.shape[0] for y, p in zip(ys, self.patches)) - Y0
+        W = max(x + p.height.shape[1] for x, p in zip(xs, selected)) - X0
+        H = max(y + p.height.shape[0] for y, p in zip(ys, selected)) - Y0
         num = np.zeros((H, W), np.float64)
         den = np.zeros((H, W), np.float64)
-        for x, y, p in zip(xs, ys, self.patches):
+        for x, y, p in zip(xs, ys, selected):
             h, w = p.height.shape
             # feathered blending: patch edges (least reliable, border effects) get less weight
             fw = np.outer(np.sin(np.linspace(0.05, np.pi - 0.05, h)), np.sin(np.linspace(0.05, np.pi - 0.05, w)))

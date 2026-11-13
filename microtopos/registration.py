@@ -27,18 +27,29 @@ def _hann(h: int, w: int) -> np.ndarray:
     return cv2.createHanningWindow((w, h), cv2.CV_32F)
 
 
+def _texture_present(a: np.ndarray, b: np.ndarray, min_std: float = 1e-3) -> bool:
+    """Reject constant or nearly constant frames whose FFT phase correlation is arbitrary."""
+    if a.size == 0 or b.size == 0 or not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return False
+    return float(np.std(a)) >= min_std and float(np.std(b)) >= min_std
+
+
 def phase_shift(a: np.ndarray, b: np.ndarray, window: np.ndarray | None = None) -> tuple[float, float, float]:
     """Phase correlation that never modifies its inputs.
 
     OpenCV 5.0's phaseCorrelate applies the window to the input arrays in place, so the window is applied
     to copies here and phaseCorrelate is called without one.
     """
-    win = _hann(*a.shape) if window is None else window
-    a = a.astype(np.float32)
-    b = b.astype(np.float32)
+    a32 = a.astype(np.float32)
+    b32 = b.astype(np.float32)
+    if not _texture_present(a32, b32):
+        return 0.0, 0.0, 0.0
+    win = _hann(*a32.shape[:2]) if window is None else window
     # zero mean before windowing: otherwise the window's own spectrum (identical in both images) adds a
     # spurious zero-shift peak that biases the estimate toward (0, 0)
-    (dx, dy), resp = cv2.phaseCorrelate((a - a.mean()) * win, (b - b.mean()) * win)
+    (dx, dy), resp = cv2.phaseCorrelate((a32 - a32.mean()) * win, (b32 - b32.mean()) * win)
+    if not (math.isfinite(dx) and math.isfinite(dy) and math.isfinite(resp)):
+        return 0.0, 0.0, 0.0
     return float(dx), float(dy), float(resp)
 
 
@@ -64,13 +75,25 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
         m = cv2.resize(moving, size, interpolation=cv2.INTER_AREA)
     else:
         t, m = template.astype(np.float32), moving.astype(np.float32)
+    if not _texture_present(t, m):
+        ident = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        return PairRegistration(ident, 0.0, False)
     dx, dy, resp = phase_shift(t, m)
-    W0 = np.array([[1, 0, dx], [0, 1, dy]], np.float32)
+    W0 = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
     W, cc, ok = W0, resp, False
     try:
         crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
         motion = cv2.MOTION_TRANSLATION if model == "translation" else cv2.MOTION_AFFINE
-        cc_e, We = cv2.findTransformECC(t, m, W0.copy(), motion, crit, None, 3)
+        ecc_mask = np.full(t.shape[:2], 255, dtype=np.uint8)
+        cc_e, We = cv2.findTransformECC(
+            t.astype(np.float32),
+            m.astype(np.float32),
+            W0.copy(),
+            motion,
+            crit,
+            ecc_mask,
+            3,
+        )
         Ws, sc, rot = _to_similarity(We)
         if np.isfinite(Ws).all() and abs(sc - 1) < max_scale_dev and abs(rot) < max_rot_deg \
                 and math.hypot(We[0, 2] - dx, We[1, 2] - dy) < 3.0:
@@ -178,6 +201,7 @@ def register_joint_intensity_height(
     )
 
     if has_height:
+        assert template_height is not None and moving_height is not None
         th = np.nan_to_num(template_height, nan=float(np.nanmedian(template_height)))
         mh = np.nan_to_num(moving_height, nan=float(np.nanmedian(moving_height)))
 
@@ -199,18 +223,22 @@ def register_joint_intensity_height(
         m_joint = m_norm
 
     h, w = t_joint.shape[:2]
+    if not _texture_present(t_joint, m_joint):
+        return 0.0, 0.0, 0.0
     win = cv2.createHanningWindow((w, h), cv2.CV_32F)
     dx, dy, resp = phase_shift(t_joint, m_joint, win)
 
     try:
         crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+        init_w = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+        ecc_mask = np.full(t_joint.shape[:2], 255, dtype=np.uint8)
         _, W = cv2.findTransformECC(
-            t_joint,
-            m_joint,
-            np.float32([[1, 0, dx], [0, 1, dy]]),
+            t_joint.astype(np.float32),
+            m_joint.astype(np.float32),
+            init_w,
             cv2.MOTION_TRANSLATION,
             crit,
-            None,
+            ecc_mask,
             1,
         )
         if np.isfinite(W).all() and math.hypot(W[0, 2] - dx, W[1, 2] - dy) < 2.0:

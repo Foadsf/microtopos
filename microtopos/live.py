@@ -36,6 +36,7 @@ class SweepCapture:
     shape: tuple[int, int]
     simulated: bool
     completeness: float  # fraction of 6x6 field tiles whose focus peak lies inside the sweep (not at an end)
+    frame_indices: np.ndarray | None = None  # original capture frame indices (preserves true spacing across thinning)
 
 
 @dataclass
@@ -85,7 +86,9 @@ class LiveEngine:
         self._sweep_pose = (0.0, 0.0)
         self._n_preroll = 0
         self._sweep_tiles: list = []
+        self._sweep_indices: list[float] = []
         self._stride, self._zcount = 1, 0
+        self._source_gen = 0
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
         self._pending_patches: list = []
         self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0)), None, 0, 0)
@@ -118,6 +121,9 @@ class LiveEngine:
     def set_source(self, src: FrameSource | None):
         with self._lock:
             self.source = src
+            self._source_gen += 1
+            self._last_seq = -1
+            self._calib_req = None
             self._reset_motion()
             self.mosaic.reset()  # a different source shows a different specimen or scale
             self.mosaic_version += 1
@@ -126,6 +132,7 @@ class LiveEngine:
         with self._lock:
             self.objective = obj
             self._corrector_key = None
+            self._calib_req = None
             self._reset_motion()
 
     def set_override(self, mode: Override):
@@ -143,6 +150,7 @@ class LiveEngine:
         self._held = None
         self._preroll.clear()
         self._sweep_tiles = []
+        self._sweep_indices = []
         self._n_preroll = 0
         self._sweep.clear()
         self._sweep_z.clear()
@@ -153,7 +161,7 @@ class LiveEngine:
     def request_calibration(self, kind: str, n: int = 24):
         """Average the next n raw frames into a dark or flat frame for the current objective and exposure."""
         with self._lock:
-            self._calib_req = [kind, n, []]
+            self._calib_req = [kind, n, [], self.objective.name, self._source_gen]
 
     def calibration_progress(self):
         c = self._calib_req
@@ -166,11 +174,14 @@ class LiveEngine:
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
 
-    def _emit(self, frames, zs, tiles, pose, n_pre, shape, simulated):
+    def _emit(self, frames, zs, tiles, pose, n_pre, shape, simulated, indices=None):
         if len(frames) - n_pre < 8 or not self.on_sweep:
             return
         z = None if any(v is None for v in zs) else np.array(zs)
-        cap = SweepCapture(list(frames), z, pose, self.objective.name, shape, simulated, _completeness(tiles))
+        idx_arr = np.array(indices, dtype=np.float64) if indices is not None and len(indices) == len(frames) else None
+        cap = SweepCapture(
+            list(frames), z, pose, self.objective.name, shape, simulated, _completeness(tiles), frame_indices=idx_arr
+        )
         threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
 
     def log(self, text: str, seq: int = 0):
@@ -216,14 +227,25 @@ class LiveEngine:
     def _process(self, bgr, truth, fps_in, fps_proc, seq):
         raw = bgr_to_luma(bgr, self.linearize)
         if self._calib_req is not None:
-            kind, need, acc = self._calib_req
-            acc.append(raw)
-            if len(acc) >= need:
-                cal = self.store.get(self.objective)
-                (cal.darks if kind == "dark" else cal.flats)[radiometric_key(raw.shape, self.exposure)] = np.mean(acc, 0)
-                self.store.save()
+            kind, need, acc, req_obj, req_gen = self._calib_req
+            if req_obj != self.objective.name or req_gen != self._source_gen:
                 self._calib_req = None
+            elif acc and raw.shape != acc[0].shape:
+                self.log(f"{kind} calibration cancelled: frame size changed", seq)
+                self._calib_req = None
+            else:
+                acc.append(raw)
+                if len(acc) >= need:
+                    cal = self.store.get(req_obj)
+                    (cal.darks if kind == "dark" else cal.flats)[radiometric_key(raw.shape, self.exposure)] = np.mean(
+                        acc, 0
+                    )
+                    self.store.save()
+                    self._calib_req = None
         corr = self._corrector_for(raw.shape)(raw)
+        cal_obj = self.store.get(self.objective)
+        if truth is None and cal_obj.lens_model is not None:
+            corr = cal_obj.lens_model.undistort(corr)
         sat = float(np.mean(raw >= 250))
         full_u8 = np.clip(corr + 0.5, 0, 255).astype(np.uint8)
         h, w = raw.shape
@@ -249,17 +271,30 @@ class LiveEngine:
         for ev in events:
             if ev.kind == "sweep_started":
                 if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it
-                    self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll = self._held[:5]
+                    (
+                        self._sweep,
+                        self._sweep_z,
+                        self._sweep_tiles,
+                        self._sweep_pose,
+                        self._n_preroll,
+                        _hseq,
+                        _hshape,
+                        _hsim,
+                        self._sweep_indices,
+                    ) = self._held
                     self._held = None
+                    self._zcount = (int(self._sweep_indices[-1]) + 1) if self._sweep_indices else 0
                     self.log("sweep resumed (merged with the previous incomplete part)", seq)
                 else:
                     self._sweep = [f for f, _, _ in self._preroll]
                     self._sweep_z = [z for _, z, _ in self._preroll]
                     self._sweep_tiles = [t for _, _, t in self._preroll]  # the blurry start is part of the sweep
                     self._n_preroll = len(self._sweep)
+                    self._sweep_indices = [float(k) for k in range(-self._n_preroll, 0)]
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
                     self._cov = None
-                self._stride, self._zcount = 1, 0
+                    self._zcount = 0
+                self._stride = 1
             elif ev.kind == "sweep_ended":
                 comp = _completeness(self._sweep_tiles)
                 self.log(f"sweep ended: {len(self._sweep)} frames ({self._n_preroll} pre-roll), completeness "
@@ -267,12 +302,29 @@ class LiveEngine:
                 if ev.detail.get("aborted"):
                     self._held = None
                 elif comp < 0.5:  # incomplete: hold it for a few seconds in case focusing resumes
-                    self._held = (self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
-                                  seq + HOLD_FRAMES, (h, w), truth is not None)
+                    self._held = (
+                        self._sweep,
+                        self._sweep_z,
+                        self._sweep_tiles,
+                        self._sweep_pose,
+                        self._n_preroll,
+                        seq + HOLD_FRAMES,
+                        (h, w),
+                        truth is not None,
+                        list(self._sweep_indices),
+                    )
                 else:
-                    self._emit(self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_pose, self._n_preroll,
-                               (h, w), truth is not None)
-                self._sweep, self._sweep_z = [], []
+                    self._emit(
+                        self._sweep,
+                        self._sweep_z,
+                        self._sweep_tiles,
+                        self._sweep_pose,
+                        self._n_preroll,
+                        (h, w),
+                        truth is not None,
+                        self._sweep_indices,
+                    )
+                self._sweep, self._sweep_z, self._sweep_indices = [], [], []
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
@@ -281,19 +333,24 @@ class LiveEngine:
         if self._held is not None and (seq > self._held[5] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
-                self._emit(*held[:5], held[6], held[7])
+                self._emit(*held[:5], held[6], held[7], held[8])
 
         in_focus = None
         if state == State.Z_SWEEP:
             if self._zcount % self._stride == 0:
                 if len(self._sweep) >= MAX_SWEEP_FRAMES:  # a long, slow sweep: thin it 2:1 instead of cutting it
-                    self._sweep, self._sweep_z, self._sweep_tiles = (self._sweep[::2], self._sweep_z[::2],
-                                                                     self._sweep_tiles[::2])
+                    self._sweep, self._sweep_z, self._sweep_tiles, self._sweep_indices = (
+                        self._sweep[::2],
+                        self._sweep_z[::2],
+                        self._sweep_tiles[::2],
+                        self._sweep_indices[::2],
+                    )
                     self._n_preroll = (self._n_preroll + 1) // 2
                     self._stride *= 2
                 self._sweep.append(full_u8)
                 self._sweep_z.append(z_true)
                 self._sweep_tiles.append(tiles)
+                self._sweep_indices.append(float(self._zcount))
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov

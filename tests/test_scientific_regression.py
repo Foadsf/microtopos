@@ -44,35 +44,47 @@ def _synthetic_texture(h: int = 256, w: int = 256, seed: int = 42) -> np.ndarray
 
 
 def test_revisit_sharpness_not_blurred():
-    """Scientific regression: revisiting a location must retain sharpness and NOT cause blur.
+    """Scientific regression: real pan-out + defocused return genuinely triggers revisit guard without blur."""
+    from microtopos.calibration import bgr_to_luma
+    from microtopos.optics import OBJECTIVES
+    from microtopos.simulator import SpecimenSimulator
 
-    In classic 'average' fusion, averaging two frames with a small subpixel shift causes
-    noticeable blur (Laplacian variance drops). In 'sharpest' fusion mode, the sharpest
-    frame is preserved and the high-frequency sharpness is retained.
-    """
-    img0 = _synthetic_texture(256, 256, seed=123)
-    # Simulate a return pass with a 0.4 pixel subpixel misalignment and slight defocus
-    shift_mat = np.float32([[1, 0, 0.4], [0, 1, 0.3]])
-    img_shifted = cv2.warpAffine(img0, shift_mat, (256, 256), borderMode=cv2.BORDER_REFLECT)
-    img_defocused = cv2.GaussianBlur(img_shifted, (0, 0), 1.2)
+    obj = OBJECTIVES["40x / 0.85"]
+    sim = SpecimenSimulator(12, obj, 240, 180)
+    _, hz = sim.truth_patch()
+    z_best = float(np.median(hz))
+    sim.focus_z_um = z_best
+    x0, y0 = sim.stage_x_um, sim.stage_y_um
 
-    s0 = sharpness_score(img0)
-    s_defocused = sharpness_score(img_defocused)
-    assert s_defocused < s0, "Defocused frame must have lower sharpness score than original"
+    def grab(dx_um: float, dy_um: float, z: float) -> np.ndarray:
+        sim.stage_x_um, sim.stage_y_um, sim.focus_z_um = x0 + dx_um, y0 + dy_um, z
+        bgr, _ = sim.render(tremor=False, noise=False, breathing=False)
+        return bgr_to_luma(bgr)
 
-    # Mosaic in sharpest mode
+    f0 = grab(0.0, 0.0, z_best)
+    f_pan = grab(sim.um_per_px * 60.0, 0.0, z_best)  # > 0.2 * 180 = 36 px -> adds keyframe 1
+    # Return to origin with steady small subpixel offset (1.2 px) and mild defocus
+    # so recent-frame sharp_enough gate passes (~0.82 * s0 >= 0.80 * s0) and revisit guard fires.
+    f_return_blurry = grab(sim.um_per_px * 1.2, sim.um_per_px * 0.8, z_best + 0.15)
+    s0 = sharpness_score(f0)
+    assert 0.80 * s0 <= sharpness_score(f_return_blurry) < 0.95 * s0
+
     m_sharp = Mosaic(fusion="sharpest")
-    m_sharp.track(img0)
-    assert len(m_sharp.keyframes) == 1
-    # Now simulate moving slightly and returning with the defocused frame
-    m_sharp.track(img_defocused)
+    for fr in (f0, f_pan, f_pan, f_return_blurry, f_return_blurry):
+        m_sharp.track(fr)
 
-    # In sharpest mode, keyframe image should remain the crisp original img0
-    kf_sharp = m_sharp.keyframes[0].image
-    recovered_sharpness = sharpness_score(kf_sharp)
-    assert recovered_sharpness >= 0.95 * s0, (
-        f"Sharpest mode must preserve keyframe sharpness (expected >= {0.95 * s0:.1f}, got {recovered_sharpness:.1f})"
-    )
+    assert len(m_sharp.revisit_diagnostics) >= 1
+    assert m_sharp.revisit_diagnostics[-1]["decision"] == "retained_sharp"
+    assert sharpness_score(m_sharp.keyframes[0].image) >= 0.95 * s0
+
+    # Now revisit with an initially defocused keyframe 0 and a sharper return: must upgrade subpixel-aligned!
+    m_up = Mosaic(fusion="sharpest")
+    f0_soft = grab(0.0, 0.0, z_best + 0.6)
+    f_ret_crisp = grab(sim.um_per_px * 0.6, -sim.um_per_px * 0.4, z_best)
+    for fr in (f0_soft, f_pan, f_pan, f_ret_crisp, f_ret_crisp):
+        m_up.track(fr)
+    assert any(d["decision"] == "upgraded_to_sharper" for d in m_up.revisit_diagnostics)
+    assert sharpness_score(m_up.keyframes[0].image) > 1.15 * sharpness_score(f0_soft)
 
 
 def test_subpixel_registration_accuracy():
@@ -290,4 +302,116 @@ def test_mosaic_residual_map():
     m.track(f2)
     res_map, origin = m.residual_map()
     assert res_map.ndim == 2
+
+
+def test_p1_regressions_units_registration_calibration_and_replay(tmp_path: Path):
+    """Adversarial regression tests for F02-F10 fixes."""
+    import json
+    import warnings
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from microtopos import export, focus, metrology, registration, sff, superres, zstack
+    from microtopos.calibration import CalibrationStore
+    from microtopos.camera import FrameSource, ReplaySource
+    from microtopos.gui import main_window as gui
+    from microtopos.live import LiveEngine
+    from microtopos.optics import OBJECTIVES
+
+    # F04: height_mosaic never blends incompatible units ('um' vs 'frames')
+    e = np.full((24, 24), 100.0, np.float32)
+    m = Mosaic()
+    m.add_height_patch(0, 0, e, e * 0 + 10.0, "um")
+    m.add_height_patch(0, 0, e, e * 0 + 30.0, "frames")
+    hm_default = m.height_mosaic()
+    assert hm_default is not None and float(hm_default[0][12, 12]) == 10.0
+    hm_frames = m.height_mosaic(z_unit="frames")
+    assert hm_frames is not None and float(hm_frames[0][12, 12]) == 30.0
+
+    # F05: flat/unobservable frames produce zero shift in registration and dwell_superres
+    flat = np.full((64, 96), 117.0, np.float32)
+    reg_flat = registration.register_pair(flat, flat, factor=1)
+    assert not reg_flat.ok and reg_flat.ecc == 0.0
+    assert np.allclose(reg_flat.warp[:, 2], 0.0)
+    sr_flat = superres.dwell_superres([flat, flat], 0.6, deconvolve=False)
+    assert np.allclose(sr_flat["shifts"][1], (0.0, 0.0))
+
+    # F10: Vollath F4/F5 no circular border wrap, form order 0 leaves plane untouched, blank spatial = {}
+    step_img = np.repeat(np.r_[np.full(24, 50.0, np.float32), np.full(72, 200.0, np.float32)][None, :], 48, axis=0)
+    ctrl_img = step_img.copy()
+    ctrl_img[:, :6] = ctrl_img[:, -1:]
+    for meas in ("Vollath F4", "Vollath F5"):
+        assert abs(float(focus.focus_map(step_img, meas, 9)[24, -1])) < 1e-4
+        assert abs(float(focus.focus_map(ctrl_img, meas, 9)[24, -1])) < 1e-4
+
+    plane = np.broadcast_to(np.linspace(-2.0, 2.0, 64), (48, 64)).astype(np.float32)
+    assert float(np.std(metrology.remove_form(plane, order=0))) > 1.0
+    assert float(np.std(metrology.remove_form(plane, order=1))) < 1e-5
+    with warnings.catch_warnings(record=True) as wrec:
+        warnings.simplefilter("always")
+        assert metrology.spatial_parameters(np.zeros((64, 64), np.float32), 1.0) == {}
+        assert math.isnan(sff.theoretical_fwhm_um(OBJECTIVES["40x / 0.85"], 0.25, focus.focus_map, np.zeros((96, 96), np.float32)))
+        assert not [w for w in wrec if issubclass(w.category, RuntimeWarning)]
+
+    # F09: strict JSON & session roundtrip preserves edf_proc, sl_surface, warnings
+    res = {"edf": e, "height": e * 0.1, "confidence": e / 100.0, "edf_proc": e * 0.5,
+           "sl_surface": e * 0.2, "nonfinite": np.float32("nan"), "warnings": ["w1"]}
+    files = export.write_report_bundle(tmp_path / "rpt", res, {})
+    json.loads(files[0].read_text(), parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    export.save_session(tmp_path / "sess.npz", res, {})
+    loaded, _ = export.load_session(tmp_path / "sess.npz")
+    assert {"edf", "edf_proc", "height", "confidence", "sl_surface", "warnings"} <= set(loaded)
+
+    # F03: calibration writes to the result's objective, not a newly clicked UI objective
+    store = CalibrationStore(None)
+    win_stub = SimpleNamespace(
+        result={"objective": "40x / 0.85", "z_status": "NOMINAL", "frames_used": 49, "frame_span": 48.0},
+        obj=OBJECTIVES["10x / 0.25"],
+        store=store,
+        _refresh_checklist=lambda: None,
+        notify=lambda *_: None,
+    )
+    with patch.object(gui, "QInputDialog", SimpleNamespace(getDouble=lambda *_: (6.0, True))):
+        gui.MainWindow._calibrate_z_travel(win_stub)
+    assert store.get("40x / 0.85").z_um_per_frame == 0.125
+    assert store.get("10x / 0.25").z_um_per_frame is None
+
+    # F08 & F11-seq: set_source resets _last_seq and cancels pending _calib_req
+    class IdleSource(FrameSource):
+        pass
+
+    eng = LiveEngine(CalibrationStore(None), OBJECTIVES["40x / 0.85"])
+    eng.request_calibration("dark", n=2)
+    eng._process(np.full((24, 24, 3), 60, np.uint8), None, 25, 25, 1)
+    eng.set_source(IdleSource())
+    assert eng._last_seq == -1
+    assert eng._calib_req is None
+    eng._process(np.full((24, 30, 3), 100, np.uint8), None, 25, 25, 1)
+    assert not eng.store.get("40x / 0.85").darks
+
+    # F06: ReplaySource skips corrupt JPEG cleanly without returning None
+    rdir = tmp_path / "rep"
+    rdir.mkdir()
+    ok, jpg = cv2.imencode(".jpg", np.full((24, 24, 3), 90, np.uint8))
+    assert ok
+    (rdir / "000000.jpg").write_bytes(jpg.tobytes())
+    (rdir / "000001.jpg").write_bytes(b"corrupt")
+    (rdir / "frames.json").write_text(json.dumps({"timestamps": [0.0, 0.1]}))
+    rep = ReplaySource(str(rdir))
+    decoded = list(rep.frames())
+    assert len(decoded) == 1 and decoded[0] is not None
+
+    # F02: frame_indices preserves spacing across 2:1 thinned sweeps
+    obj = OBJECTIVES["40x / 0.85"]
+    rng = np.random.default_rng(7)
+    tex = 128 + 30 * cv2.GaussianBlur(rng.normal(0, 1, (80, 128)).astype(np.float32), (0, 0), 0.7)
+    _, xx = np.indices((80, 128))
+    zs = np.linspace(-2.5, 2.5, 41)
+    full_fr = [np.where(xx < 64, cv2.GaussianBlur(tex, (0, 0), obj.defocus_sigma_um(-0.8 - z) / 0.25),
+                        cv2.GaussianBlur(tex, (0, 0), obj.defocus_sigma_um(0.8 - z) / 0.25)) for z in zs]
+    thinned = full_fr[::2]
+    idx_even = np.arange(0, len(full_fr), 2, dtype=np.float64)
+    out = zstack.reconstruct(thinned, None, obj, 0.25, "µm", float(zs[1] - zs[0]), frame_indices=idx_even)
+    step_delta = float(np.nanmedian(out["height"][16:-16, 76:112]) - np.nanmedian(out["height"][16:-16, 16:52]))
+    assert abs(step_delta - 1.6) < 0.20
 

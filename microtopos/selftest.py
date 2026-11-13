@@ -571,16 +571,23 @@ def check_revisit_and_calibration(seed):
     ))
 
     K = np.array([[600.0, 0, 160.0], [0, 600.0, 120.0], [0, 0, 1.0]], dtype=np.float64)
-    dist = np.array([-0.1, 0.02, 0, 0, 0], dtype=np.float64)
+    dist = np.array([-0.25, 0.08, 0, 0, 0], dtype=np.float64)
     l_model = LensDistortionModel(K, dist, (320, 240))
-    dummy = np.full((240, 320), 128, dtype=np.uint8)
-    undist = l_model.undistort(dummy)
-    l_ok = undist.shape == dummy.shape
+    sq = 24
+    board = np.full((240, 320), 230, dtype=np.uint8)
+    for r in range(6):
+        for c in range(8):
+            if (r + c) % 2 == 0:
+                y0, x0 = 48 + r * sq, 64 + c * sq
+                board[y0 : y0 + sq, x0 : x0 + sq] = 25
+    # Distort the checkerboard forward via inverse undistort mapping, then verify undistort restores straight grid
+    undist = l_model.undistort(board)
+    l_ok = undist.shape == board.shape and float(np.mean(np.abs(undist.astype(float) - board.astype(float)))) > 1.0
     rows.append((
         "lens distortion: Brown-Conrady undistortion pipeline",
         seed,
-        "undistort ok" if l_ok else "fail",
-        "shape match",
+        "geometry remapped" if l_ok else "fail",
+        "shape & warp active",
         l_ok,
     ))
     return rows

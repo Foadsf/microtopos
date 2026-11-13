@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -42,6 +43,7 @@ class ObjectiveCalibration:
     # dark/flat keyed by "WxH@exposure"
     darks: dict[str, np.ndarray] = field(default_factory=dict)
     flats: dict[str, np.ndarray] = field(default_factory=dict)
+    lens_model: LensDistortionModel | None = None
 
     @property
     def lateral_status(self) -> CalStatus:
@@ -81,22 +83,27 @@ class CalibrationStore:
 
     @property
     def _json(self) -> Path:
+        assert self.directory is not None
         return self.directory / "calibration.json"
 
     @property
     def _npz(self) -> Path:
+        assert self.directory is not None
         return self.directory / "radiometric.npz"
 
     def save(self) -> None:
         if self.directory is None:
             return
-        meta, arrays = {}, {}
+        meta: dict[str, Any] = {}
+        arrays: dict[str, Any] = {}
         for name, c in self.cals.items():
             meta[name] = {
                 k: getattr(c, k)
                 for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "z_um_per_frame",
                           "z_source", "z_date", "z_uncertainty_pct")
             }
+            if c.lens_model is not None:
+                meta[name]["lens_model"] = c.lens_model.to_dict()
             for kind, d in (("dark", c.darks), ("flat", c.flats)):
                 for key, arr in d.items():
                     arrays[f"{kind}|{name}|{key}"] = arr.astype(np.float32)
@@ -115,7 +122,9 @@ class CalibrationStore:
             for name, d in meta.items():
                 if name in self.cals:
                     for k, v in d.items():
-                        if hasattr(self.cals[name], k):
+                        if k == "lens_model" and isinstance(v, dict):
+                            self.cals[name].lens_model = LensDistortionModel.from_dict(v)
+                        elif hasattr(self.cals[name], k):
                             setattr(self.cals[name], k, v)
         if self._npz.exists():
             with np.load(self._npz) as z:
@@ -165,7 +174,7 @@ def bgr_to_luma(bgr: np.ndarray, linearize: bool = False) -> np.ndarray:
         return 255.0 * (y / 255.0) ** 2.2 if linearize else y
     if linearize:
         lin = 255.0 * (bgr.astype(np.float32) / 255.0) ** 2.2
-        return (0.0722 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.2126 * lin[..., 2]).astype(np.float32)
+        return np.asarray(0.0722 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.2126 * lin[..., 2], dtype=np.float32)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
 
@@ -188,7 +197,7 @@ class LensDistortionModel:
             self._map1, self._map2 = cv2.initUndistortRectifyMap(
                 self.camera_matrix, self.dist_coeffs, None, new_cam_mat, (w, h), cv2.CV_16SC2
             )
-        return cv2.remap(img, self._map1, self._map2, cv2.INTER_LINEAR)
+        return np.asarray(cv2.remap(img, self._map1, self._map2, cv2.INTER_LINEAR))
 
     def to_dict(self) -> dict:
         return {
@@ -221,7 +230,7 @@ def calibrate_lens_from_checkerboard(
 
     objpoints = []
     imgpoints = []
-    img_size = None
+    img_size: tuple[int, int] | None = None
 
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
@@ -238,7 +247,13 @@ def calibrate_lens_from_checkerboard(
     if not objpoints or img_size is None:
         raise ValueError(f"No checkerboard patterns found in the provided {len(images)} images.")
 
-    rms, mtx, dist, _rvecs, _tvecs = cv2.calibrateCamera(objpoints, imgpoints, img_size, None, None)
+    rms, mtx, dist, _rvecs, _tvecs = cv2.calibrateCamera(
+        objpoints,
+        imgpoints,
+        img_size,
+        np.eye(3, dtype=np.float64),
+        np.zeros((1, 5), dtype=np.float64),
+    )
     model = LensDistortionModel(camera_matrix=mtx, dist_coeffs=dist, image_size=img_size)
     return model, float(rms)
 

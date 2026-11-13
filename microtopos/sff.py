@@ -289,7 +289,12 @@ def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.nda
         s = float(np.sqrt(max(objective.defocus_sigma_um(d) ** 2 - objective.airy_sigma_um**2, 0))) / um_per_px
         img = cv2.GaussianBlur(tex, (0, 0), s) if s > 0.05 else tex
         resp.append(float(np.mean(measure_fn(img)[20:-20, 20:-20])))
-    lr = np.log(np.array(resp))
+    r_arr = np.asarray(resp, dtype=np.float64)
+    r_max = float(np.max(r_arr))
+    r_min = float(np.min(r_arr))
+    if not np.isfinite(r_max) or r_max <= 1e-12 or r_max <= r_min * (1.0 + 1e-4):
+        return float("nan")
+    lr = np.log(np.maximum(r_arr, 1e-12))
     half = lr.max() - np.log(2)
     above = dz[lr >= half]
     return float(above.max() - above.min())

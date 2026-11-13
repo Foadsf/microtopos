@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import platform
 import struct
 from pathlib import Path
@@ -185,10 +186,10 @@ def write_float32_tiff(filepath: Path | str, height_map: np.ndarray, pixel_um: f
 
 def _jsonable(v):
     if isinstance(v, (np.floating, np.integer)):
-        return v.item()
+        v = v.item()
     if isinstance(v, np.ndarray):
         return None
-    if isinstance(v, float) and not np.isfinite(v):
+    if isinstance(v, float) and not math.isfinite(v):
         return None
     if isinstance(v, dict):
         return {k: _jsonable(x) for k, x in v.items() if not isinstance(x, np.ndarray)}
@@ -204,28 +205,34 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
     meta["software"] = {"python": platform.python_version(), **versions}
     files = [out / "report.json", out / "summary.csv", out / "edf.png"]
-    files[0].write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    files[0].write_text(json.dumps(meta, indent=2, allow_nan=False), encoding="utf-8")
     with open(files[1], "w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
         wr.writerow(["parameter", "value"])
         for k, v in meta.items():
             if not isinstance(v, (dict, list)):
                 wr.writerow([k, v])
-    cv2.imwrite(str(files[2]), np.clip(result["edf"], 0, 255).astype(np.uint8))
+    if not cv2.imwrite(str(files[2]), np.clip(result["edf"], 0, 255).astype(np.uint8)):
+        raise OSError(f"Failed to write image file: {files[2]}")
     if "confidence" in result:
         p = out / "confidence.png"
-        cv2.imwrite(str(p), np.clip(result["confidence"] * 255, 0, 255).astype(np.uint8))
+        if not cv2.imwrite(str(p), np.clip(result["confidence"] * 255, 0, 255).astype(np.uint8)):
+            raise OSError(f"Failed to write image file: {p}")
         files.append(p)
     return files
 
 
-SESSION_ARRAYS = ("edf", "height", "confidence", "height_raw", "mosaic_image", "height_mosaic")
+SESSION_ARRAYS = ("edf", "edf_proc", "height", "confidence", "height_raw", "sl_surface", "mosaic_image", "height_mosaic")
 
 
 def save_session(path: Path | str, result: dict, settings: dict) -> None:
     arrays = {k: result[k] for k in SESSION_ARRAYS if isinstance(result.get(k), np.ndarray)}
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
-    np.savez_compressed(path, __meta__=np.array(json.dumps({"result": meta, "settings": settings})), **arrays)
+    np.savez_compressed(
+        path,
+        __meta__=np.array(json.dumps({"result": meta, "settings": settings}, allow_nan=False)),
+        **arrays,
+    )
 
 
 def load_session(path: Path | str) -> tuple[dict, dict]:

@@ -25,12 +25,16 @@ MIN_VALID_FRACTION = 0.30
 
 
 def remove_form(z: np.ndarray, order: int = 1) -> np.ndarray:
+    if order < 0:
+        return z.copy()
     valid = np.isfinite(z)
     if valid.sum() < 16:
         return z.copy()
     h, w = z.shape
     yy, xx = np.mgrid[-1:1:complex(0, h), -1:1:complex(0, w)]
-    terms = [np.ones_like(xx), xx, yy]
+    terms = [np.ones_like(xx)]
+    if order >= 1:
+        terms += [xx, yy]
     if order >= 2:
         terms += [xx * xx, xx * yy, yy * yy]
     if order >= 3:
@@ -116,10 +120,11 @@ def functional_parameters(s: np.ndarray) -> dict:
     slope = (z2 - z1) / (mr[i + w] - m1)
     z_at0 = z1 - slope * m1
     z_at100 = z1 + slope * (100.0 - m1)
-    smr1 = float(np.mean(z > z_at0) * 100.0)
-    smr2 = float(np.mean(z > z_at100) * 100.0)
-    a1 = (z[z > z_at0] - z_at0).sum() / n * 100.0  # peak-region area (height x %)
-    a2 = (z_at100 - z[z < z_at100]).sum() / n * 100.0
+    tol = 1e-9 * max(1.0, float(z[0] - z[-1]))
+    smr1 = float(np.mean(z > z_at0 + tol) * 100.0)
+    smr2 = float(np.mean(z >= z_at100 - tol) * 100.0)
+    a1 = (z[z > z_at0 + tol] - z_at0).sum() / n * 100.0  # peak-region area (height x %)
+    a2 = (z_at100 - z[z < z_at100 - tol]).sum() / n * 100.0
     spk = 2 * a1 / smr1 if smr1 > 0 else 0.0
     svk = 2 * a2 / (100.0 - smr2) if smr2 < 100 else 0.0
     return {"Sk": float(z_at0 - z_at100), "Spk": float(spk), "Svk": float(svk), "Smr1_pct": smr1, "Smr2_pct": smr2}
@@ -130,33 +135,42 @@ def spatial_parameters(s: np.ndarray, um_per_px: float, threshold: float = 0.2) 
     valid = np.isfinite(s)
     if valid.mean() < MIN_VALID_FRACTION:
         return {}
-    z = np.where(valid, s - np.nanmean(s), 0.0)
+    s_valid = s[valid].astype(np.float64)
+    if float(np.std(s_valid)) <= 1e-12:
+        return {}
+    z = np.where(valid, s - float(np.mean(s_valid)), 0.0)
     h, w = z.shape
     shape = (2 * h, 2 * w)  # zero padding: linear, not circular, autocorrelation
     acf = np.fft.fftshift(np.real(np.fft.ifft2(np.abs(np.fft.fft2(z, s=shape)) ** 2)))
     norm = np.fft.fftshift(np.real(np.fft.ifft2(np.abs(np.fft.fft2(valid.astype(float), s=shape)) ** 2)))
-    acf = acf / np.maximum(norm, 1.0)
     cy, cx = h, w
-    acf = acf / acf[cy, cx]
+    acf0 = acf[cy, cx] / max(norm[cy, cx], 1.0)
+    if not np.isfinite(acf0) or acf0 <= 1e-18:
+        return {}
+    min_pairs = max(16.0, 0.02 * float(valid.sum()))
+    acf = np.where(norm >= min_pairs, acf / np.maximum(norm, 1.0), np.nan) / acf0
     r = np.arange(1, min(h, w) // 2)
     lengths = []
     for th in np.deg2rad(np.arange(0, 180, 2)):
         ys = np.clip(np.round(cy + r * np.sin(th)).astype(int), 0, 2 * h - 1)
         xs = np.clip(np.round(cx + r * np.cos(th)).astype(int), 0, 2 * w - 1)
-        below = np.nonzero(acf[ys, xs] < threshold)[0]
+        vals = acf[ys, xs]
+        below = np.nonzero(np.isfinite(vals) & (vals < threshold))[0]
         lengths.append(r[below[0]] if below.size else np.inf)
-    lengths = np.array(lengths, float)
-    out = {"Sal_um": float(lengths.min() * um_per_px)} if np.isfinite(lengths.min()) else {}
-    if np.all(np.isfinite(lengths)):
-        out["Str"] = float(lengths.min() / lengths.max())
+    lengths_arr = np.array(lengths, float)
+    out = {"Sal_um": float(lengths_arr.min() * um_per_px)} if np.isfinite(lengths_arr.min()) else {}
+    if np.all(np.isfinite(lengths_arr)) and lengths_arr.max() > 0:
+        out["Str"] = float(lengths_arr.min() / lengths_arr.max())
     # Std: the lay runs perpendicular to the direction of maximum spectral energy
     P = np.fft.fftshift(np.abs(np.fft.fft2(z * np.outer(np.hanning(h), np.hanning(w)))) ** 2)
     fy, fx = np.mgrid[-(h // 2):h - h // 2, -(w // 2):w - w // 2]
     ang = (np.degrees(np.arctan2(fy / h, fx / w)) + 180.0) % 180.0
     rad = np.hypot(fy / h, fx / w)
     band = (rad > 2.0 / min(h, w)) & (rad < 0.25)
-    hist = np.bincount(np.minimum((ang[band] // 2).astype(int), 89), P[band], minlength=90)
-    out["Std_deg"] = float((np.argmax(hist) * 2 + 1 + 90) % 180)
+    if np.any(band) and float(P[band].sum()) > 1e-18:
+        hist = np.bincount(np.minimum((ang[band] // 2).astype(int), 89), P[band], minlength=90)
+        if float(hist.sum()) > 1e-18:
+            out["Std_deg"] = float((np.argmax(hist) * 2 + 1 + 90) % 180)
     return out
 
 

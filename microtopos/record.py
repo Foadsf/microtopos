@@ -34,7 +34,8 @@ def main():
     src = CameraSource(cams[0])
     controls = src.set_manual_exposure(None if a.exposure == 0 else a.exposure)
     cap = src.open()
-    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # deliver the MJPEG bytes undecoded
+    raw_ok = bool(cap.set(cv2.CAP_PROP_CONVERT_RGB, 0))  # deliver the MJPEG bytes undecoded when supported
+    warned_decoded = False
     out = Path(a.outdir)
     out.mkdir(parents=True, exist_ok=True)
     stamps = []
@@ -44,7 +45,22 @@ def main():
         ok, buf = cap.read()
         if not ok or buf is None:
             continue
-        (out / f"{len(stamps):06d}.jpg").write_bytes(buf.tobytes())
+        if buf.ndim == 3 or (buf.ndim == 2 and buf.shape[0] > 1 and buf.shape[1] > 1):
+            if not warned_decoded:
+                print("warning: camera backend returned decoded frames; encoding JPEG in software", file=sys.stderr)
+                warned_decoded = True
+            ok_enc, enc = cv2.imencode(".jpg", buf)
+            if not ok_enc:
+                continue
+            jpg_bytes = enc.tobytes()
+        else:
+            jpg_bytes = buf.tobytes()
+            if len(jpg_bytes) < 2 or jpg_bytes[:2] != b"\xff\xd8":
+                if not raw_ok or not warned_decoded:
+                    print("warning: skipping non-JPEG raw frame from backend", file=sys.stderr)
+                    warned_decoded = True
+                continue
+        (out / f"{len(stamps):06d}.jpg").write_bytes(jpg_bytes)
         stamps.append(round(t, 4))
         if t - last_print >= 10:
             print(f"{t:5.0f} s  {len(stamps)} frames", flush=True)

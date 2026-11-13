@@ -366,15 +366,32 @@ class ReplaySource(FrameSource):
 
         self.folder = Path(folder)
         self.meta = json.loads((self.folder / "frames.json").read_text())
-        self.files = sorted(self.folder.glob("*.jpg"))
-        self.stamps = self.meta["timestamps"][: len(self.files)]
+        all_files = sorted(self.folder.glob("*.jpg"))
+        all_stamps = self.meta.get("timestamps", [])
+        n_items = min(len(all_files), len(all_stamps))
+        if len(all_files) != len(all_stamps):
+            logger.warning(
+                "Replay manifest timestamps (%d) differ from JPEG count (%d) in %s; truncating to %d",
+                len(all_stamps),
+                len(all_files),
+                self.folder,
+                n_items,
+            )
+        self.files = all_files[:n_items]
+        self.stamps = all_stamps[:n_items]
         self.speed, self.loop = speed, loop
         self.readback = {"replay": str(self.folder), "frames": len(self.files), **self.meta.get("readback", {})}
         self.done = False
 
     def frames(self):
         for f in self.files:
-            yield cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR)
+            raw = np.fromfile(f, np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size else None
+            if img is None:
+                logger.warning("Skipping corrupt or unreadable replay frame: %s", f)
+                self.error = f"Skipped corrupt frame {f.name}"
+                continue
+            yield img
 
     def _run(self):
         while self._running:
@@ -385,8 +402,15 @@ class ReplaySource(FrameSource):
                 wait = ts / self.speed - (time.perf_counter() - t0)
                 if wait > 0:
                     time.sleep(wait)
-                self._publish(cv2.imdecode(np.fromfile(f, np.uint8), cv2.IMREAD_COLOR))
-                self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
+                raw = np.fromfile(f, np.uint8)
+                img = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size else None
+                if img is None:
+                    logger.warning("Skipping corrupt or unreadable replay frame: %s", f)
+                    self.error = f"Skipped corrupt frame {f.name}"
+                    continue
+                self._publish(img)
+                if self.stamps:
+                    self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
             if not self.loop:
                 self.done = True
                 return

@@ -310,7 +310,7 @@ class MainWindow(QMainWindow):
     def _mosaic_bar(self):
         h = QHBoxLayout()
         self.cmb_mview = QComboBox()
-        self.cmb_mview.addItems(["Image", "Image + height overlay", "Height only"])
+        self.cmb_mview.addItems(["Image", "Image + height overlay", "Height only", "Registration residual (px)"])
         self.cmb_mview.setCurrentIndex(1)
         self.cmb_mview.setToolTip("Every height map stays pinned to its place in the mosaic; overlapping maps are "
                                   "levelled to each other (least squares) and blended")
@@ -1031,33 +1031,40 @@ class MainWindow(QMainWindow):
         if r is None or r.get("z_status") == CalStatus.SIMULATED.value:
             self.notify("Make a real focus sweep first (turn the knob between two marks).", "warning")
             return
+        target_name = r.get("objective") or self.obj.name
+        if target_name not in OBJECTIVES:
+            target_name = self.obj.name
+        span = max(1.0, float(r.get("frame_span") or max(1, r["frames_used"] - 1)))
         val, ok = QInputDialog.getDouble(self, "Z calibration from knob travel",
-                                         f"The last sweep used {r['frames_used']} frames.\n"
+                                         f"The last sweep ({target_name}) used {r['frames_used']} frames.\n"
                                          "Knob travel during that sweep (µm):", 10.0, 0.01, 1e4, 3)
         if ok:
-            c = self.store.get(self.obj)
-            c.z_um_per_frame = val / max(1, r["frames_used"] - 1)
-            c.z_source = f"knob travel {val:g} µm over {r['frames_used']} frames (even speed assumed)"
+            c = self.store.get(target_name)
+            c.z_um_per_frame = val / span
+            c.z_source = f"knob travel {val:g} µm over {span:g} frames (even speed assumed)"
             c.z_uncertainty_pct = None
             c.z_date = today()
             self.store.save()
             self._refresh_checklist()
-            self.notify(f"Z scale {c.z_um_per_frame:.4f} µm per frame.", "success")
+            self.notify(f"Z scale {c.z_um_per_frame:.4f} µm per frame saved for {target_name}.", "success")
 
     def _calibrate_z_ruler(self):
         r = self.result
         est = r.get("dof_ruler_um_per_frame") if r else None
-        if not est:
+        if not est or r is None:
             self.notify("Needs a hand sweep reconstructed in focus-frame units first.", "warning")
             return
-        c = self.store.get(self.obj)
+        target_name = r.get("objective") or self.obj.name
+        if target_name not in OBJECTIVES:
+            target_name = self.obj.name
+        c = self.store.get(target_name)
         c.z_um_per_frame = float(est)
         c.z_source = "DOF ruler (experimental, simulator error up to ±35%)"
         c.z_uncertainty_pct = 35.0
         c.z_date = today()
         self.store.save()
         self._refresh_checklist()
-        self.notify(f"Applied experimental Z scale {est:.4f} µm per frame.", "warning")
+        self.notify(f"Applied experimental Z scale {est:.4f} µm per frame for {target_name}.", "warning")
 
     def _clear_z(self):
         c = self.store.get(self.obj)
@@ -1191,6 +1198,12 @@ class MainWindow(QMainWindow):
                 self.p_mosaic.set_image(hm[0], um_prev, unit=self._z_unit_label())
                 self.p_mosaic.set_overlay(None)
                 self.mosaic_origin = hm[1]
+            elif mode == 3:
+                res_map, res_origin = self.engine.mosaic.residual_map()
+                self.p_mosaic.set_image(res_map, um_prev, unit="px")
+                self.p_mosaic.set_overlay(None)
+                self.mosaic_origin = res_origin
+                self.lbl_hlegend.setText("")
             else:
                 # display copy: at most 1600 px wide, 8-bit RGBA (empty = transparent); cheap to repaint
                 f = max(1.0, img.shape[1] / 1600.0)
@@ -1332,7 +1345,8 @@ class MainWindow(QMainWindow):
                               workers=max(1, (os.cpu_count() or 2) - 1))
         meta = {"z_status": zstat, "lateral_status": cal.lateral_status.value if not cap.simulated else "SIMULATED",
                 "pose": cap.pose, "capture_shape": cap.shape}
-        self.job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st)
+        self.job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st,
+                       frame_indices=cap.frame_indices)
         self.job.progress.connect(self._on_progress)
         self.job.done.connect(lambda r: self._on_result({**r, **meta}))
         self.job.failed.connect(self._on_failed)
@@ -1360,6 +1374,7 @@ class MainWindow(QMainWindow):
             self.repeat_armed = False
             a, b = self.result, r
             same = (a["objective"] == b["objective"] and a["height"].shape == b["height"].shape
+                    and a.get("z_unit") == b.get("z_unit")
                     and math.hypot(a["pose"][0] - b["pose"][0], a["pose"][1] - b["pose"][1]) <= 2.0)
             if same:
                 sig = metrology.repeatability(a["height"], b["height"])
@@ -1368,7 +1383,7 @@ class MainWindow(QMainWindow):
                     r["sigma_inst_lt_Sq_over_10"] = bool(sig < r["Sq"] / 10)
             else:
                 r["warnings"] = r.get("warnings", []) + ["Repeatability not computed: the stage moved, the objective "
-                                                         "changed or the size differs between the two sweeps."]
+                                                         "or Z unit changed, or the size differs between the two sweeps."]
         self.prev_result, self.result = self.result, r
         self._result_t = time.perf_counter()
         self._remember(r)
@@ -1519,11 +1534,16 @@ class MainWindow(QMainWindow):
         self.prof_plot.setLabel("bottom", "distance", units="µm")
         self.prof_plot.getAxis("bottom").enableAutoSIPrefix(False)
         v = prof[np.isfinite(prof)]
-        if v.size > 4 and mode != 2:
+        if mode == 2 and v.size > 0:
+            self.prof_label.setText(f"Confidence profile over {dist[-1]:.1f} µm:  min {v.min():.2f}  ·  "
+                                    f"median {np.median(v):.2f}  ·  max {v.max():.2f}")
+        elif v.size > 4:
             v = v - v.mean()
             self.prof_label.setText(f"Profile over {dist[-1]:.1f} µm:  Ra {np.mean(np.abs(v)):.4g} {r['z_unit']}  ·  "
                                     f"Rq {np.sqrt(np.mean(v * v)):.4g}  ·  Rz(max-min) {np.ptp(v):.4g}  "
                                     "(no profile filtering; for orientation only)")
+        else:
+            self.prof_label.setText("Drag the orange line over valid pixels to inspect the profile.")
 
     def _update_3d(self):
         r = self.result
@@ -1720,6 +1740,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("state", self.saveState())
         self.timer.stop()
+        for j in (self.job, getattr(self, "sr_job", None)):
+            if j is not None and j.isRunning():
+                j.cancel = True
+                j.wait(1500)
         if isinstance(self.source, CameraSource) and getattr(self.source, "recording", False):
             self.source.stop_recording()
         self.engine.stop()

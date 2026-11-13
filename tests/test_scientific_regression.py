@@ -138,11 +138,11 @@ def test_backlash_model():
     assert cx2 == 0.0 and cy2 == 0.0
 
     # Reversing direction (moving negative along X): backlash correction applied!
-    cx3, cy3 = bm.apply(-4.0, 0.0)
+    cx3, _cy3 = bm.apply(-4.0, 0.0)
     assert cx3 == -1.5, f"Expected backlash correction of -1.5 px on X reversal, got {cx3}"
 
     # Continuing in negative direction: no extra backlash
-    cx4, cy4 = bm.apply(-3.0, 0.0)
+    cx4, _cy4 = bm.apply(-3.0, 0.0)
     assert cx4 == 0.0
 
 
@@ -300,7 +300,7 @@ def test_mosaic_residual_map():
     f2 = _synthetic_texture(128, 128, seed=2)
     m.track(f1)
     m.track(f2)
-    res_map, origin = m.residual_map()
+    res_map, _origin = m.residual_map()
     assert res_map.ndim == 2
 
 
@@ -334,7 +334,8 @@ def test_p1_regressions_units_registration_calibration_and_replay(tmp_path: Path
     assert not reg_flat.ok and reg_flat.ecc == 0.0
     assert np.allclose(reg_flat.warp[:, 2], 0.0)
     sr_flat = superres.dwell_superres([flat, flat], 0.6, deconvolve=False)
-    assert np.allclose(sr_flat["shifts"][1], (0.0, 0.0))
+    assert sr_flat["frames_used"] == 1
+    assert sr_flat["shifts"] == [(0.0, 0.0)]
 
     # F10: Vollath F4/F5 no circular border wrap, form order 0 leaves plane untouched, blank spatial = {}
     step_img = np.repeat(np.r_[np.full(24, 50.0, np.float32), np.full(72, 200.0, np.float32)][None, :], 48, axis=0)
@@ -372,7 +373,7 @@ def test_p1_regressions_units_registration_calibration_and_replay(tmp_path: Path
         notify=lambda *_: None,
     )
     with patch.object(gui, "QInputDialog", SimpleNamespace(getDouble=lambda *_: (6.0, True))):
-        gui.MainWindow._calibrate_z_travel(win_stub)
+        gui.MainWindow._calibrate_z_travel(win_stub)  # type: ignore[arg-type]
     assert store.get("40x / 0.85").z_um_per_frame == 0.125
     assert store.get("10x / 0.25").z_um_per_frame is None
 
@@ -414,4 +415,174 @@ def test_p1_regressions_units_registration_calibration_and_replay(tmp_path: Path
     out = zstack.reconstruct(thinned, None, obj, 0.25, "µm", float(zs[1] - zs[0]), frame_indices=idx_even)
     step_delta = float(np.nanmedian(out["height"][16:-16, 76:112]) - np.nanmedian(out["height"][16:-16, 16:52]))
     assert abs(step_delta - 1.6) < 0.20
+
+
+def test_canonical_camera_sr_live_and_gui_guards(tmp_path: Path):
+    """Regression tests for F03 (source_gen), F05 (SR failed pair filter), F06 (worker_error), F07 (SOI), F09, F12."""
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from microtopos import export, superres
+    from microtopos.calibration import CalibrationStore
+    from microtopos.camera import CameraInfo, CameraSource, FrameSource
+    from microtopos.gui import main_window as gui
+    from microtopos.live import LiveEngine
+    from microtopos.optics import OBJECTIVES
+
+    # F07: CameraSource software-JPEG fallback produces valid SOI JPEGs when FOURCC MJPG decoded frames arrive
+    class _FakeCap:
+        def __init__(self, frames):
+            self._frames = list(frames)
+            self._idx = 0
+
+        def isOpened(self):
+            return True
+
+        def getBackendName(self):
+            return "FAKE"
+
+        def set(self, *_args):
+            return True
+
+        def get(self, *_args):
+            return 0.0
+
+        def read(self):
+            if self._idx >= len(self._frames):
+                return False, None
+            frm = self._frames[self._idx]
+            self._idx += 1
+            return True, frm
+
+        def release(self):
+            return None
+
+    bgr = np.full((32, 48, 3), 120, np.uint8)
+    cam = CameraSource(CameraInfo(index=0, name="FakeCam", path="0"), 48, 32, 25)
+    rec_dir = tmp_path / "cam_rec"
+    cam.start_recording(rec_dir)
+    cam._running = True
+
+    class _OnceCap(_FakeCap):
+        def read(self):
+            ok, frm = super().read()
+            if not ok:
+                cam._running = False
+            return ok, frm
+
+    with patch("microtopos.camera.cv2.VideoCapture", return_value=_OnceCap([bgr])):
+        cam._run()
+    n_saved = cam.stop_recording()
+    assert n_saved == 1
+    jpg_bytes = (rec_dir / "000000.jpg").read_bytes()
+    assert jpg_bytes.startswith(b"\xff\xd8")
+    meta = json.loads((rec_dir / "frames.json").read_text())
+    assert len(meta["timestamps"]) == 1
+
+    # F05: dwell_superres filters out failed registrations instead of drizzling them at zero shift
+    rng = np.random.default_rng(19)
+    textured = (128.0 + 40.0 * cv2.GaussianBlur(rng.normal(0, 1, (64, 64)).astype(np.float32), (0, 0), 1.0)).astype(
+        np.float32
+    )
+    blank = np.full((64, 64), 90.0, np.float32)
+    sr_out = superres.dwell_superres([textured, blank, textured], 0.8, deconvolve=False)
+    assert sr_out["frames_used"] == 2
+    assert len(sr_out["shifts"]) == 2
+
+    # F06: LiveEngine._loop surfaces worker_error on Snapshot without crashing the engine thread
+    class _BadSource(FrameSource):
+        def latest(self):
+            return (np.zeros((16, 16, 3), np.uint8), 0.1, 1, None)
+
+    eng = LiveEngine(CalibrationStore(None), OBJECTIVES["10x / 0.25"])
+    eng.source = _BadSource()
+    eng._running = True
+    with patch.object(eng, "_process", side_effect=ValueError("synthetic failure")):
+        def _stop_after_one(*_args):
+            eng._running = False
+
+        with patch.object(eng, "log", side_effect=_stop_after_one):
+            eng._loop()
+    assert eng.snapshot().worker_error == "ValueError: synthetic failure"
+
+    # F03: stale reconstruction from prior source_gen does not pollute the new mosaic
+    added: list[tuple] = []
+    eng2 = LiveEngine(CalibrationStore(None), OBJECTIVES["10x / 0.25"])
+    eng2.set_source(FrameSource())
+    gen0 = eng2._source_gen
+    eng2.set_source(FrameSource())  # advances _source_gen
+    eng2._snap = eng2._snap.__class__(preview=np.zeros((32, 48), np.float32))
+    stub_win = SimpleNamespace(
+        btn_cancel=SimpleNamespace(setEnabled=lambda *_: None),
+        repeat_armed=False,
+        result=None,
+        prev_result=None,
+        _result_t=0.0,
+        _remember=lambda *_: None,
+        last_ignored="x",
+        engine=SimpleNamespace(
+            snapshot=eng2.snapshot,
+            _source_gen=eng2._source_gen,
+            add_height_patch=lambda *a: added.append(a),
+        ),
+        last_mosaic_version=0,
+        _show_result=lambda: None,
+        notify=lambda *_: None,
+    )
+    e = np.full((32, 48), 100.0, np.float32)
+    gui.MainWindow._on_result(
+        stub_win,  # type: ignore[arg-type]
+        {
+            "edf": e,
+            "height": e * 0.1,
+            "confidence": e / 100.0,
+            "z_unit": "µm",
+            "pose": (0.0, 0.0),
+            "valid_fraction": 1.0,
+            "timings": {"total": 0.1},
+            "source_gen": gen0,
+        },
+    )
+    assert added == []
+
+    # F12: _run_sr rejects concurrent runs when sr_job is already running
+    notes: list[tuple[str, str]] = []
+    sr_stub = SimpleNamespace(
+        sr_job=SimpleNamespace(isRunning=lambda: True),
+        notify=lambda msg, kind="info": notes.append((msg, kind)),
+    )
+    gui.MainWindow._run_sr(sr_stub)  # type: ignore[arg-type]
+    assert notes and notes[0][1] == "warning"
+
+    # F09: _load_session preserves pre-existing warnings alongside newly computed metrology warnings
+    sess_path = tmp_path / "warn_sess.npz"
+    export.save_session(
+        sess_path,
+        {
+            "edf": e,
+            "height": e * 0.1,
+            "confidence": e / 100.0,
+            "um_per_px": 0.5,
+            "z_unit": "µm",
+            "objective": "10x / 0.25",
+            "warnings": ["original acquisition warning"],
+        },
+        {},
+    )
+    load_stub = SimpleNamespace(
+        settings=SimpleNamespace(value=lambda _k, d=None: str(tmp_path)),
+        result=None,
+        _remember=lambda *_: None,
+        loaded_mosaic=None,
+        last_mosaic_version=0,
+        _show_result=lambda: None,
+        tabs=SimpleNamespace(setCurrentIndex=lambda *_: None),
+        notify=lambda *_: None,
+    )
+    with patch.object(gui, "QFileDialog", SimpleNamespace(getOpenFileName=lambda *_a: (str(sess_path), ""))):
+        gui.MainWindow._load_session(load_stub)  # type: ignore[arg-type]
+    assert load_stub.result is not None
+    assert "original acquisition warning" in load_stub.result["warnings"]
+
 

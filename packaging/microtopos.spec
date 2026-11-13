@@ -39,4 +39,4 @@ if sys.platform == "darwin":
     app = BUNDLE(coll, name="microtopos.app", bundle_identifier="org.microtopos.MicroTopos")
 else:
     exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="microtopos", console=True,
-              hide_console="hide-early")
+              hide_console="hide-early" if sys.platform == "win32" else None)

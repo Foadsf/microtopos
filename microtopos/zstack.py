@@ -68,14 +68,14 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
 
     H, W = frames[0].shape
     f = max(1.0, W / float(st.proc_width))
-    pw, ph = int(round(W / f)), int(round(H / f))
+    pw, ph = round(W / f), round(H / f)
     f = W / pw
     um_proc = um_per_px * f
 
     # 1 ---- segmentation on small tiles -------------------------------------------------------------
     step("segment", 0.02, "Analysing sweep direction...")
     small_w = 320
-    sw, sh = small_w, int(round(H * small_w / W))
+    sw, sh = small_w, round(H * small_w / W)
     tiles = np.array([tile_scores(cv2.resize(fr, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32), grid=6)
                       for fr in frames])
     n_in = len(frames)
@@ -180,12 +180,12 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         **m,
         "edf": edf, "edf_proc": edf_proc.astype(np.float32), "height": height, "height_raw": fit.z_raw,
         "confidence": fit.confidence, "um_per_px_capture": um_per_px, "objective": objective.name,
-        "frames_in": n_in, "frames_used": int(len(idx)), "frame_span": frame_span, "reversal_at": reversal_at,
+        "frames_in": n_in, "frames_used": len(idx), "frame_span": frame_span, "reversal_at": reversal_at,
         "z_first": float(z[0]), "z_last": float(z[-1]), "fwhm_z": fit.fwhm_z_median,
         "dof_ruler_um_per_frame": dof_ruler, "ecc_mean": float(eccs.mean()) if eccs.size else None,
         "ecc_min": float(eccs.min()) if eccs.size else None, "registration_fallbacks": fails,
         "breathing_scale_range": float(max(scales) - min(scales)), "focus_window_px": window,
         "measure": st.measure, "timings": timings, "warnings": warnings,
         "frame_indices": idx.tolist(), "z_values": z.tolist(),
-        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds"),
     }

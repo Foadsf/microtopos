@@ -117,8 +117,8 @@ def main():
     if args.selftest is not None:
         try:
             from .selftest import main as selftest_main
-        except ImportError as exc:
-            logger.exception("Failed to import selftest module: %s", exc)
+        except ImportError:
+            logger.exception("Failed to import selftest module")
             sys.exit(1)
         selftest_main(args.selftest)
         sys.exit(0)
@@ -144,8 +144,8 @@ def main():
         )
         w.show()
         sys.exit(app.exec())
-    except Exception as exc:
-        logger.exception("Fatal error at application boundary: %s", exc)
+    except Exception:
+        logger.exception("Fatal error at application boundary")
         sys.exit(1)
 
 

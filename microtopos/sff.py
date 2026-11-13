@@ -3,6 +3,7 @@ all-in-focus fusion and the experimental depth-of-field ruler."""
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import cv2
@@ -18,7 +19,7 @@ def monotonic_segments_from_z(z: np.ndarray, min_len: int = 5) -> list[tuple[int
         if dz[i] == 0:
             dz[i] = dz[i - 1]
     cuts = [0] + [i + 1 for i in range(1, len(dz)) if dz[i] * dz[i - 1] < 0] + [len(z)]
-    segs = [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b - a >= min_len]
+    segs = [(a, b) for a, b in itertools.pairwise(cuts) if b - a >= min_len]
     return sorted(segs, key=lambda s: s[1] - s[0], reverse=True) or [(0, len(z))]
 
 
@@ -67,13 +68,13 @@ def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5) -> int | None:
             mids.append(0.5 * (pk[0] + pk[-1]))
     if len(mids) < max(3, 0.25 * lt.shape[1]):
         return find_optical_reversal(tiles)
-    mids = np.array(mids)
-    med = float(np.median(mids))
-    agree = np.abs(mids - med) <= max(3.0, 0.06 * n)
+    mids_arr = np.array(mids)
+    med = float(np.median(mids_arr))
+    agree = np.abs(mids_arr - med) <= max(3.0, 0.06 * n)
     if agree.mean() < 0.6:
         return find_optical_reversal(tiles)
     v = (lt - lt.mean(0)) / (lt.std(0) + 1e-6)
-    best, best_s = int(round(med)), np.inf
+    best, best_s = round(med), np.inf
     for t in range(max(2, int(med) - 6), min(n - 2, int(med) + 7)):
         arm = min(t, n - 1 - t, 15)
         m = np.arange(1, arm + 1)
@@ -127,8 +128,8 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
     offs = (-2, -1, 0, 1, 2) if n >= 5 else (-1, 0, 1)
     z0 = z[k]
     # weighted LS fit y = a dz^2 + b dz + c, weights 0 for samples outside the valid range
-    S = {p: 0.0 for p in range(5)}
-    T = {p: 0.0 for p in range(3)}
+    S: dict[int, np.ndarray | float] = {p: 0.0 for p in range(5)}
+    T: dict[int, np.ndarray | float] = {p: 0.0 for p in range(3)}
     for o in offs:
         j = kc + o
         use = (j >= 0) & (j < n) & (np.abs(j - k) <= 2)
@@ -145,10 +146,14 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
     # normal equations [[S4 S3 S2],[S3 S2 S1],[S2 S1 S0]] [a b c] = [T2 T1 T0]
     m11, m12, m13 = S[4], S[3], S[2]
     m22, m23, m33 = S[2], S[1], S[0]
-    det = m11 * (m22 * m33 - m23 * m23) - m12 * (m12 * m33 - m23 * m13) + m13 * (m12 * m23 - m22 * m13)
-    det = np.where(np.abs(det) < 1e-20, np.nan, det)
-    a = (T[2] * (m22 * m33 - m23 * m23) - m12 * (T[1] * m33 - m23 * T[0]) + m13 * (T[1] * m23 - m22 * T[0])) / det
-    b = (m11 * (T[1] * m33 - m23 * T[0]) - T[2] * (m12 * m33 - m23 * m13) + m13 * (m12 * T[0] - T[1] * m13)) / det
+    det_raw = m11 * (m22 * m33 - m23 * m23) - m12 * (m12 * m33 - m23 * m13) + m13 * (m12 * m23 - m22 * m13)
+    det = np.where(np.abs(det_raw) < 1e-20, np.nan, det_raw)
+    a = np.asarray(
+        (T[2] * (m22 * m33 - m23 * m23) - m12 * (T[1] * m33 - m23 * T[0]) + m13 * (T[1] * m23 - m22 * T[0])) / det
+    )
+    b = np.asarray(
+        (m11 * (T[1] * m33 - m23 * T[0]) - T[2] * (m12 * m33 - m23 * m13) + m13 * (m12 * T[0] - T[1] * m13)) / det
+    )
     peak_ok = interior & np.isfinite(a) & (a < 0)
     dz_hi = np.abs(z[np.clip(k + 1, 0, n - 1)] - z0)
     dz_lo = np.abs(z[np.clip(k - 1, 0, n - 1)] - z0)
@@ -232,8 +237,8 @@ class EDFAccumulator:
     def __init__(self, shape: tuple[int, int], levels: int = 5):
         self.shape = shape
         self.levels = max(1, min(levels, int(np.log2(min(shape))) - 3))
-        self.acc = None
-        self.wsum = None
+        self.acc: list[np.ndarray] | None = None
+        self.wsum: list[np.ndarray] | None = None
 
     def _gauss(self, a):
         pyr = [a]
@@ -246,7 +251,7 @@ class EDFAccumulator:
         lap = [g[i] - cv2.pyrUp(g[i + 1], dstsize=(g[i].shape[1], g[i].shape[0])) for i in range(self.levels)]
         lap.append(g[-1])
         wp = self._gauss(weight.astype(np.float32))
-        if self.acc is None:
+        if self.acc is None or self.wsum is None:
             self.acc = [np.zeros_like(x) for x in lap]
             self.wsum = [np.zeros_like(x) for x in wp]
         for i in range(len(lap)):
@@ -254,11 +259,12 @@ class EDFAccumulator:
             self.wsum[i] += wp[i]
 
     def result(self) -> np.ndarray:
+        assert self.acc is not None and self.wsum is not None
         parts = [a / np.maximum(w, 1e-6) for a, w in zip(self.acc, self.wsum)]
         out = parts[-1]
         for i in range(self.levels - 1, -1, -1):
             out = cv2.pyrUp(out, dstsize=(parts[i].shape[1], parts[i].shape[0])) + parts[i]
-        return out
+        return np.asarray(out, dtype=np.float32)
 
 
 def softmax_weights(fv: np.ndarray, temperature: float = 0.25) -> np.ndarray:
@@ -266,7 +272,7 @@ def softmax_weights(fv: np.ndarray, temperature: float = 0.25) -> np.ndarray:
     lf = np.log(np.maximum(fv, 1e-12))
     lf = lf - lf.max(axis=0, keepdims=True)
     e = np.exp(lf / temperature)
-    return (e / e.sum(axis=0, keepdims=True)).astype(np.float32)
+    return np.asarray(e / e.sum(axis=0, keepdims=True), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------------------------- DOF ruler

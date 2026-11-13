@@ -68,7 +68,7 @@ class Objective:
 
     def focus_window_px(self, um_per_px: float) -> int:
         """Odd focus-measure window covering at least 3 PSF sigmas each side, minimum 7 px."""
-        side = int(math.ceil(6.0 * self.psf_sigma_px(um_per_px)))
+        side = math.ceil(6.0 * self.psf_sigma_px(um_per_px))
         side = max(7, side)
         return side | 1
 

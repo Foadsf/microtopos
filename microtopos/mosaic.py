@@ -12,10 +12,10 @@ Enhanced with:
 
 from __future__ import annotations
 
-import collections
-from dataclasses import dataclass, field
 import logging
 import math
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Literal
 
 import cv2
@@ -339,7 +339,7 @@ class Mosaic:
     prev_xy: tuple = (0.0, 0.0)
     ref: int = 0
     areas: int = 1
-    recent_b: collections.deque = field(default_factory=lambda: collections.deque(maxlen=12))
+    recent_b: deque = field(default_factory=lambda: deque(maxlen=12))
     edges: list = field(default_factory=list)  # (i, j, dx, dy, weight): position of j minus position of i
     lost_frames: int = 0
     velocity: tuple | None = None  # last per-frame camera motion (constant-velocity prediction)
@@ -389,7 +389,7 @@ class Mosaic:
         b_bp = b_bp.astype(np.float32, copy=False)
         h, w = a_bp.shape
         hx, hy = dx / 2, dy / 2
-        ix, iy = int(math.floor(hx)), int(math.floor(hy))
+        ix, iy = math.floor(hx), math.floor(hy)
         if abs(ix) > 0.75 * w or abs(iy) > 0.75 * h:
             return -1.0
         fx, fy = hx - ix, hy - iy
@@ -410,7 +410,7 @@ class Mosaic:
         a32 = a_bp.astype(np.float32, copy=False)
         f32 = f_bp.astype(np.float32, copy=False)
         hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
-        dx, dy, r = phase_shift(a32, f32, hwin)
+        dx, dy, _r = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
         try:
@@ -588,7 +588,7 @@ class Mosaic:
             self._loop_closure(win)
             return True, q
         if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe
-            self.ref = self._nearest(self.x, self.y)
+            self.ref = self._nearest_one(self.x, self.y)
         return False, q
 
     NEW_AREA_AFTER = 40  # lost frames (about 3 s at 12.5 fps) before starting a separate mosaic area
@@ -626,7 +626,7 @@ class Mosaic:
 
     def _new_area(self, f, fb, b) -> None:
         """Place an unconnected view to the right of everything mapped so far (its true position is unknown)."""
-        h, w = f.shape
+        _h, w = f.shape
         x = max(k.x for k in self.keyframes) + 1.3 * w
         y = min(k.y for k in self.keyframes)
         self._add_keyframe(f, fb, b, x, y, None, (0.0, 0.0))
@@ -637,15 +637,19 @@ class Mosaic:
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (x, y)
 
-    def _nearest(self, x, y, k: int = 1):
+    def _nearest_one(self, x: float, y: float) -> int:
+        d = [math.hypot(x - kf.x, y - kf.y) for kf in self.keyframes]
+        return int(np.argmin(d))
+
+    def _nearest_k(self, x: float, y: float, k: int) -> list[int]:
         d = [math.hypot(x - kf.x, y - kf.y) for kf in self.keyframes]
         order = np.argsort(d)
-        return int(order[0]) if k == 1 else [int(i) for i in order[:k]]
+        return [int(i) for i in order[:k]]
 
     def _relocalize(self, f, fb, win) -> bool:
         """After losing track, try the keyframes nearest the last known position (bounded work per attempt)."""
         best = None
-        for i in self._nearest(self.x, self.y, k=8):
+        for i in self._nearest_k(self.x, self.y, 8):
             k = self.keyframes[i]
             dx, dy, q = self._match(k.image, k.bp, f, fb, win)
             if q >= self.LOOP_NCC and (best is None or q > best[0]):
@@ -743,7 +747,7 @@ class Mosaic:
         fy = np.sin(np.linspace(0.05, np.pi - 0.05, h, dtype=np.float32))
         fx = np.sin(np.linspace(0.05, np.pi - 0.05, w, dtype=np.float32))
         feather = np.outer(fy, fx) * weight
-        x0, y0 = int(round(x)), int(round(y))
+        x0, y0 = round(x), round(y)
         t = self.tile
         for ty in range(y0 // t, (y0 + h - 1) // t + 1):
             for tx in range(x0 // t, (x0 + w - 1) // t + 1):
@@ -818,8 +822,8 @@ class Mosaic:
                 actual_dx = kj.x - ki.x
                 actual_dy = kj.y - ki.y
                 res = math.hypot(actual_dx - dx, actual_dy - dy)
-                x_center = int(round((ki.x + kj.x) / 2.0 - X0 * t))
-                y_center = int(round((ki.y + kj.y) / 2.0 - Y0 * t))
+                x_center = round((ki.x + kj.x) / 2.0 - X0 * t)
+                y_center = round((ki.y + kj.y) / 2.0 - Y0 * t)
                 h_half, w_half = t // 2, t // 2
                 ys = slice(max(0, y_center - h_half), min(res_canvas.shape[0], y_center + h_half))
                 xs = slice(max(0, x_center - w_half), min(res_canvas.shape[1], x_center + w_half))
@@ -845,7 +849,7 @@ class Mosaic:
                 dx, dy, q = register_joint_intensity_height(best_p.edf, best_p.height, edf32, h32, weight_height=0.4)
                 if q >= self.LOOP_NCC and math.hypot(dx - (best_p.x - rx), dy - (best_p.y - ry)) < 4.0:
                     rx, ry = best_p.x - dx, best_p.y - dy
-        kf = self._nearest(rx, ry) if self.keyframes else None
+        kf = self._nearest_one(rx, ry) if self.keyframes else None
         rel = (rx - self.keyframes[kf].x, ry - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
         self.patches.append(HeightPatch(rx, ry, edf32, h32, unit, 0.0, kf, rel))
         self._splat(edf32, rx, ry, weight=4.0)
@@ -863,7 +867,7 @@ class Mosaic:
                 a, b = P[i], P[j]
                 if _canon_z_unit(a.z_unit) != _canon_z_unit(b.z_unit):
                     continue
-                ax, ay, bx, by = int(round(a.x)), int(round(a.y)), int(round(b.x)), int(round(b.y))
+                ax, ay, bx, by = round(a.x), round(a.y), round(b.x), round(b.y)
                 x0, y0 = max(ax, bx), max(ay, by)
                 x1 = min(ax + a.height.shape[1], bx + b.height.shape[1])
                 y1 = min(ay + a.height.shape[0], by + b.height.shape[0])
@@ -899,8 +903,8 @@ class Mosaic:
                 len(self.patches) - len(selected),
                 target_unit,
             )
-        xs = [int(round(p.x)) for p in selected]
-        ys = [int(round(p.y)) for p in selected]
+        xs = [round(p.x) for p in selected]
+        ys = [round(p.y) for p in selected]
         X0, Y0 = min(xs), min(ys)
         W = max(x + p.height.shape[1] for x, p in zip(xs, selected)) - X0
         H = max(y + p.height.shape[0] for y, p in zip(ys, selected)) - Y0

@@ -2,28 +2,52 @@
 
 from __future__ import annotations
 
+import datetime
 import html
 import logging
 import math
-import time
 import os
+import time
+from collections.abc import Callable
 from pathlib import Path
-
-logger = logging.getLogger("microtopos.gui")
+from typing import Any, Literal
 
 import cv2
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                               QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
-                               QStackedWidget, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDockWidget,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QStackedWidget,
+    QTabWidget,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .. import __version__, export, metrology, zstack
 from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
-from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
+from ..camera import CameraSource, FrameSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
 from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import LiveEngine, SweepCapture
@@ -31,6 +55,15 @@ from ..optics import OBJECTIVE_NAMES, OBJECTIVES
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
 from .widgets import Banner, Chip, ImagePanel, Toast, section
+
+logger = logging.getLogger("microtopos.gui")
+
+_FUSION_MODES: dict[str, Literal["sharpest", "weighted", "average", "superres"]] = {
+    "sharpest": "sharpest",
+    "weighted": "weighted",
+    "average": "average",
+    "superres": "superres",
+}
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -78,7 +111,16 @@ class Job(QThread):
             self.done.emit(res)
         except zstack.Cancelled:
             self.failed.emit("Cancelled.")
-        except Exception as e:  # surfaced to the user, never silently dropped
+        except (
+            ValueError,
+            RuntimeError,
+            OSError,
+            TypeError,
+            ArithmeticError,
+            LookupError,
+            cv2.error,
+            AttributeError,
+        ) as e:  # surfaced to the user, never silently dropped
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
@@ -103,28 +145,33 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("MicroTopos", "MicroTopos")
         self.dark = self.settings.value("dark", True, type=bool)
         self.t = DARK if self.dark else LIGHT
-        data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation) or Path.home() / ".microtopos")
+        data_dir = Path(
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            or Path.home() / ".microtopos"
+        )
         self.store = CalibrationStore(data_dir)
-        self.obj = OBJECTIVES[self.settings.value("objective", "10x / 0.25")] \
-            if self.settings.value("objective", "10x / 0.25") in OBJECTIVES else OBJECTIVES["10x / 0.25"]
+        saved_obj = str(self.settings.value("objective", "10x / 0.25"))
+        self.obj = OBJECTIVES[saved_obj] if saved_obj in OBJECTIVES else OBJECTIVES["10x / 0.25"]
         self.engine = LiveEngine(self.store, self.obj)
         self.fusion = fusion
         self.crop = crop
         if hasattr(self.engine, "mosaic"):
-            self.engine.mosaic.fusion = fusion
+            self.engine.mosaic.fusion = _FUSION_MODES.get(fusion, "sharpest")
         self.bridge = Bridge()
         self.engine.verbose = verbose
-        self.engine.on_sweep = self.bridge.sweep.emit
-        self.engine.on_objective_hint = self.bridge.objective_hint.emit
+        self.engine.on_sweep = lambda cap: self.bridge.sweep.emit(cap)
+        self.engine.on_objective_hint = lambda ratio: self.bridge.objective_hint.emit(ratio)
         self.bridge.sweep.connect(self._on_sweep)
         self.bridge.objective_hint.connect(self._on_objective_hint)
-        self.source = None
+        self.source: FrameSource | None = None
         self.sim_source: SimulatorSource | None = None
-        self.result: dict | None = None
-        self.prev_result: dict | None = None
+        self.result: dict[str, Any] | None = None
+        self.prev_result: dict[str, Any] | None = None
         self.repeat_armed = False
         self.job: Job | None = None
-        self.sr_result = None
+        self.sr_job: Job | None = None
+        self.job_done_hook: list[dict[str, Any]] | None = None
+        self.sr_result: dict[str, Any] | None = None
         self.last_mosaic_version = -1
         self.history: list[dict] = []
         self._result_t = -1e9
@@ -171,7 +218,9 @@ class MainWindow(QMainWindow):
         st = self.settings.value("state")
         if st is not None:
             self.restoreState(st)
-        self.timer = QTimer(self, interval=66, timeout=self._tick)  # 15 Hz: above the camera's 12.5 fps
+        self.timer = QTimer(self)
+        self.timer.setInterval(66)  # 15 Hz: above the camera's 12.5 fps
+        self.timer.timeout.connect(self._tick)
         self.timer.start()
         self._refresh_checklist()
 
@@ -266,8 +315,8 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 8, 8)
         # tool bars (layouts) above the image, everything else in the given order
-        ws = [x for x in ws if not isinstance(x, QWidget)] + [x for x in ws if isinstance(x, QWidget)]
-        for x in ws:
+        ordered = [x for x in ws if not isinstance(x, QWidget)] + [x for x in ws if isinstance(x, QWidget)]
+        for x in ordered:
             if isinstance(x, QWidget):
                 lay.addWidget(x, 1 if isinstance(x, ImagePanel) else 0)
             else:
@@ -276,7 +325,7 @@ class MainWindow(QMainWindow):
 
     def _btn(self, text, fn, tip="", primary=False) -> QPushButton:
         b = QPushButton(text)
-        b.setFocusPolicy(Qt.TabFocus)  # a mouse click does not take focus, so Space never re-triggers it
+        b.setFocusPolicy(Qt.FocusPolicy.TabFocus)  # a mouse click does not take focus, so Space never re-triggers it
         b.clicked.connect(fn)
         if tip:
             b.setToolTip(tip)
@@ -296,7 +345,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.chk_zebra)
         self.btn_rec = QPushButton("● Record raw stream")
         self.btn_rec.setCheckable(True)
-        self.btn_rec.setFocusPolicy(Qt.TabFocus)
+        self.btn_rec.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.btn_rec.setToolTip("Save the camera's exact MJPEG frames to the 'recordings' folder for offline replay "
                                 "(uv run microtopos --replay FOLDER)")
         self.btn_rec.toggled.connect(self._toggle_record)
@@ -376,7 +425,10 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(8, 8, 8, 8)
         self.gl = None
         try:
+            import OpenGL.error as gl_err  # type: ignore[import-untyped]
             import pyqtgraph.opengl as gl
+
+            _gl_errors = (RuntimeError, ValueError, OSError, ImportError, AttributeError, TypeError, gl_err.Error)
 
             class SafeGL(gl.GLViewWidget):
                 """GL view that records initialisation/paint failures instead of raising inside Qt."""
@@ -385,7 +437,7 @@ class MainWindow(QMainWindow):
                 def initializeGL(self):
                     try:
                         super().initializeGL()
-                    except Exception as exc:
+                    except _gl_errors as exc:
                         logger.debug("OpenGL SafeGL initializeGL failed: %s", exc)
                         self.failed = True
 
@@ -393,7 +445,7 @@ class MainWindow(QMainWindow):
                     if not self.failed:
                         try:
                             super().paintGL(*a, **k)
-                        except Exception as exc:
+                        except _gl_errors as exc:
                             logger.debug("OpenGL SafeGL paintGL failed: %s", exc)
                             self.failed = True
 
@@ -404,7 +456,7 @@ class MainWindow(QMainWindow):
             self.gl_surf.setVisible(False)  # an empty surface has no mesh: drawing it raises in pyqtgraph
             self.gl.addItem(self.gl_surf)
             lay.addWidget(self.gl, 1)
-        except Exception as exc:
+        except (ImportError, RuntimeError, OSError, AttributeError, ValueError, TypeError) as exc:
             logger.warning("OpenGL 3D view unavailable; falling back to 2D shaded relief: %s", exc)
             self.gl = None
         self.relief = ImagePanel(self.t, "No height map yet.")
@@ -796,20 +848,23 @@ class MainWindow(QMainWindow):
         if self.source is not None:
             self.engine.set_source(None)
             self.source.stop()
+        src: FrameSource
         if info is None:
             self.sim_source = SimulatorSource(7, self.obj)
-            self.source = self.sim_source
+            src = self.sim_source
         elif info == "replay":
             self.sim_source = None
-            self.source = ReplaySource(self.replay)
+            assert self.replay is not None
+            src = ReplaySource(self.replay)
         else:
             w, h = (int(v) for v in self.cmb_res.currentText().split("x"))
             self.sim_source = None
-            self.source = CameraSource(info, w, h, 25)
-        self.source.start()
-        self.engine.set_source(self.source)
-        if isinstance(self.source, CameraSource):
-            rng = self.source.exposure_range()
+            src = CameraSource(info, w, h, 25)
+        self.source = src
+        src.start()
+        self.engine.set_source(src)
+        if isinstance(src, CameraSource):
+            rng = src.exposure_range()
             if rng:  # use the device's own limits (the defaults are the Bresser's)
                 v = self.sl_exp.value()
                 self.sl_exp.blockSignals(True)
@@ -817,7 +872,7 @@ class MainWindow(QMainWindow):
                 self.sl_exp.setValue(int(np.clip(v, *rng)))
                 self.sl_exp.blockSignals(False)
                 self.lbl_exp.setText(f"{self.sl_exp.value() / 10:.1f} ms")
-        self.btn_autoexp_once.setEnabled(isinstance(self.source, CameraSource))
+        self.btn_autoexp_once.setEnabled(isinstance(src, CameraSource))
         self.demo_box.setVisible(self.sim_source is not None)
         self.cmb_res.setVisible(self.sim_source is None)
         self._apply_exposure()
@@ -925,8 +980,14 @@ class MainWindow(QMainWindow):
         text = "Objective change suspected (the image changed abruptly)."
         if guess and guess != self.obj.name:
             text += f" Texture scale suggests <b>{guess}</b> (a guess)."
-        acts = [(n, lambda n=n: self.cmb_obj.setCurrentText(n)) for n in OBJECTIVE_NAMES]
-        acts.append(("Dismiss", lambda: None))
+        def _pick(name: str) -> Callable[[], object]:
+            return lambda: self.cmb_obj.setCurrentText(name)
+
+        def _dismiss() -> None:
+            return None
+
+        acts: list[tuple[str, Callable[[], object]]] = [(n, _pick(n)) for n in OBJECTIVE_NAMES]
+        acts.append(("Dismiss", _dismiss))
         self.banner.ask(text, acts)
 
     def _demo(self, kind):
@@ -954,9 +1015,9 @@ class MainWindow(QMainWindow):
                 self.notify("Recording needs a camera source.", "warning")
             return
         if on:
-            import datetime
-            folder = Path(self.settings.value("rec_dir", str(Path.cwd() / "recordings"))) / \
-                datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            rec_base = Path(str(self.settings.value("rec_dir", str(Path.cwd() / "recordings"))))
+            stamp = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
+            folder = rec_base / stamp
             self.source.start_recording(folder)
             self.rec_folder = folder
             self.btn_rec.setText("■ Stop recording")
@@ -1166,12 +1227,19 @@ class MainWindow(QMainWindow):
         elif getattr(self, "_stale", False):
             self._stale = False
             self._refresh_checklist()
-        rec = getattr(self.source, "recording", False)
-        self.chip_rec.setVisible(rec)
-        if rec:
-            secs = int(time.perf_counter() - self.source.rec_t0)
+        if s.worker_error and s.worker_error != getattr(self, "_last_worker_error", None):
+            self._last_worker_error = s.worker_error
+            self.notify(f"Engine error: {s.worker_error}", "warning")
+        elif s.worker_error is None:
+            self._last_worker_error = None
+        rec_src = (
+            self.source if isinstance(self.source, CameraSource) and getattr(self.source, "recording", False) else None
+        )
+        self.chip_rec.setVisible(rec_src is not None)
+        if rec_src is not None:
+            secs = int(time.perf_counter() - rec_src.rec_t0)
             self.chip_rec.set(f"● REC {secs // 60}:{secs % 60:02d}", "danger")
-        self.lbl_live.setText((f"● REC {len(self.source.rec_stamps)} frames · " if rec else "") +
+        self.lbl_live.setText((f"● REC {len(rec_src.rec_stamps)} frames · " if rec_src is not None else "") +
                               f"{s.frame_shape[1]}×{s.frame_shape[0]} capture · preview {um_prev:.3f} µm/px · "
                               f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}")
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
@@ -1179,10 +1247,11 @@ class MainWindow(QMainWindow):
         if s.brenner_hist:
             self.spark_curve.setData(np.asarray(s.brenner_hist, float))
         cp = self.engine.calibration_progress()
+        cal_was = getattr(self, "_cal_was", None)
         if cp:
             self.lbl_job.setText(f"Recording {cp[0]}: {cp[1]}/{cp[2]} frames")
-        elif getattr(self, "_cal_was", None):
-            self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
+        elif cal_was is not None:
+            self.notify(f"{cal_was[0].capitalize()} frame recorded and saved.", "success")
             self._refresh_checklist()
         self._cal_was = cp
         if self.tabs.currentIndex() == 1:
@@ -1344,7 +1413,7 @@ class MainWindow(QMainWindow):
                               lam_s_um=self.sp_ls.value() or None, lam_c_um=self.sp_lc.value(),
                               workers=max(1, (os.cpu_count() or 2) - 1))
         meta = {"z_status": zstat, "lateral_status": cal.lateral_status.value if not cap.simulated else "SIMULATED",
-                "pose": cap.pose, "capture_shape": cap.shape}
+                "pose": cap.pose, "capture_shape": cap.shape, "source_gen": self.engine._source_gen}
         self.job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st,
                        frame_indices=cap.frame_indices)
         self.job.progress.connect(self._on_progress)
@@ -1382,15 +1451,20 @@ class MainWindow(QMainWindow):
                 if sig is not None and r.get("Sq"):
                     r["sigma_inst_lt_Sq_over_10"] = bool(sig < r["Sq"] / 10)
             else:
-                r["warnings"] = r.get("warnings", []) + ["Repeatability not computed: the stage moved, the objective "
-                                                         "or Z unit changed, or the size differs between the two sweeps."]
+                r["warnings"] = r.get("warnings", []) + [
+                    (
+                        "Repeatability not computed: the stage moved, the objective "
+                        "or Z unit changed, or the size differs between the two sweeps."
+                    )
+                ]
         self.prev_result, self.result = self.result, r
         self._result_t = time.perf_counter()
         self._remember(r)
         self.last_ignored = None
-        # pin into the mosaic at preview resolution
+        # pin into the mosaic at preview resolution (unless the source changed since capture started)
         s = self.engine.snapshot()
-        if s.preview is not None:
+        same_gen = r.get("source_gen") is None or r.get("source_gen") == self.engine._source_gen
+        if same_gen and s.preview is not None:
             ph, pw = s.preview.shape
             edf_p = cv2.resize(r["edf"], (pw, ph), interpolation=cv2.INTER_AREA)
             h_p = cv2.resize(r["height"], (pw, ph), interpolation=cv2.INTER_NEAREST)
@@ -1437,6 +1511,9 @@ class MainWindow(QMainWindow):
         self.notify("Metrology recomputed with the new filter settings.", "success")
 
     def _run_sr(self):
+        if self.sr_job is not None and self.sr_job.isRunning():
+            self.notify("Super-resolution is still running.", "warning")
+            return
         frames = self.engine.dwell_frames()
         if len(frames) < 8:
             self.notify("Hold still for a moment (needs 8 still frames).", "warning")
@@ -1495,7 +1572,8 @@ class MainWindow(QMainWindow):
             data, unit = r["height"], r["z_unit"]
         else:
             data, unit = r["confidence"], ""
-        self.p_height.bar.setColorMap(pg.colormap.get("cividis" if mode == 2 else "viridis"))
+        if self.p_height.bar is not None:
+            self.p_height.bar.setColorMap(pg.colormap.get("cividis" if mode == 2 else "viridis"))
         self.p_height.set_image(data, um, levels=(0, 1) if mode == 2 else None, unit=unit)
         self.p_height.extra = r["confidence"]
         if not self.prof_roi.isVisible():
@@ -1667,18 +1745,22 @@ class MainWindow(QMainWindow):
     def _export_gsf(self):
         if self._need_result() and (p := self._save_path("Export Gwyddion field", "height.gsf", "GSF (*.gsf)")):
             r = self.result
+            assert r is not None
             export.write_gwyddion_gsf(p, r["sl_surface"], r["um_per_px"], r["z_unit"] == "µm",
                                       f"MicroTopos {r['objective']} {r.get('z_status')}")
             self.notify(f"Saved {p}", "success")
 
     def _export_tiff(self):
         if self._need_result() and (p := self._save_path("Export float TIFF", "height.tif", "TIFF (*.tif)")):
-            export.write_float32_tiff(p, self.result["sl_surface"], self.result["um_per_px"])
+            r = self.result
+            assert r is not None
+            export.write_float32_tiff(p, r["sl_surface"], r["um_per_px"])
             self.notify(f"Saved {p}", "success")
 
     def _export_stl(self):
         if self._need_result() and (p := self._save_path("Export STL", "surface.stl", "STL (*.stl)")):
             r = self.result
+            assert r is not None
             z = r["sl_surface"] if r["z_unit"] == "µm" else r["sl_surface"] * r["um_per_px"]
             n, _ = export.write_binary_stl(p, z, r["um_per_px"], max_grid_dim=400)
             self.notify(f"Saved {p} ({n} triangles)" + ("" if r["z_unit"] == "µm" else "; z in frames × pixel size"),
@@ -1687,40 +1769,46 @@ class MainWindow(QMainWindow):
     def _export_report(self):
         if not self._need_result():
             return
+        r = self.result
+        assert r is not None
         d = QFileDialog.getExistingDirectory(self, "Folder for the report bundle",
-                                             self.settings.value("export_dir", str(Path.home())))
+                                             str(self.settings.value("export_dir", str(Path.home()))))
         if d:
             import scipy
             import skimage
-            files = export.write_report_bundle(d, self.result, {"microtopos": __version__, "numpy": np.__version__,
-                                                                "opencv": cv2.__version__, "scipy": scipy.__version__,
-                                                                "scikit-image": skimage.__version__})
+            files = export.write_report_bundle(d, r, {"microtopos": __version__, "numpy": np.__version__,
+                                                      "opencv": cv2.__version__, "scipy": scipy.__version__,
+                                                      "scikit-image": skimage.__version__})
             self.notify(f"Saved {len(files)} files to {d}", "success")
 
     def _save_session(self):
         if self._need_result() and (p := self._save_path("Save session", "session.npz", "Session (*.npz)")):
+            r = self.result
+            assert r is not None
             (img, origin), hm, _, _ = self.engine.mosaic_image()
             extra = {"mosaic_image": img, "mosaic_origin": list(origin), "um_preview": getattr(self, "um_preview", None)}
             if hm is not None:
                 extra.update(height_mosaic=hm[0], height_mosaic_origin=list(hm[1]))
-            export.save_session(p, {**self.result, **extra},
+            export.save_session(p, {**r, **extra},
                                 {"objective": self.obj.name, "measure": self.cmb_measure.currentText()})
             self.notify(f"Saved {p}", "success")
 
     def _load_session(self):
-        d = self.settings.value("export_dir", str(Path.home()))
+        d = str(self.settings.value("export_dir", str(Path.home())))
         p, _ = QFileDialog.getOpenFileName(self, "Open session", d, "Session (*.npz)")
         if not p:
             return
         try:
-            r, s = export.load_session(p)
+            r, _s = export.load_session(p)
             if "edf_proc" not in r:
                 r["edf_proc"] = cv2.resize(r["edf"], (r["height"].shape[1], r["height"].shape[0]),
                                            interpolation=cv2.INTER_AREA)
             m = metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
                                   OBJECTIVES[r["objective"]].lateral_cutoff_um, r.get("form_order", 1),
                                   r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
-            r["warnings"] = m.pop("warnings")
+            orig_w = list(r.get("warnings") or [])
+            new_w = list(m.pop("warnings") or [])
+            r["warnings"] = list(dict.fromkeys([*orig_w, *new_w]))
             r.update(m)
             self.result = r
             self._remember(r)
@@ -1732,7 +1820,7 @@ class MainWindow(QMainWindow):
             self._show_result()
             self.tabs.setCurrentIndex(3)
             self.notify(f"Opened {p}", "success")
-        except Exception as e:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
             self.notify(f"Could not open session: {e}", "danger")
 
     # ================================================================== shutdown

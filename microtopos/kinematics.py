@@ -61,30 +61,33 @@ def spectral_centroid(img: np.ndarray) -> float:
 class StateMachine:
     def __init__(self, analysis_width: int = 320):
         self.analysis_width = analysis_width
+        self._reset_state()
+
+    def _reset_state(self) -> None:
         self.state = State.DWELL
         self.override = Override.AUTO
-        self.prev = None
-        self.prev_b = None
-        self.prev_luma = None
-        self.quiet_shift = collections.deque(maxlen=120)
-        self.quiet_db = collections.deque(maxlen=120)
-        self.quiet_resp = collections.deque(maxlen=120)
-        self.cut_before = None
+        self.prev: np.ndarray | None = None
+        self.prev_b: float | None = None
+        self.prev_luma: float | None = None
+        self.quiet_shift: collections.deque[float] = collections.deque(maxlen=120)
+        self.quiet_db: collections.deque[float] = collections.deque(maxlen=120)
+        self.quiet_resp: collections.deque[float] = collections.deque(maxlen=120)
+        self.cut_before: np.ndarray | None = None
         self.sweep_complete = True  # set by the caller each frame during a sweep (live completeness >= 0.5)
-        self.trend = collections.deque(maxlen=6)
+        self.trend: collections.deque[float] = collections.deque(maxlen=6)
         self.enter_count = 0
         self.exit_count = 0
         self.lost_count = 0
-        self.centroid_before = None
-        self.centroid_hist = collections.deque(maxlen=10)
+        self.centroid_before: float | None = None
+        self.centroid_hist: collections.deque[float] = collections.deque(maxlen=10)
 
     def reset(self) -> None:
-        self.__init__(self.analysis_width)
+        self._reset_state()
 
     def _small(self, luma: np.ndarray) -> np.ndarray:
         h, w = luma.shape
         sw = self.analysis_width
-        return cv2.resize(luma, (sw, max(8, int(round(h * sw / w)))), interpolation=cv2.INTER_AREA)
+        return cv2.resize(luma, (sw, max(8, round(h * sw / w))), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _robust(values, floor):
@@ -103,6 +106,7 @@ class StateMachine:
             self.prev, self.prev_b, self.prev_luma = s, b, luma_mean
             self.centroid_hist.append(spectral_centroid(s))
             return self.state, Features(0, 1, 0, 0, b, 0), events
+        assert self.prev_b is not None and self.prev_luma is not None
         dx, dy, resp = _phase(self.prev, s)
         shift = math.hypot(dx, dy)
         dlb = math.log((b + 1e-6) / (self.prev_b + 1e-6))
@@ -161,7 +165,7 @@ class StateMachine:
         if self.state == State.OBJECTIVE_CHANGE:
             self.exit_count = 0 if cut else self.exit_count + 1
             if self.exit_count >= 8:
-                _, _, r_back = _phase(self.cut_before, s)
+                r_back = _phase(self.cut_before, s)[2] if self.cut_before is not None else 0.0
                 if r_back < max(0.08, 0.25 * (base_resp or 0.5)):  # a different view, not a brief occlusion
                     after = spectral_centroid(s)
                     ratio = (self.centroid_before / after) if self.centroid_before and after > 0 else None
@@ -222,7 +226,7 @@ def motion_match(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
     ba, bb = _band(a), _band(b)
     win = cv2.createHanningWindow((w, h), cv2.CV_32F)
     dx, dy, _ = phase_shift(ba, bb, win)
-    ix, iy = int(round(dx)), int(round(dy))
+    ix, iy = round(dx), round(dy)
     ow, oh = w - abs(ix), h - abs(iy)
     if ow * oh < 0.4 * w * h:
         return dx, dy, 0.0

@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import cv2
@@ -61,6 +62,7 @@ class Snapshot:
     mosaic_xy: tuple = (0.0, 0.0)  # live camera position in mosaic pixels (preview scale)
     preview_shape: tuple = (0, 0)
     sweep_completeness: float = 0.0  # live: fraction of the field that has gone blurry -> sharp -> blurry
+    worker_error: str | None = None
 
 
 class LiveEngine:
@@ -72,15 +74,15 @@ class LiveEngine:
         self.source: FrameSource | None = None
         self.exposure: float | None = None
         self.linearize = False
-        self.on_sweep = None  # callback(SweepCapture)
-        self.on_objective_hint = None  # callback(ratio)
+        self.on_sweep: Callable[[SweepCapture], object] | None = None  # callback(SweepCapture)
+        self.on_objective_hint: Callable[[object], object] | None = None  # callback(ratio)
         self._lock = threading.Lock()
         self._snap = Snapshot()
         self.verbose = False  # also print the event log to stdout (--verbose)
         self._running = False
         self._thread = None
         self._last_seq = -1
-        self._preroll = collections.deque(maxlen=PREROLL)
+        self._preroll: collections.deque = collections.deque(maxlen=PREROLL)
         self._sweep: list = []
         self._sweep_z: list = []
         self._sweep_pose = (0.0, 0.0)
@@ -96,15 +98,15 @@ class LiveEngine:
         self._view_t = 0.0
         self._areas_seen = 1
         self._cov = None
-        self._dwell = collections.deque(maxlen=16)
-        self._avg = collections.deque(maxlen=8)
-        self._bhist = collections.deque(maxlen=200)
-        self._calib_req = None  # (kind, n, frames)
+        self._dwell: collections.deque = collections.deque(maxlen=16)
+        self._avg: collections.deque = collections.deque(maxlen=8)
+        self._bhist: collections.deque = collections.deque(maxlen=200)
+        self._calib_req: list | None = None  # [kind, n, frames, obj_name, source_gen]
         self.events: collections.deque = collections.deque(maxlen=500)  # (seq, text) for diagnostics
         self._last_state = None
         self._t0 = time.perf_counter()
-        self._corrector = None
-        self._corrector_key = None
+        self._corrector: RadiometricCorrector | None = None
+        self._corrector_key: tuple | None = None
         self.mosaic_version = 0
 
     # ------------------------------------------------------------------ control
@@ -175,7 +177,7 @@ class LiveEngine:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
 
     def _emit(self, frames, zs, tiles, pose, n_pre, shape, simulated, indices=None):
-        if len(frames) - n_pre < 8 or not self.on_sweep:
+        if len(frames) - n_pre < 8 or self.on_sweep is None:
             return
         z = None if any(v is None for v in zs) else np.array(zs)
         idx_arr = np.array(indices, dtype=np.float64) if indices is not None and len(indices) == len(frames) else None
@@ -198,11 +200,11 @@ class LiveEngine:
         self._pending_patches.append((pose, edf_preview, height_preview, z_unit))  # applied by the engine thread
 
     # ------------------------------------------------------------------ loop
-    def _corrector_for(self, shape):
+    def _corrector_for(self, shape) -> RadiometricCorrector:
         cal = self.store.get(self.objective)
         key = radiometric_key(shape, self.exposure)
         full_key = (self.objective.name, key, id(cal.darks.get(key)), id(cal.flats.get(key)))
-        if full_key != self._corrector_key:
+        if self._corrector is None or full_key != self._corrector_key:
             self._corrector = RadiometricCorrector(cal.darks.get(key), cal.flats.get(key))
             self._corrector_key = full_key
         return self._corrector
@@ -213,13 +215,41 @@ class LiveEngine:
         while self._running:
             src = self.source
             item = src.latest() if src else None
-            if item is None or item[2] == self._last_seq:
+            if src is None or item is None or item[2] == self._last_seq:
                 time.sleep(0.004)
                 continue
-            bgr, ts, seq, truth = item
+            bgr, _ts, seq, truth = item
             self._last_seq = seq
             with self._lock:
-                self._process(bgr, truth, src.fps, fps_proc, seq)
+                try:
+                    self._process(bgr, truth, src.fps, fps_proc, seq)
+                except (
+                    ValueError,
+                    RuntimeError,
+                    AttributeError,
+                    TypeError,
+                    ArithmeticError,
+                    LookupError,
+                    cv2.error,
+                    OSError,
+                ) as exc:
+                    msg = f"{type(exc).__name__}: {exc}"
+                    self.log(f"worker error: {msg}", seq)
+                    snap = self._snap
+                    self._snap = Snapshot(
+                        preview=snap.preview,
+                        state=snap.state,
+                        fps_in=src.fps,
+                        fps_proc=fps_proc,
+                        frame_shape=snap.frame_shape,
+                        mosaic_version=snap.mosaic_version,
+                        mosaic_lost=snap.mosaic_lost,
+                        dwell_frames=snap.dwell_frames,
+                        seq=seq,
+                        mosaic_xy=snap.mosaic_xy,
+                        preview_shape=snap.preview_shape,
+                        worker_error=msg,
+                    )
             n += 1
             if time.perf_counter() - t0 > 1:
                 fps_proc, t0, n = n / (time.perf_counter() - t0), time.perf_counter(), 0
@@ -250,7 +280,7 @@ class LiveEngine:
         full_u8 = np.clip(corr + 0.5, 0, 255).astype(np.uint8)
         h, w = raw.shape
         pw = min(PREVIEW_W, w)
-        prev = cv2.resize(corr, (pw, int(round(h * pw / w))), interpolation=cv2.INTER_AREA) if pw < w else corr
+        prev = cv2.resize(corr, (pw, round(h * pw / w)), interpolation=cv2.INTER_AREA) if pw < w else corr
 
         while self._pending_patches:
             pose, e, hp, zu = self._pending_patches.pop(0)
@@ -327,7 +357,7 @@ class LiveEngine:
                 self._sweep, self._sweep_z, self._sweep_indices = [], [], []
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
-            if ev.kind == "objective_change" and self.on_objective_hint:
+            if ev.kind == "objective_change" and self.on_objective_hint is not None:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
         self._preroll.append((full_u8, z_true, tiles))
         if self._held is not None and (seq > self._held[5] or state == State.PAN):

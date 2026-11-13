@@ -61,11 +61,11 @@ class ObjectiveCalibration:
 
 def radiometric_key(shape: tuple[int, int], exposure: float | None) -> str:
     h, w = shape[:2]
-    return f"{w}x{h}@{'auto' if exposure is None else int(round(exposure))}"
+    return f"{w}x{h}@{'auto' if exposure is None else round(exposure)}"
 
 
 def today() -> str:
-    return datetime.date.today().isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().date().isoformat()
 
 
 class CalibrationStore:
@@ -153,6 +153,7 @@ class RadiometricCorrector:
             gain = None
             if self.flat is not None:
                 flat = fit(self.flat)
+                assert flat is not None
                 signal = flat - (dark if dark is not None else 0.0)
                 signal = np.maximum(signal, 1.0)
                 gain = (float(np.mean(signal)) / signal).astype(np.float32)

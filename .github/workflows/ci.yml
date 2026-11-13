@@ -22,9 +22,11 @@ jobs:
       - name: Qt runtime libraries (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0
-      - name: Lint
-        run: uvx ruff check --select F,E9 microtopos tests
-      - name: Type checking (MyPy)
-        run: uv run --python 3.12 --group dev mypy microtopos/logging.py microtopos/validation.py microtopos/mosaic.py
+      - name: Lint (Ruff full suite)
+        run: uvx ruff check microtopos tests
+      - name: Type checking (MyPy full repo)
+        run: uv run --python 3.12 --group dev mypy microtopos tests
+      - name: Type checking (Pyright full repo)
+        run: uvx pyright microtopos tests
       - name: Tests (ground-truth self-tests, scientific regressions and offscreen GUI smoke test)
         run: uv run --python 3.12 --group dev pytest -q

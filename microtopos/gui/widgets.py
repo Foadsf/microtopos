@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QRectF, Qt, QTimer
@@ -17,7 +19,7 @@ class Chip(QLabel):
         super().__init__(text)
         self.kind = kind
         self.tokens = tokens or {}
-        self.setAlignment(Qt.AlignCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._apply()
 
     def set(self, text: str, kind: str | None = None, tip: str | None = None):
@@ -50,12 +52,14 @@ class Toast(QLabel):
         super().__init__(parent)
         self.tokens = tokens
         self.setWordWrap(True)
-        self.setAlignment(Qt.AlignCenter)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hide()
         self._fx = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._fx)
         self._anim = QPropertyAnimation(self._fx, b"opacity", self)
-        self._timer = QTimer(self, singleShot=True, timeout=self._fade)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._fade)
         self._anim.finished.connect(self._done)
 
     def show_message(self, text: str, kind: str = "info", ms: int = 3500):
@@ -65,6 +69,8 @@ class Toast(QLabel):
                            f" border-left: 4px solid {col}; border-radius: {RADIUS}px; padding: 10px 16px;")
         self.setText(text)
         p = self.parentWidget()
+        if p is None:
+            return
         w = min(560, p.width() - 40)
         self.setFixedWidth(w)
         self.adjustSize()
@@ -79,7 +85,7 @@ class Toast(QLabel):
         self._anim.setDuration(600)
         self._anim.setStartValue(1.0)
         self._anim.setEndValue(0.0)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.start()
 
     def _done(self):
@@ -102,19 +108,25 @@ class Banner(QWidget):
         lay.addLayout(self.buttons_box)
         self.hide()
 
-    def ask(self, text: str, actions: list[tuple[str, callable]], kind: str = "warning"):
+    def ask(self, text: str, actions: list[tuple[str, Callable[[], object]]], kind: str = "warning"):
         t = self.tokens
         col = t.get(kind, t["warning"])
         self.setStyleSheet(f"background: {t['elevated']}; border: 1px solid {col}; border-radius: {RADIUS}px;")
         self.label.setText(text)
         while self.buttons_box.count():
-            w = self.buttons_box.takeAt(0).widget()
-            if w:
+            item = self.buttons_box.takeAt(0)
+            w = item.widget() if item is not None else None
+            if w is not None:
                 w.deleteLater()
         for label, fn in actions:
             b = QPushButton(label)
-            b.setFocusPolicy(Qt.TabFocus)
-            b.clicked.connect(lambda _=False, f=fn: (self.hide(), f()))
+            b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+
+            def _trigger(_checked: bool = False, f: Callable[[], object] = fn) -> None:
+                self.hide()
+                f()
+
+            b.clicked.connect(_trigger)
             self.buttons_box.addWidget(b)
         self.show()
 
@@ -143,18 +155,19 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.overlay = pg.ImageItem()
         self.overlay.setZValue(5)
         self.overlay.setParentItem(self.group)
-        self.bar = None
+        self.bar: pg.ColorBarItem | None = None
         if colorbar_label is not None:
-            self.bar = pg.ColorBarItem(colorMap=pg.colormap.get(cmap), label=colorbar_label, interactive=False, width=14)
-            self.bar.setImageItem(self.img, insert_in=self.plot)
+            bar = pg.ColorBarItem(colorMap=pg.colormap.get(cmap), label=colorbar_label, interactive=False, width=14)
+            bar.setImageItem(self.img, insert_in=self.plot)
+            self.bar = bar
         self.empty = pg.TextItem(empty_text, anchor=(0.5, 0.5))
         self.plot.addItem(self.empty)
         self.readout = pg.TextItem("", anchor=(0, 0))
         self.readout.setZValue(10)
         self.readout.hide()  # its filled background would show as a small box while empty
         self.plot.addItem(self.readout)
-        self.data = None
-        self.extra = None  # optional second layer for readout (e.g. confidence)
+        self.data: np.ndarray | None = None
+        self.extra: np.ndarray | None = None  # optional second layer for readout (e.g. confidence)
         self.um_per_px = 1.0
         self.unit = ""
         self.scene().sigMouseMoved.connect(self._moved)

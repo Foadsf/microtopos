@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+
 import cv2
+import numpy as np
 from hypothesis import given, settings
 from hypothesis import strategies as st
-import numpy as np
 
 from microtopos.mosaic import BacklashModel, PoseGraph, sharpness_score
 from microtopos.validation import parse_crop

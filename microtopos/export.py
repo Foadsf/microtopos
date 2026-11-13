@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 import tifffile
 
+
 def write_gwyddion_gsf(
     filepath: Path | str,
     height_map: np.ndarray,
@@ -99,8 +100,8 @@ def write_binary_stl(
     z_clean = np.where(valid, height_map, fill).astype(np.float32)
 
     scale = min(1.0, float(max_grid_dim) / float(max(h, w)))
-    gh = max(4, int(round(h * scale)))
-    gw = max(4, int(round(w * scale)))
+    gh = max(4, round(h * scale))
+    gw = max(4, round(w * scale))
     z_mesh = cv2.resize(z_clean, (gw, gh), interpolation=cv2.INTER_AREA) if (gh, gw) != (h, w) else z_clean
 
     # Rescale dx and dy so total physical span (w - 1)*pixel_um is preserved!

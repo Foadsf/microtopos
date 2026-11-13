@@ -41,10 +41,10 @@ def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, 
                 i2[:, -2:] = img[:, -1:]
             elif img.shape[1] > 1:
                 i2[:, :] = img[:, -1:]
-            return np.maximum(p1 - _box(img * i2, window), 0.0)
+            return np.asarray(np.maximum(p1 - _box(img * i2, window), 0.0), dtype=np.float32)
         # F5 = sum I(x)I(x+1) - N * mean(I)^2  (local version)
         m = _box(img, window)
-        return np.maximum(p1 - m * m, 0.0)
+        return np.asarray(np.maximum(p1 - m * m, 0.0), dtype=np.float32)
     raise ValueError(f"unknown focus measure {measure!r}")
 
 

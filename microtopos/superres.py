@@ -90,7 +90,7 @@ def drizzle(frames: list[np.ndarray], shifts: list[tuple[float, float]], scale: 
         y0, y1 = cy - hx, cy + hx
         jx0 = np.floor(x0 + 0.5).astype(int)
         jy0 = np.floor(y0 + 0.5).astype(int)
-        span = int(math.ceil(2 * hx)) + 1
+        span = math.ceil(2 * hx) + 1
         vals = f.astype(np.float64).ravel()
         for oy in range(span):
             jy = jy0 + oy
@@ -129,16 +129,22 @@ def richardson_lucy(obs: np.ndarray, sigma_px: float, noise_sigma: float, max_it
 def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2, pixfrac: float = 0.7,
                    deconvolve: bool = True) -> dict:
     ref = frames[0].astype(np.float32)
-    # ECC translation (sub-pixel, unbiased) initialised by phase correlation; content shift = warp translation
-    shifts = [(0.0, 0.0)] + [tuple(float(v) for v in register_pair(ref, f.astype(np.float32), 1).warp[:, 2])
-                             for f in frames[1:]]
-    driz, cover = drizzle(frames, shifts, scale, pixfrac)
-    sigma_lr, src = fit_edge_psf_sigma(np.mean(frames, axis=0), psf_sigma_lr)
+    # ECC translation (sub-pixel, unbiased) initialised by phase correlation; keep only valid registrations (F05)
+    used_frames: list[np.ndarray] = [frames[0]]
+    shifts: list[tuple[float, float]] = [(0.0, 0.0)]
+    for f in frames[1:]:
+        reg = register_pair(ref, f.astype(np.float32), 1)
+        if reg.ok:
+            used_frames.append(f)
+            shifts.append((float(reg.warp[0, 2]), float(reg.warp[1, 2])))
+    driz, cover = drizzle(used_frames, shifts, scale, pixfrac)
+    sigma_lr, src = fit_edge_psf_sigma(np.mean(used_frames, axis=0), psf_sigma_lr)
     out, iters = driz, 0
     noise = immerkaer_sigma(driz)
     if deconvolve:
         # the drizzled image is blurred by the optics (sigma_lr*scale) and by the drop (pixfrac*scale box)
         sig_hr = math.sqrt((sigma_lr * scale) ** 2 + (pixfrac * scale) ** 2 / 12.0)
         out, iters = richardson_lucy(driz, sig_hr, noise)  # stops at the noise level or after 30 iterations
-    return {"image": out, "drizzled": driz, "shifts": shifts, "psf_sigma_lr": sigma_lr, "psf_source": src,
+    return {"image": out, "drizzled": driz, "shifts": shifts, "frames_used": len(used_frames),
+            "psf_sigma_lr": sigma_lr, "psf_source": src,
             "rl_iterations": iters, "noise_sigma": noise, "coverage_min": float(cover.min())}

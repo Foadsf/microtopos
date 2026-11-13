@@ -7,6 +7,7 @@ causes a backlog, it just skips frames. `latest()` returns (frame_bgr, timestamp
 from __future__ import annotations
 
 import glob
+import logging
 import math
 import os
 import re
@@ -16,9 +17,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
-import logging
 import numpy as np
 
 from .optics import Objective
@@ -41,7 +42,8 @@ def list_cameras() -> list[CameraInfo]:
         for dev in sorted(glob.glob("/dev/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0)):
             idx = int(re.sub(r"\D", "", dev))
             try:
-                name = open(f"/sys/class/video4linux/video{idx}/name").read().strip()
+                with open(f"/sys/class/video4linux/video{idx}/name", encoding="utf-8") as fh:
+                    name = fh.read().strip()
             except OSError as exc:
                 logger.debug("Could not read sysfs name for video%d: %s", idx, exc)
                 name = dev
@@ -60,8 +62,13 @@ def list_cameras() -> list[CameraInfo]:
 def _v4l2_is_capture(dev: str) -> bool:
     if shutil.which("v4l2-ctl"):
         try:
-            out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
-                                 timeout=3).stdout
+            out = subprocess.run(
+                ["v4l2-ctl", "-d", dev, "--list-formats"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            ).stdout
             return "[0]:" in out
         except (subprocess.SubprocessError, OSError) as exc:
             logger.debug("v4l2-ctl probe failed for %s: %s", dev, exc)
@@ -79,8 +86,13 @@ class V4L2Controls:
     def list(self) -> dict[str, dict]:
         if not self.available:
             return {}
-        out = subprocess.run(["v4l2-ctl", "-d", self.path, "--list-ctrls"], capture_output=True, text=True,
-                             timeout=3).stdout
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", self.path, "--list-ctrls"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        ).stdout
         ctrls = {}
         for line in out.splitlines():
             m = re.match(r"\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)", line)
@@ -95,9 +107,19 @@ class V4L2Controls:
         if not self.available:
             return {}
         for k, v in values.items():
-            subprocess.run(["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"], capture_output=True, timeout=3)
+            subprocess.run(
+                ["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
         cur = self.list()
-        return {k: cur.get(k, {}).get("value") for k in values}
+        out: dict[str, int] = {}
+        for k in values:
+            val = cur.get(k, {}).get("value")
+            if isinstance(val, int):
+                out[k] = val
+        return out
 
 
 class FrameSource:
@@ -142,13 +164,18 @@ class CameraSource(FrameSource):
         self.req = (width, height, fps)
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
+        self.rec_dir: Path | None = None
+        self.rec_stamps: list[float] = []
+        self.rec_t0: float = 0.0
+        self.recording: bool = False
 
     def open(self) -> cv2.VideoCapture:
         api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else (cv2.CAP_DSHOW if sys.platform.startswith("win32") else cv2.CAP_ANY)
         cap = cv2.VideoCapture(self.info.index, api)
         if not cap.isOpened():
             raise RuntimeError(f"cannot open camera {self.info.name}")
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        fourcc_fn = cv2.VideoWriter_fourcc  # type: ignore[attr-defined]
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc_fn(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req[1])
         cap.set(cv2.CAP_PROP_FPS, self.req[2])
@@ -218,22 +245,21 @@ class CameraSource(FrameSource):
         return {}
 
     def start_recording(self, folder) -> None:
-        """Save every raw MJPEG frame (exact camera bytes) plus timestamps; replay with --replay."""
-        from pathlib import Path
-
+        """Save every frame (raw MJPEG bytes when available, else software-encoded JPEG) plus timestamps."""
         self.rec_dir = Path(folder)
         self.rec_dir.mkdir(parents=True, exist_ok=True)
-        self.rec_stamps, self.rec_t0 = [], time.perf_counter()
+        self.rec_stamps = []
+        self.rec_t0 = time.perf_counter()
         self.recording = True
 
     def stop_recording(self) -> int:
         import json
 
         self.recording = False
-        n = len(getattr(self, "rec_stamps", []))
-        if n:
+        n = len(self.rec_stamps)
+        if n and self.rec_dir is not None:
             meta = {"camera": self.info.name, "readback": self.readback, "timestamps": self.rec_stamps}
-            (self.rec_dir / "frames.json").write_text(json.dumps(meta, indent=1))
+            (self.rec_dir / "frames.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
         return n
 
     def _run(self):
@@ -243,7 +269,6 @@ class CameraSource(FrameSource):
             self.error = str(e)
             return
         cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # receive MJPEG bytes; decode here (and record them if asked)
-        self.recording = False
         t0, n, n_total = time.perf_counter(), 0, 0
         last_ok = time.perf_counter()
         while self._running:
@@ -268,19 +293,31 @@ class CameraSource(FrameSource):
                 self._apply_pending = False
                 try:
                     self.applied = self._apply_controls(cap)
-                except Exception as e:  # a missing control must not stop the stream
+                except (cv2.error, RuntimeError, ValueError, OSError) as e:  # a missing control must not stop the stream
                     logger.warning("Failed setting camera control on %s: %s", self.info.name, e)
                     self.applied = {"error": str(e)}
             n_total += 1
+            jpeg_bytes: bytes | None = None
             if raw.ndim == 3:  # backend already decoded
                 frame = raw
+                if self.recording:
+                    ok_enc, enc = cv2.imencode(".jpg", frame)
+                    if ok_enc:
+                        jpeg_bytes = enc.tobytes()
             else:
                 frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
-                if self.recording:
-                    (self.rec_dir / f"{len(self.rec_stamps):06d}.jpg").write_bytes(raw.tobytes())
+                raw_bytes = raw.tobytes()
+                if self.recording and raw_bytes[:2] == b"\xff\xd8":
+                    jpeg_bytes = raw_bytes
+            if self.recording and jpeg_bytes is not None and self.rec_dir is not None:
+                try:
+                    (self.rec_dir / f"{len(self.rec_stamps):06d}.jpg").write_bytes(jpeg_bytes)
                     self.rec_stamps.append(round(time.perf_counter() - self.rec_t0, 4))
+                except OSError as exc:
+                    self.error = f"Recording write failed: {exc}"
+                    self.recording = False
             self._publish(frame)
             n += 1
             dt = time.perf_counter() - t0
@@ -327,10 +364,13 @@ class SimulatorSource(FrameSource):
             zs = s.sweep_trajectory(reversal=reversal)
             # move to the start smoothly (as a hand would), pause briefly, then sweep
             approach = np.linspace(s.focus_z_um, zs[0], 25)
-            p = lambda z: (s.stage_x_um, s.stage_y_um, float(z))  # noqa: E731
+
+            def p(z: float) -> tuple[float, float, float]:
+                return (s.stage_x_um, s.stage_y_um, float(z))
+
             back = np.linspace(zs[-1], self._best_focus(), 30)  # refocus afterwards, as a user would
-            self.script = [p(z) for z in approach] + [p(zs[0])] * 6 + [p(z) for z in zs] + [p(zs[-1])] * 25 \
-                + [p(z) for z in back]
+            self.script = [p(float(z)) for z in approach] + [p(float(zs[0]))] * 6 + [p(float(z)) for z in zs] + [p(float(zs[-1]))] * 25 \
+                + [p(float(z)) for z in back]
 
     def busy(self) -> bool:
         return bool(self.script)

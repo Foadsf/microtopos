@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import collections
-from contextlib import contextmanager
 import json
 import logging
 import platform
 import sys
 import time
-from pathlib import Path
 import uuid
 import zipfile
+from contextlib import contextmanager
+from pathlib import Path
 
 # Canonical human log format: timestamp, level, logger, function:line, message
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s"
@@ -24,7 +24,6 @@ _CURRENT_RUN_ID: str = uuid.uuid4().hex[:8]
 
 def get_run_id() -> str:
     """Return the current operation/session run ID."""
-    global _CURRENT_RUN_ID
     return _CURRENT_RUN_ID
 
 
@@ -42,7 +41,7 @@ class RingBufferHandler(logging.Handler):
         try:
             msg = self.format(record)
             _RING_BUFFER.append(msg)
-        except Exception:
+        except (TypeError, ValueError, RuntimeError):
             self.handleError(record)
 
 
@@ -172,7 +171,7 @@ def log_environment(logger: logging.Logger | None = None) -> dict[str, str]:
     try:
         from . import __version__ as mt_ver
         versions["microtopos"] = mt_ver
-    except Exception:
+    except (ImportError, AttributeError):
         versions["microtopos"] = "unknown"
 
     log.info(
@@ -223,7 +222,7 @@ def create_diagnostic_bundle(out_path: Path | str | None = None) -> Path:
     if cal_file.exists():
         try:
             calibration_data = json.loads(cal_file.read_text(encoding="utf-8"))
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             calibration_data = {"error": f"Failed to read calibration: {exc}"}
 
     with zipfile.ZipFile(target_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:

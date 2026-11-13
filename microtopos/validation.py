@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 import math
-from typing import Tuple
+
 import numpy as np
 
 
-def parse_crop(value: str) -> Tuple[int, int, int, int]:
+def parse_crop(value: str) -> tuple[int, int, int, int]:
     """Parse and strictly validate a crop specification in 'x,y,w,h' format.
 
     Raises argparse.ArgumentTypeError with an informative message if validation fails.
@@ -95,7 +95,4 @@ def validate_warp_matrix(W: np.ndarray, max_translation: float = 1000.0) -> bool
 
     # Check translation magnitudes
     tx, ty = float(W[0, 2]), float(W[1, 2])
-    if math.hypot(tx, ty) > max_translation:
-        return False
-
-    return True
+    return math.hypot(tx, ty) <= max_translation

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -28,7 +29,7 @@ from .registration import phase_shift, register_pair, register_sweep, warp_scale
 from .simulator import SpecimenSimulator
 from .superres import dwell_superres
 
-THRESH = {
+THRESH: dict[str, Any] = {
     "geom_offset_px": 0.05,
     "geom_r": 0.99,
     "reg_shift_rms_px": 0.25,
@@ -109,7 +110,7 @@ def check_registration(seed):
     sim = SpecimenSimulator(seed, OBJECTIVES["40x / 0.85"])
     zs = sim.sweep_trajectory()
     fr, tr = _frames(sim, zs)
-    warps, pairs = register_sweep(fr, factor=2)
+    warps, _pairs = register_sweep(fr, factor=2)
     ref = len(fr) // 2
     errs, serr = [], []
     for W, t in zip(warps, tr):
@@ -171,8 +172,8 @@ def check_hand_sweep(seed):
     err = (est / true_step - 1) * 100 if est else float("nan")
     return [("hand sweep (z unknown): rank correlation", seed, f"{rho:.3f}", f">= {THRESH['rank_r']}",
              rho >= THRESH["rank_r"]),
-            ("DOF ruler (experimental): um/frame error", seed, f"{err:+.0f}% (est {est or float('nan'):.3f}, "
-             f"true mean {true_step:.3f})", "info", None)]
+            ("DOF ruler (experimental): um/frame error", seed,
+             f"{err:+.0f}% (est {est or float('nan'):.3f}, true mean {true_step:.3f})", "info", None)]
 
 
 def check_reversal(seed):
@@ -290,7 +291,7 @@ def check_fast_pan(seed, speeds=(30, 60)):
         n = int(2.5 * sim.out_w / v)
         xs = list(np.zeros(15)) + list(np.arange(1, n + 1) * v) + [n * v] * 20
         for i, xp in enumerate(xs):
-            vel = (xs[i] - xs[i - 1]) if i else 0.0
+            vel = (xp - xs[i - 1]) if i else 0.0
             sim.stage_x_um = xp * sim.um_per_px
             luma = bgr_to_luma(sim.render(motion_px=(-0.4 * vel, 0.0))[0])
             st, _, ev = sm.update(luma)
@@ -368,7 +369,9 @@ def check_height_mosaic(seed):
     m._add_keyframe(b_alb, m._bp(b_alb), 1.0, float(shift_px), 0.0, 0, (float(shift_px), 0.0))
     m.add_height_patch(0.0, 0.0, a_alb, a_h, "um")
     m.add_height_patch(float(shift_px), 0.0, b_alb, b_h + 3.0, "um")
-    hm, (x0, _) = m.height_mosaic()
+    res_hm = m.height_mosaic()
+    assert res_hm is not None
+    hm, (x0, _) = res_hm
     ov = slice(shift_px - x0, fov_px - x0)
     # in the overlap both patches see the same surface: after levelling, the patch-to-patch step must vanish
     step = abs((m.patches[1].offset + 3.0) - m.patches[0].offset)
@@ -419,6 +422,7 @@ def check_metrology_extra(seed):
     a_sl = 0.3
     plane = (np.arange(200)[None, :] * a_sl * 0.5 + np.zeros((100, 1))).astype(np.float32)
     sdr = metrology.developed_area_ratio(plane, 0.5)
+    assert sdr is not None
     exact = (math.sqrt(1 + a_sl**2) - 1) * 100
     rows.append(("Sdr on a tilted plane (triangulated)", seed, f"{sdr:.4f} vs {exact:.4f} %", "rel. error < 1e-3",
                  abs(sdr - exact) / exact < 1e-3))
@@ -637,7 +641,7 @@ def check_real_recording(folder: str) -> list:
     slope = float(np.polyfit(relief[c][v], h[c][v], 1)[0])
     rows.append(("real texture: depth Pearson r / slope", 0, f"{r:.4f} / {slope:.3f} ({v.mean():.0%} valid)",
                  f">= {THRESH['sff_r']} / 1 +/- {THRESH['sff_slope_tol']}",
-                 r >= THRESH["sff_r"] and abs(slope - 1) <= THRESH["sff_slope_tol"]))
+                 r >= float(THRESH["sff_r"]) and abs(slope - 1) <= float(THRESH["sff_slope_tol"])))
     return rows
 
 

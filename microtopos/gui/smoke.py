@@ -48,7 +48,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         try:
             fn()
             log.append(f"ok    {name}")
-        except Exception:
+        except (RuntimeError, ValueError, AssertionError, OSError, TypeError, LookupError, ArithmeticError, AttributeError):
             errors.append(f"{name}: {traceback.format_exc()}")
             log.append(f"ERROR {name}")
 
@@ -69,6 +69,10 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     pump(app, 1)
     step("height history", lambda: w.cmb_hist.setCurrentIndex(w.cmb_hist.count() - 1))
     pump(app, 1)
+    t_pan = time.time()
+    while w.sim_source is not None and w.sim_source.busy() and time.time() - t_pan < 15:
+        pump(app, 0.2)
+    pump(app, 0.5)
     step("sweep with reversal", lambda: w._demo("rev"))
     got2 = wait_result(2)
     log.append(f"{'ok' if got2 else 'FAIL'}    reversal sweep reconstructed")

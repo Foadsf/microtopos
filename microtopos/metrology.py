@@ -114,7 +114,7 @@ def functional_parameters(s: np.ndarray) -> dict:
     z = np.sort(v)[::-1]  # heights from highest to lowest
     n = z.size
     mr = (np.arange(n) + 0.5) / n * 100.0  # material ratio (%) at each sorted height
-    w = int(round(0.4 * n))
+    w = round(0.4 * n)
     i = int(np.argmin(z[: n - w] - z[w:]))
     m1, z1, z2 = mr[i], z[i], z[i + w]
     slope = (z2 - z1) / (mr[i + w] - m1)
@@ -261,13 +261,21 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
     """All surface metrics. Height parameters are withheld when < 30% of pixels have a reliable depth."""
     valid_frac = float(np.mean(np.isfinite(height)))
     lam_s = lateral_cutoff_um if lam_s_um is None else lam_s_um
-    res = {"valid_fraction": valid_frac, "um_per_px": um_per_px, "z_unit": z_unit, "lambda_s_um": lam_s,
-           "lambda_c_um": lam_c_um, "form_order": form_order, "warnings": []}
+    warns: list[str] = []
+    res: dict[str, object] = {
+        "valid_fraction": valid_frac,
+        "um_per_px": um_per_px,
+        "z_unit": z_unit,
+        "lambda_s_um": lam_s,
+        "lambda_c_um": lam_c_um,
+        "form_order": form_order,
+        "warnings": warns,
+    }
     s = sl_surface(height, um_per_px, form_order, lam_s, lam_c_um)
     res["sl_surface"] = s
     if valid_frac < MIN_VALID_FRACTION:
-        res["warnings"].append(f"Only {valid_frac:.0%} of pixels have a reliable depth (< {MIN_VALID_FRACTION:.0%}); "
-                               "height parameters withheld. Needs more texture, light or a wider focus sweep.")
+        warns.append(f"Only {valid_frac:.0%} of pixels have a reliable depth (< {MIN_VALID_FRACTION:.0%}); "
+                     "height parameters withheld. Needs more texture, light or a wider focus sweep.")
     else:
         res.update(height_parameters(s, um_per_px))
         res.update(functional_parameters(s))

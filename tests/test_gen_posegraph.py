@@ -76,14 +76,12 @@ def _outlier(shape, seeds):
     assert max(worst) <= 1.5, f"{shape}: max error per seed {np.round(worst, 2).tolist()}"
 
 
-@pytest.mark.xfail(strict=True, reason=_OUTLIER)
 @pytest.mark.parametrize("shape", SHAPES, ids=str)
 def test_relax_survives_one_false_loop_edge(shape):
     _outlier(shape, seeds=range(1, 5))
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=_OUTLIER)
 @pytest.mark.parametrize("shape", SHAPES, ids=str)
 def test_relax_survives_one_false_loop_edge_full(shape):
     _outlier(shape, seeds=range(1, 21))

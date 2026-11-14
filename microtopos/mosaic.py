@@ -297,34 +297,61 @@ class Mosaic:
         self.edges += new
         self._relax()
 
+    # Robust pose graph (Mosaic._relax). Residual scale floor: an edge is only down-weighted when it disagrees with
+    # the graph by more than registration error can explain, even when the graph is so consistent that the measured
+    # residual scale is smaller. Accepted _match results over the accuracy matrix (tests/test_gen_registration.py)
+    # are within 0.26 px of the truth for pure translations (+3 DOF defocus, the worst) and within 0.48 px under
+    # 1 deg rotation or 1.02 scale, so sigma >= 0.5 px: with the Cauchy constant an edge 1.2 px off keeps half its
+    # weight. A false loop edge that passes _loop_closure's gate can be anything up to 24 px off.
+    RELAX_SIGMA_FLOOR = 0.5
+    RELAX_ITERS = 10
+
     def _relax(self) -> None:
-        """Least-squares pose graph: one sparse factorisation solves x and y.
+        """Robust least-squares pose graph: iteratively reweighted least squares with Cauchy weights on the edges.
 
         Row weights multiply residuals, so an edge of weight w enters the objective as w^2. A weak prior on every
         node's current position keeps unconnected areas where they are and fixes the gauge freedom of each
-        connected component (keyframe 0 gets a strong prior).
+        connected component (keyframe 0 gets a strong prior). Plain least squares spreads a false loop edge (one
+        that passed the NCC and 10 %-of-frame gates) over the whole graph; after the first solve every edge is
+        reweighted by w = 1 / (1 + (r / c)^2) of its residual r, with c = 2.385 sigma (the Cauchy constant with
+        95 % efficiency for Gaussian residuals) and sigma the robust residual scale (median / 1.1774 for 2-D
+        Gaussian residual lengths), never below RELAX_SIGMA_FLOOR. Consistent edges keep weight ~1, so the clean
+        solution is the least-squares one; an edge many sigma off loses its influence instead of bending the graph.
         """
         from scipy.sparse import coo_matrix
         from scipy.sparse.linalg import splu
 
         n = len(self.keyframes)
         m = len(self.edges)
-        ri, ci, vals = [], [], []
-        bx = np.zeros(n + m)
-        by = np.zeros(n + m)
-        for i, k in enumerate(self.keyframes):
-            wp = 10.0 if i == 0 else 0.01
-            ri.append(i), ci.append(i), vals.append(wp)
-            bx[i], by[i] = wp * k.x, wp * k.y
-        for r, (i, j, ex, ey, wt) in enumerate(self.edges, n):
-            ri += [r, r]
-            ci += [i, j]
-            vals += [-wt, wt]
-            bx[r], by[r] = wt * ex, wt * ey
-        A = coo_matrix((vals, (ri, ci)), shape=(n + m, n)).tocsc()
-        lu = splu((A.T @ A).tocsc())
-        sx = lu.solve(A.T @ bx)
-        sy = lu.solve(A.T @ by)
+        E = np.array([(i, j, ex, ey, wt) for i, j, ex, ey, wt in self.edges], np.float64).reshape(m, 5)
+        ii, jj = E[:, 0].astype(int), E[:, 1].astype(int)
+        wp = np.full(n, 0.01)
+        wp[0] = 10.0
+        px = np.array([k.x for k in self.keyframes])
+        py = np.array([k.y for k in self.keyframes])
+        rows = np.concatenate([np.arange(n), np.repeat(np.arange(n, n + m), 2)])
+        cols = np.concatenate([np.arange(n), np.stack([ii, jj], 1).ravel()])
+
+        def solve(rw):
+            w = E[:, 4] * rw
+            vals = np.concatenate([wp, np.stack([-w, w], 1).ravel()])
+            A = coo_matrix((vals, (rows, cols)), shape=(n + m, n)).tocsc()
+            bx = np.concatenate([wp * px, w * E[:, 2]])
+            by = np.concatenate([wp * py, w * E[:, 3]])
+            lu = splu((A.T @ A).tocsc())
+            return lu.solve(A.T @ bx), lu.solve(A.T @ by)
+
+        rw = np.ones(m)
+        sx, sy = solve(rw)
+        for _ in range(self.RELAX_ITERS if m else 0):
+            r = np.hypot(sx[jj] - sx[ii] - E[:, 2], sy[jj] - sy[ii] - E[:, 3])
+            sigma = max(float(np.median(r)) / 1.1774, self.RELAX_SIGMA_FLOOR)
+            new = 1.0 / (1.0 + (r / (2.385 * sigma)) ** 2)
+            done = np.max(np.abs(np.sqrt(new) - rw)) < 1e-3
+            rw = np.sqrt(new)  # row weight: the squared residual is weighted by w
+            sx, sy = solve(rw)
+            if done:
+                break
         corr = max(math.hypot(k.x - x, k.y - y) for k, x, y in zip(self.keyframes, sx, sy))
         if corr < 0.5:
             return

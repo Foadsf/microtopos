@@ -31,7 +31,8 @@ from ..objectives import resolve, resolve_result
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
 from .objectives_dialog import ObjectivesDialog
-from .widgets import Banner, Chip, FlowWidget, ImagePanel, Toast, section
+from .widgets import (DARK_P99_DN, Banner, Chip, FlowWidget, ImagePanel, Toast, frame_percentile, section,
+                      stretch_levels)
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -347,6 +348,14 @@ class MainWindow(QMainWindow):
         self.chk_zebra.setToolTip("Magenta stripes where the image is saturated (≥ 250): lower the exposure there")
         self.chk_zebra.setChecked(True)
         h.addWidget(self.chk_zebra)
+        self.chk_stretch = QCheckBox("Stretch brightness")
+        self.chk_stretch.setToolTip("Display only: spreads a dim image's own brightness range over the full grey scale "
+                                    "so you can see it. The recorded frames, measurements and the cursor readout keep "
+                                    "the camera's real values; a dim image still gives noisy heights, so fix the light")
+        self.chk_stretch.setChecked(self.settings.value("live_stretch", False, type=bool))
+        self.chk_stretch.toggled.connect(lambda on: self.settings.setValue("live_stretch", on))
+        self._stretch = None
+        h.addWidget(self.chk_stretch)
         self.btn_rec = QPushButton("● Record raw stream")
         self.btn_rec.setCheckable(True)
         self.btn_rec.setFocusPolicy(Qt.TabFocus)
@@ -1321,6 +1330,15 @@ class MainWindow(QMainWindow):
                               " (new sweeps in camera frames)") + (f" ({c.z_date})" if c.z_date else ""))
 
     # ================================================================== live tick
+    def _brightness_note(self, preview: np.ndarray) -> str:
+        """Live-label suffix: says when the display is stretched, and warns when the camera image is very dark."""
+        if self._stretch is not None:
+            return f" · display stretched {self._stretch[0]:.0f}–{self._stretch[1]:.0f} DN"
+        p99 = frame_percentile(preview, 99)
+        if p99 < DARK_P99_DN:
+            return f" · very dark image (99 % of pixels ≤ {p99:.0f} DN): check the lamp, or tick Stretch brightness"
+        return ""
+
     def _tick(self):
         s = self.engine.snapshot()
         if s.preview is None:
@@ -1330,7 +1348,13 @@ class MainWindow(QMainWindow):
         pw = s.preview.shape[1]
         um_prev = self.obj.nominal_um_per_px(pw) if self.sim_source is not None else cal.um_per_px(pw)
         self.um_preview = um_prev
-        self.p_live.set_image(s.preview, um_prev, levels=(0, 255), unit="DN")
+        if self.chk_stretch.isChecked():
+            self._stretch = stretch_levels(s.preview, self._stretch)
+            levels = self._stretch
+        else:
+            self._stretch = None
+            levels = (0, 255)
+        self.p_live.set_image(s.preview, um_prev, levels=levels, unit="DN")
         ov = None
         if self.chk_focus.isChecked() and s.in_focus is not None:
             r, g, b = hex_rgb(self.t["overlay_focus"])
@@ -1386,7 +1410,8 @@ class MainWindow(QMainWindow):
             self.notify(self.engine.calib_error, "warning")
         self.lbl_live.setText((f"● REC {self.source.rec_frames} frames · " if rec else "") +
                               f"{s.frame_shape[1]}×{s.frame_shape[0]} capture · preview {um_prev:.3f} µm/px · "
-                              f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}")
+                              f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}"
+                              + self._brightness_note(s.preview))
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))
         if s.brenner_hist:

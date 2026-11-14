@@ -9,6 +9,33 @@ from PySide6.QtWidgets import QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPush
 
 from .theme import RADIUS, hex_rgb
 
+STRETCH_LO_PCT, STRETCH_HI_PCT = 0.5, 99.7
+STRETCH_MIN_SPAN = 4.0  # DN: never stretch a flat frame's noise to full contrast
+STRETCH_SMOOTH = 0.3  # weight of the new frame, so the brightness does not flicker frame to frame
+DARK_P99_DN = 40.0  # below this the live image looks black on a 0-255 display
+
+
+def frame_percentile(img: np.ndarray, pct: float) -> float:
+    """Percentile of the finite pixels, on a subsample (the live preview is redrawn several times a second)."""
+    step = max(1, int(np.sqrt(img.size / 40000)))
+    v = img[::step, ::step]
+    v = v[np.isfinite(v)]
+    return float(np.percentile(v, pct)) if v.size else 0.0
+
+
+def stretch_levels(img: np.ndarray, previous: tuple[float, float] | None = None) -> tuple[float, float]:
+    """Display levels (low, high) that spread the frame's own brightness range over the whole grey scale.
+    For display only: the pixel values themselves (and the cursor readout) are unchanged."""
+    lo = frame_percentile(img, STRETCH_LO_PCT)
+    hi = frame_percentile(img, STRETCH_HI_PCT)
+    if hi - lo < STRETCH_MIN_SPAN:
+        lo = max(0.0, 0.5 * (lo + hi) - STRETCH_MIN_SPAN / 2)
+        hi = lo + STRETCH_MIN_SPAN
+    if previous is not None:
+        a = STRETCH_SMOOTH
+        lo, hi = a * lo + (1 - a) * previous[0], a * hi + (1 - a) * previous[1]
+    return lo, hi
+
 
 class Chip(QLabel):
     """A small rounded status label. kind: success | warning | danger | info | neutral."""

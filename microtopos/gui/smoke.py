@@ -10,6 +10,8 @@ import time
 import traceback
 from pathlib import Path
 
+import numpy as np
+
 
 def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -86,6 +88,21 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         w.sp_rot.setValue(0.0)
 
     step("rotate views", rotate)
+
+    def live_stretch():
+        w.tabs.setCurrentIndex(0)
+        w.chk_stretch.setChecked(True)
+        pump(app, 1)
+        lo, hi = w.p_live.img.getLevels()
+        assert w._stretch is not None and (lo, hi) != (0, 255) and hi - lo >= 4, (lo, hi)
+        # display only: the drawn image and the cursor readout's data are the camera values, levels apply at render
+        assert np.array_equal(w.p_live.img.image, w.p_live.data) and w.p_live.data.max() > 1.0
+        assert "display stretched" in w.lbl_live.text(), w.lbl_live.text()
+        w.chk_stretch.setChecked(False)
+        pump(app, 1)
+        assert tuple(w.p_live.img.getLevels()) == (0, 255) and w._stretch is None
+
+    step("live brightness stretch", live_stretch)
     n_before = len(results)
     step("sweep kept, not reconstructed", lambda: (w.chk_autorec.setChecked(False), w._demo("sweep")))
     cap_before, t0 = getattr(w, "last_cap", None), time.time()

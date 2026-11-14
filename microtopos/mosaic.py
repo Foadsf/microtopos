@@ -25,6 +25,9 @@ class Keyframe:
     image: np.ndarray
     sharpness: float
     bp: np.ndarray | None = None
+    # keyframes that show parts of this view more sharply: (x offset, y offset, height, width, grid) relative to this
+    # keyframe, grid = YIELD_GRID x YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0)
+    yields: list = field(default_factory=list)
 
 
 @dataclass
@@ -330,11 +333,78 @@ class Mosaic:
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
         kf = Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16))
+        kf.yields = self._sharper_overlaps(kf)
         self.keyframes.append(kf)
         if parent is not None:
             self.edges.append((parent, len(self.keyframes) - 1, rel[0], rel[1], weight))
         # splat the STORED 8-bit image: a later correction subtracts exactly the same contribution
-        self._splat(kf.image, x, y)
+        self._splat(kf.image, x, y, mask=self._yield_mask(kf))
+
+    @staticmethod
+    def _relative_sharpness(img: np.ndarray) -> float:
+        """Brenner energy per unit variance: sharpness of the same content compared between two frames, independent
+        of exposure and lamp flicker (which scale both by the same gain squared)."""
+        img = img.astype(np.float32)
+        v = float(img.var())
+        return brenner(img) / v if v > 1e-6 else 0.0
+
+    # Sharpness is compared tile by tile (1/8 of the view per axis, >= 1000 pixels at 320 x 240): a revisit defocused
+    # by a fraction of the depth of field is sharper where the surface is higher and blurrier where it is lower, so
+    # one global score can call it equal while it blurs half of the view (measured: a 0.5 DOF revisit scoring 1.005x
+    # the original overall still cut the Laplacian variance of part of the view by 25 %).
+    YIELD_GRID = 8
+
+    def _sharper_overlaps(self, kf: Keyframe) -> list:
+        """Existing keyframes that show a substantial part of kf's view (at least 1/4 of its width and height) more
+        sharply than kf does, with the tiles of kf's view where they do, compared over exactly the same content. A
+        revisit (loop closure, dwelling) may be defocused yet pass the keyframe gate, which compares against recent
+        frames only: it then still adds its pose-graph edges, but it must not blur the sharper view already in the
+        mosaic."""
+        h, w = kf.image.shape
+        g = self.YIELD_GRID
+        xs = np.linspace(0, w, g + 1).astype(int)
+        ys = np.linspace(0, h, g + 1).astype(int)
+        out = []
+        for k in self.keyframes:
+            kh, kw = k.image.shape
+            ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
+            x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
+            if x1 - x0 < w / 4 or y1 - y0 < h / 4:
+                continue
+            grid = np.zeros((g, g), np.float32)
+            for i in range(g):
+                for j in range(g):
+                    ta, tb, la, lb = ys[i], ys[i + 1], xs[j], xs[j + 1]
+                    if ta < y0 or tb > y1 or la < x0 or lb > x1:  # only tiles that both views show entirely
+                        continue
+                    mine = self._relative_sharpness(kf.image[ta:tb, la:lb])
+                    theirs = self._relative_sharpness(k.image[ta - oy:tb - oy, la - ox:lb - ox])
+                    grid[i, j] = float(mine < theirs)
+            if grid.any():
+                out.append((k.x - kf.x, k.y - kf.y, kh, kw, grid))
+        return out
+
+    @staticmethod
+    def _yield_mask(kf: Keyframe) -> np.ndarray | None:
+        """Canvas weight factor of kf: 1 - min(1, 2 f_k) * t_k under every keyframe k that is sharper in some tiles,
+        with f_k that keyframe's own feather and t_k its tile grid interpolated smoothly over kf's view. Wherever k
+        carries at least half of its peak blend weight (its central ~2/3 per axis) and is sharper, kf contributes
+        nothing; only in k's outer band, where k's weight fades out anyway, and between tiles does kf take over,
+        smoothly, so no seam is cut into the canvas. (Yielding in proportion to f_k alone left the revisit half the
+        weight a third of the way in from k's border: held out, a 0.5 DOF revisit still cut the Laplacian variance of
+        the view to 0.74, against 0.88 with the half-weight core.)"""
+        if not kf.yields:
+            return None
+        h, w = kf.image.shape
+        m = np.ones((h, w), np.float32)
+        for dx, dy, kh, kw, grid in kf.yields:
+            ox, oy = int(round(dx)), int(round(dy))
+            x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
+            if x1 > x0 and y1 > y0:
+                t = cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
+                f = np.minimum(1.0, 2.0 * _feather(kh, kw)[y0 - oy:y1 - oy, x0 - ox:x1 - ox])
+                m[y0:y1, x0:x1] *= 1.0 - f * t[y0:y1, x0:x1]
+        return m
 
     def _loop_closure(self, win) -> None:
         """Verified matches between the new keyframe and older overlapping ones become extra pose-graph edges.
@@ -425,9 +495,10 @@ class Mosaic:
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
         for k, x, y in zip(self.keyframes, sx, sy):
             if math.hypot(k.x - x, k.y - y) > 0.5:  # move only what changed: remove old splat, add new
-                self._splat(k.image, k.x, k.y, weight=-1.0)
+                mask = self._yield_mask(k)
+                self._splat(k.image, k.x, k.y, weight=-1.0, mask=mask)
                 k.x, k.y = float(x), float(y)
-                self._splat(k.image, k.x, k.y)
+                self._splat(k.image, k.x, k.y, mask=mask)
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -445,9 +516,11 @@ class Mosaic:
         self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
 
     # ---------------------------------------------------------------- canvas
-    def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0) -> None:
+    def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0, mask: np.ndarray | None = None) -> None:
         h, w = img.shape
         feather = _feather(h, w) * weight
+        if mask is not None:
+            feather = feather * mask
         x0, y0 = int(round(x)), int(round(y))
         t = self.tile
         for ty in range(y0 // t, (y0 + h - 1) // t + 1):

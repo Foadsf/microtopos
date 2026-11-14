@@ -82,10 +82,16 @@ def phase_shift(a: np.ndarray, b: np.ndarray, window: np.ndarray | None = None) 
 
 
 def remove_shading(img: np.ndarray) -> np.ndarray:
-    """Frame minus its frame-scale illumination (Gaussian high-pass, sigma = SHADING_SIGMA_FRACTION x short side)."""
+    """Frame minus its frame-scale illumination: high-pass with three box filters of total variance sigma^2, sigma =
+    SHADING_SIGMA_FRACTION x short side (a Gaussian to within a few %, at a cost independent of sigma). Like any
+    symmetric normalised kernel, it maps a quadratic q to q + const, so quadratic shading is removed exactly."""
     img = img.astype(np.float32)
     s = SHADING_SIGMA_FRACTION * min(img.shape[:2])
-    return img - cv2.GaussianBlur(img, (0, 0), s)
+    k = max(1, int(round(math.sqrt(4 * s * s + 1)))) | 1  # (k^2 - 1) / 12 per pass, three passes
+    low = img
+    for _ in range(3):
+        low = cv2.blur(low, (k, k), borderType=cv2.BORDER_REFLECT)
+    return img - low
 
 
 def correlation_surface(a: np.ndarray, b: np.ndarray, window: np.ndarray | None = None) -> np.ndarray:
@@ -108,13 +114,13 @@ class Peaks:
     candidates: list  # [(sx, sy, z)] every local maximum (main peak first), z = (value - best) / sigma <= 0
 
 
-def correlation_peaks(c: np.ndarray) -> Peaks:
+def correlation_peaks(c: np.ndarray, comparable: float = PEAK_SEPARATION_MIN) -> Peaks:
     """The global maximum of a correlation surface and how clearly it beats the competing peaks.
 
     The main lobe is the connected region around the maximum above half its height (relative to the surface
     median), so its width follows the texture's own correlation length; local maxima outside it are the competing
     candidates. Their distance from the best is expressed in robust standard deviations of the surface outside
-    the lobe."""
+    the lobe; only candidates within `comparable` of the best are listed."""
     h, w = c.shape
     c = c.astype(np.float32, copy=False)
     py, px = np.unravel_index(int(np.argmax(c)), c.shape)
@@ -133,20 +139,21 @@ def correlation_peaks(c: np.ndarray) -> Peaks:
     if sigma <= 0:
         return Peaks(shift, 0.0, 0.0, [(shift[0], shift[1], 0.0)])
     loc = (c >= cv2.dilate(c, np.ones((3, 3), np.uint8))) & ~lobe
-    ys, xs = np.nonzero(loc)
+    vals_all = c[loc]
+    second = float(vals_all.max()) if vals_all.size else m
+    ys, xs = np.nonzero(loc & (c > c1 - comparable * sigma))
     vals = c[ys, xs]
     order = np.argsort(-vals)
     cands = [(shift[0], shift[1], 0.0)] + [(float(xs[i] - w // 2), float(ys[i] - h // 2), (float(vals[i]) - c1) / sigma)
                                            for i in order]
-    second = float(vals[order[0]]) if vals.size else m
     return Peaks(shift, (c1 - second) / sigma, sigma, cands)
 
 
-def deformation(a: np.ndarray, b: np.ndarray, dx: float, dy: float, max_side: int = 320) -> tuple[float, float] | None:
+def deformation(a: np.ndarray, b: np.ndarray, dx: float, dy: float, max_side: int = 160) -> tuple[float, float] | None:
     """(scale, rotation in degrees) of b relative to a from an affine ECC fit started at the translation (dx, dy).
 
-    Run on a copy reduced to at most max_side pixels (rotation and scale do not depend on resolution; measured
-    accuracy at 320 x 240 ~0.01 deg). None when the fit fails."""
+    Run on a copy reduced to at most max_side pixels (rotation and scale do not depend on resolution; measured on
+    160 x 120 band-pass pairs: rotation 1 deg -> 0.97-1.02 deg, scale 1.02 -> 0.020). None when the fit fails."""
     f = max(1, math.ceil(max(a.shape[:2]) / max_side))
     if f > 1:
         size = (a.shape[1] // f, a.shape[0] // f)
@@ -208,7 +215,13 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
         (np.array([[1, 0, 0], [0, 1, 0]], np.float32), resp, False, "none")
     # the decision is made on shading-free frames: the shared vignette correlates at zero shift for any content
     th, mh = remove_shading(t), remove_shading(m)
-    pk = correlation_peaks(correlation_surface(th, mh))
+    # the peak test runs on copies of at most ~320 px (the frame size its threshold was measured at); ECC then
+    # refines at full analysis resolution from the scaled peak
+    r = max(1, math.ceil(max(h_s, w_s) / 320))
+    small = (w_s // r, h_s // r)
+    pk = correlation_peaks(correlation_surface(th, mh) if r == 1 else correlation_surface(
+        cv2.resize(th, small, interpolation=cv2.INTER_AREA), cv2.resize(mh, small, interpolation=cv2.INTER_AREA)))
+    pk.shift = (r * pk.shift[0], r * pk.shift[1])
     significant = (pk.separation >= PEAK_SEPARATION_MIN
                    and math.hypot(*pk.shift) <= PHASE_MAX_FRACTION * min(h_s, w_s))
     if significant:

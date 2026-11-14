@@ -64,6 +64,7 @@ class Mosaic:
     velocity: tuple | None = None  # last per-frame camera motion (constant-velocity prediction)
     last_good: tuple | None = None  # (frame, band-pass, position) of the latest frame with a known position
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
+    rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
 
     def reset(self) -> None:
         self.tiles.clear()
@@ -81,6 +82,7 @@ class Mosaic:
         self.last_good = None
         self.prev_bp = None
         self.recent_b.clear()
+        self.rep_cache.clear()
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -142,7 +144,14 @@ class Mosaic:
         a32 = a_bp.astype(np.float32, copy=False)
         f32 = f_bp.astype(np.float32, copy=False)
         hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
-        rep = self._repeat_distance(a32, hwin)
+        hit = self.rep_cache.get(id(a_bp))
+        if hit is not None and hit[0] is a_bp:  # keyframes are matched against every frame: test them once
+            rep = hit[1]
+        else:
+            rep = self._repeat_distance(a32, hwin)
+            if len(self.rep_cache) >= 8:  # bounded: holds at most 8 band-pass frames
+                self.rep_cache.clear()
+            self.rep_cache[id(a_bp)] = (a_bp, rep)
         if math.isfinite(rep):
             if predict is None or gate is None:
                 dx, dy, _ = phase_shift(a32, f32, hwin)
@@ -184,7 +193,7 @@ class Mosaic:
         (registration.MAX_ROT_DEG, MAX_SCALE_DEV). Valid pairs measure <= 0.14 deg (rotation 1 deg: 0.97-1.02 deg,
         scale 1.02: 0.020), 3 deg rotations 2.96-3.02 deg."""
         q = self._ncc(a32, f32, dx, dy)
-        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2, max_side=160)):
+        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2)):
             return 0.0
         return q
 

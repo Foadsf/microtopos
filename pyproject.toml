@@ -39,3 +39,7 @@ line-length = 120
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The full generalisation matrix (tests/test_gen_*.py) is marked slow and deselected by default; the default run
+# keeps a representative subset. Run it with `pytest -m slow`, or everything with `pytest -m "slow or not slow"`.
+addopts = "-m 'not slow'"
+markers = ["slow: full generalisation matrix (several minutes); run with -m slow"]

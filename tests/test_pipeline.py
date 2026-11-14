@@ -13,7 +13,7 @@ from microtopos.camera import FrameSource, ReplaySource
 from microtopos.live import LiveEngine
 from microtopos.mosaic import Mosaic
 from microtopos.objectives import default_set, resolve
-from microtopos.recording import RecordingError, RecordingWriter, load_manifest
+from microtopos.recording import RecordingError, RecordingWriter, decode, load_manifest
 
 OBJ = resolve("10x / 0.25", objset=default_set())
 
@@ -48,6 +48,79 @@ def test_writer_decoded_frames_are_png_not_fake_jpeg(tmp_path):
     m = load_manifest(tmp_path / "r")
     assert m.mode == "decoded-png" and m.files[0].suffix == ".png"
     assert cv2.imread(str(m.files[0])) is not None
+
+
+def test_writer_single_row_mjpeg_is_saved_as_jpeg_bytes(tmp_path):
+    # V4L2 with CONVERT_RGB off delivers MJPEG as shape (1, N); before the fix it was PNG-encoded as a 1 x N image
+    img = _frame(120)
+    enc = _jpeg(img)
+    w = RecordingWriter(tmp_path / "r")
+    w.add(enc.reshape(1, -1), 1, 0.0)
+    w.close()
+    m = load_manifest(tmp_path / "r")
+    assert m.mode == "mjpeg-raw" and m.files[0].suffix == ".jpg"
+    assert m.files[0].read_bytes() == enc.tobytes()
+    assert decode(m.files[0]).shape == img.shape
+    w2 = RecordingWriter(tmp_path / "bad")  # control: a single row that is not JPEG is refused like 1-D bytes
+    with pytest.raises(RecordingError):
+        w2.add(np.arange(100, dtype=np.uint8).reshape(1, -1), 1, 0.0)
+    w2.close()
+
+
+def test_legacy_single_row_png_recording_replays_full_frames(tmp_path):
+    # recordings written before the fix: each frame's JPEG bytes stored as a one-pixel-tall grey PNG
+    d = tmp_path / "legacy"
+    d.mkdir()
+    imgs = [_frame(90 + 10 * i) for i in range(3)]
+    entries = []
+    for i, img in enumerate(imgs):
+        ok, png = cv2.imencode(".png", _jpeg(img).reshape(1, -1))
+        assert ok
+        (d / f"{i:06d}.png").write_bytes(png.tobytes())
+        entries.append({"file": f"{i:06d}.png", "seq": i + 1, "t": 0.1 * i})
+    (d / "frames.json").write_text(json.dumps({"format": "microtopos-recording", "version": 2,
+                                               "mode": "decoded-png", "complete": True, "frames": entries}))
+    got = list(ReplaySource(str(d), exhaustive=True).frames())
+    assert len(got) == 3 and all(g.shape == imgs[0].shape for g in got)
+    assert np.array_equal(got[1], cv2.imdecode(_jpeg(imgs[1]), cv2.IMREAD_COLOR))  # exactly the carried JPEG
+    # control: a genuine one-row PNG that carries no JPEG is returned as it is
+    row = np.full((1, 50), 7, np.uint8)
+    ok, png = cv2.imencode(".png", row)
+    (tmp_path / "row.png").write_bytes(png.tobytes())
+    assert decode(tmp_path / "row.png").shape == (1, 50, 3)
+
+
+def test_stop_during_a_manifest_flush_still_marks_the_recording_complete(tmp_path, monkeypatch):
+    # add() (camera thread) pauses inside a periodic flush, after serialising "complete": false; close() (GUI
+    # thread) must wait for it, or the flush lands last and a finished recording reads "not closed cleanly"
+    import threading
+
+    from microtopos import recording
+    w = RecordingWriter(tmp_path / "r")
+    w.FLUSH_EVERY = 2
+    w.add(_jpeg(_frame()), 1, 0.0)
+    in_flush, release = threading.Event(), threading.Event()
+    real_dumps = recording.json.dumps
+
+    def slow_dumps(obj, **k):
+        s = real_dumps(obj, **k)
+        if threading.current_thread().name == "cam":
+            in_flush.set()
+            release.wait(2)
+        return s
+
+    monkeypatch.setattr(recording.json, "dumps", slow_dumps)
+    cam = threading.Thread(target=w.add, args=(_jpeg(_frame()), 2, 0.1), name="cam")
+    cam.start()
+    assert in_flush.wait(2)
+    gui = threading.Thread(target=w.close)
+    gui.start()
+    gui.join(0.3)
+    release.set()
+    cam.join(2)
+    gui.join(2)
+    meta = json.loads((tmp_path / "r" / "frames.json").read_text())
+    assert meta["complete"] is True and len(meta["frames"]) == 2
 
 
 def test_writer_rejects_non_jpeg_bytes_and_stale_folder(tmp_path):

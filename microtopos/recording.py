@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,12 +31,28 @@ def is_jpeg(data: bytes) -> bool:
     return len(data) > 4 and data[:2] == b"\xff\xd8" and b"\xff\xd9" in data[-64:]
 
 
+def encoded_buffer(raw: np.ndarray) -> np.ndarray | None:
+    """The flat byte buffer when `raw` is an encoded frame, else None (a decoded image).
+
+    OpenCV hands an undecoded frame over as 1-D, or as a single row: V4L2 with CONVERT_RGB off gives MJPEG
+    bytes shaped (1, N) (measured on a MikrOkular Full HD, 2026-11-14). A one-pixel-tall decoded image does
+    not occur, so any single row or column of uint8 is treated as bytes, as camera.py already does."""
+    if raw.dtype == np.uint8 and (raw.ndim == 1 or (raw.ndim == 2 and 1 in raw.shape)):
+        return raw.reshape(-1)
+    return None
+
+
 class RecordingError(RuntimeError):
     pass
 
 
 class RecordingWriter:
-    """Writes frames and keeps the manifest current, so a disconnect or crash leaves a usable recording."""
+    """Writes frames and keeps the manifest current, so a disconnect or crash leaves a usable recording.
+
+    add() runs on the camera thread and close() on the GUI thread, so both hold one lock: without it a Stop
+    that lands during a periodic manifest flush can be overwritten by that flush, leaving a finished
+    recording marked "not closed cleanly" (the likely cause of exactly that on a real recording, 2026-11-14:
+    its last manifest write was the flush at frame 1250, 6 ms after the last frame, and Stop wrote nothing later)."""
 
     FLUSH_EVERY = 50
 
@@ -51,20 +68,26 @@ class RecordingWriter:
         self.bytes = 0
         self.error: str | None = None
         self.closed = False
+        self._lock = threading.Lock()
 
     @property
     def n(self) -> int:
         return len(self.entries)
 
     def add(self, raw: np.ndarray, seq: int, t: float) -> None:
-        """raw: the encoded buffer (1-D uint8) or a decoded image (2-D / 3-D). Raises RecordingError on failure."""
+        """raw: the encoded buffer (uint8, 1-D or a single row) or a decoded image. Raises RecordingError on failure."""
+        with self._lock:
+            self._add(raw, seq, t)
+
+    def _add(self, raw: np.ndarray, seq: int, t: float) -> None:
         if self.closed:
             raise RecordingError("recording already closed")
-        if raw.ndim == 1:
-            data = raw.tobytes()
+        enc = encoded_buffer(raw)
+        if enc is not None:
+            data = enc.tobytes()
             if not is_jpeg(data):
                 raise RecordingError("the camera buffer is not a JPEG image; raw recording is not possible")
-            if self.n % 100 == 0 and cv2.imdecode(raw, cv2.IMREAD_COLOR) is None:
+            if self.n % 100 == 0 and cv2.imdecode(enc, cv2.IMREAD_COLOR) is None:
                 raise RecordingError("the camera's JPEG data does not decode")
             mode, ext = "mjpeg-raw", "jpg"
         else:
@@ -101,11 +124,12 @@ class RecordingWriter:
 
     def close(self) -> int:
         """Finalise the manifest (also after an error). Returns the number of frames saved."""
-        if not self.closed:
-            self.meta["complete"] = self.error is None
-            self._write_manifest()
-            self.closed = True
-        return self.n
+        with self._lock:
+            if not self.closed:
+                self.meta["complete"] = self.error is None
+                self._write_manifest()
+                self.closed = True
+            return self.n
 
 
 @dataclass
@@ -166,10 +190,18 @@ def load_manifest(folder: Path | str) -> Manifest:
 
 
 def decode(path: Path) -> np.ndarray | None:
-    """Decoded BGR frame, or None when the file is damaged."""
+    """Decoded BGR frame, or None when the file is damaged.
+
+    Recordings made before the single-row fix (v0.8.1 and earlier, on cameras that deliver MJPEG as (1, N))
+    hold each frame's JPEG bytes as a one-pixel-tall grey PNG. Those bytes are intact, so such a strip is
+    decoded as the JPEG it carries instead of being returned as a 1 x N image."""
     try:
         buf = np.fromfile(path, np.uint8)
     except OSError:
         return None
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR) if buf.size else None
+    if img is not None and img.shape[0] == 1:
+        strip = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+        if strip is not None and strip.dtype == np.uint8 and strip.ndim == 2 and is_jpeg(strip.tobytes()):
+            return cv2.imdecode(strip.reshape(-1), cv2.IMREAD_COLOR)  # None when the carried JPEG is damaged
     return img

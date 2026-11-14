@@ -295,13 +295,15 @@ class CameraSource(FrameSource):
                     del self.warnings[:-20]
                     continue
                 self.readback["delivery"] = "MJPEG bytes"
-            if self.recording and self.rec_writer is not None:
+            w = self.rec_writer  # read once: Stop on the GUI thread may clear it meanwhile
+            if self.recording and w is not None:
                 try:
-                    self.rec_writer.add(raw, n_total, time.perf_counter() - self.rec_t0)
+                    w.add(raw, n_total, time.perf_counter() - self.rec_t0)
                 except Exception as e:  # noqa: BLE001 - disk full etc.: stop and say so
-                    self.rec_error = str(e)
-                    self.stop_recording()
-                    self.rec_error = str(e)
+                    if not (w.closed and w.error is None):  # a frame in flight when Stop landed is no error
+                        self.rec_error = str(e)
+                        self.stop_recording()
+                        self.rec_error = str(e)
             self._publish(frame)
             n += 1
             dt = time.perf_counter() - t0

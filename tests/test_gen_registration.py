@@ -103,8 +103,6 @@ GATES = {
 # (gate, cond) -> reason, for combinations that fail on main (strict: a fix turns them red, so the mark is removed
 # with the fix). The fast subset fails on the same combinations (fast counts out of 12 in brackets).
 KNOWN_BAD = {
-    ("match_track", "rot3"): "NCC 0.59-0.69 under 3 deg rotation passes TRACK_NCC 0.5 (73/96, up to 2.2 px) [12]",
-    ("match_loop", "rot3"): "NCC up to 0.69 under 3 deg rotation passes LOOP_NCC 0.65 (26/96, up to 1.3 px) [1]",
 }
 
 

@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 
 from .focus import brenner
-from .registration import PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, phase_shift
+from .registration import (PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, deformation, phase_shift,
+                           within_envelope)
 
 
 @dataclass
@@ -155,7 +156,7 @@ class Mosaic:
             if not np.isfinite(W).all() or math.hypot(dx - px, dy - py) > tol:
                 return predict[0], predict[1], 0.0
             dx, dy = 2 * dx, 2 * dy
-            return dx, dy, self._ncc(a32, f32, dx, dy)
+            return dx, dy, self._verified(a32, f32, dx, dy)
         dx, dy, r = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
@@ -168,7 +169,21 @@ class Mosaic:
         except cv2.error:
             pass
         dx, dy = 2 * dx, 2 * dy
-        return dx, dy, self._ncc(a32, f32, dx, dy)
+        return dx, dy, self._verified(a32, f32, dx, dy)
+
+    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float) -> float:
+        """NCC of the overlap at the shift (full preview px), or 0 when a translation cannot describe the pair.
+
+        Under a rotation the NCC stays high enough to pass the gates (3 deg: NCC 0.59-0.69; on main 73/96 such
+        pairs were tracked with up to 2.2 px error, 26/96 loop-closed), so a match that could be accepted also gets
+        an affine ECC fit on the band-pass pair (at most 160 px wide: ~2-3 ms, rotation accurate to ~0.03 deg on the
+        accuracy matrix) and must lie inside the envelope register_pair uses for translation-only results
+        (registration.MAX_ROT_DEG, MAX_SCALE_DEV). Valid pairs measure <= 0.14 deg (rotation 1 deg: 0.97-1.02 deg,
+        scale 1.02: 0.020), 3 deg rotations 2.96-3.02 deg."""
+        q = self._ncc(a32, f32, dx, dy)
+        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2, max_side=160)):
+            return 0.0
+        return q
 
     def _accept(self, dx, dy, q, base_xy, h, w) -> bool:
         """Strong matches are accepted; weaker ones (motion blur) only if they agree with the constant-velocity

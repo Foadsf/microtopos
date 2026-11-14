@@ -17,8 +17,8 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTabWidget,
-                               QTextBrowser, QVBoxLayout, QWidget)
+                               QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QStyle,
+                               QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
 from .. import __version__, export, metrology, units, zstack
 from .. import objectives as objlib
@@ -194,7 +194,9 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(central)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(8)
-        # header: wraps onto a second row on narrow windows instead of forcing a wide minimum
+        # header: the chips wrap onto a second row on narrow windows instead of forcing a wide minimum; the buttons
+        # sit in a fixed group on the right, so a chip whose text changes every frame can never push them between
+        # rows (the "Light theme" button used to flicker between the first and second row)
         head = FlowWidget()
         title = QLabel("MicroTopos")
         title.setObjectName("title")
@@ -204,35 +206,52 @@ class MainWindow(QMainWindow):
         ctx.setToolTip("The chips on this row describe the live capture: source, motion, and the calibration of the "
                        "objective selected now. The selected result has its own line below.")
         head.addWidget(ctx)
-        self.chip_state = Chip("DWELL", "success")
+        self.chip_state = Chip("DWELL", "success", sticky=True)
+        self.chip_state.reserve("OBJECTIVE_CHANGE", "Z_SWEEP  888 frames")
         self.chip_state.setToolTip("Motion state detected from the video: DWELL (still), PAN (X-Y moving), "
                                    "Z_SWEEP (focus moving), OBJECTIVE_CHANGE")
-        self.chip_xy = Chip()
-        self.chip_z = Chip()
-        self.chip_rad = Chip()
-        self.chip_src = Chip()
-        self.chip_fps = Chip("", "neutral")
-        self.chip_sat = Chip("CLIPPING", "danger")
+        self.chip_xy = Chip(sticky=True)
+        self.chip_z = Chip(sticky=True)
+        self.chip_rad = Chip(sticky=True)
+        self.chip_src = Chip(sticky=True)
+        self.chip_fps = Chip("", "neutral", sticky=True)
+        self.chip_fps.reserve("88.8 fps in · 88.8 processed")
+        self.chip_sat = Chip("CLIPPING", "danger", sticky=True)
         self.chip_sat.setToolTip("More than 1% of pixels are saturated: lower the exposure, specular metal clips easily")
-        self.chip_sat.hide()
-        self.chip_rec = Chip("● REC", "danger")
+        self.chip_rec = Chip("● REC", "danger", sticky=True)
+        self.chip_rec.reserve("● REC 88:88")
         self.chip_rec.setToolTip("Raw camera frames are being saved; press Stop recording under the Live view")
-        self.chip_rec.hide()
-        for w in (self.chip_rec, self.chip_state, self.chip_src, self.chip_xy, self.chip_z, self.chip_rad, self.chip_sat):
+        for c in (self.chip_sat, self.chip_rec):  # toggling chips keep their row reserved: the header height is stable
+            sp = c.sizePolicy()
+            sp.setRetainSizeWhenHidden(True)
+            c.setSizePolicy(sp)
+            c.hide()
+        # CLIPPING toggles with every exposure change, so it comes last: showing it moves no other chip
+        for w in (self.chip_rec, self.chip_state, self.chip_src, self.chip_xy, self.chip_z, self.chip_rad, self.chip_fps,
+                  self.chip_sat):
             head.addWidget(w)
-        head.addWidget(self.chip_fps)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
         self.btn_left = self._btn("◧", lambda c: self.dock_left.setVisible(c), "Show or hide the session checklist")
         self.btn_right = self._btn("◨", lambda c: self.dock_right.setVisible(c), "Show or hide the telemetry panel")
         for b in (self.btn_left, self.btn_right):
             b.setCheckable(True)
             b.setChecked(True)
             b.setAccessibleName(b.toolTip())
-            head.addWidget(b)
-        head.addWidget(self._btn("Reset layout", self._reset_layout, "Restore the default panel layout"))
+            buttons.addWidget(b)
+        buttons.addWidget(self._btn("Reset layout", self._reset_layout, "Restore the default panel layout"))
         self.btn_theme = QPushButton()
         self.btn_theme.clicked.connect(self._toggle_theme)
-        head.addWidget(self.btn_theme)
-        v.addWidget(head)
+        # sized for the longer of its two labels, so switching theme does not resize the group
+        self.btn_theme.setMinimumWidth(max(self.btn_theme.fontMetrics().horizontalAdvance(s)
+                                           for s in ("Light theme", "Dark theme")) + 28)
+        buttons.addWidget(self.btn_theme)
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        header.addWidget(head, 1)
+        header.addLayout(buttons)
+        header.setAlignment(buttons, Qt.AlignTop)
+        v.addLayout(header)
         self.banner = Banner(self.t)
         v.addWidget(self.banner)
         self.guide = QLabel()
@@ -537,9 +556,24 @@ class MainWindow(QMainWindow):
         lay.addWidget(line)
         lay.addWidget(self.stack, 1)
         dock.setWidget(w)
-        dock.setMinimumWidth(300)
+        # a dropdown sizes itself to its longest entry (a camera name, a recording path): let it shrink and elide,
+        # with the full text in the tooltip, instead of widening the page past the panel
+        for cmb in self.stack.findChildren(QComboBox):
+            cmb.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            cmb.setMinimumContentsLength(14)
+            cmb.currentTextChanged.connect(lambda txt, c=cmb: c.setToolTip(txt) if len(txt) > 14 else None)
+        self._fit_left_dock()
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
         self._open_step(0)
+
+    def _fit_left_dock(self):
+        """The pages scroll vertically only, so the panel must be at least as wide as the widest page; otherwise its
+        right part is cut off under the middle panel (seen on the Camera page: 369 px of content in 344 px). Run after
+        building and after every theme change, since the style sheet changes fonts and padding."""
+        need = max(self.stack.widget(i).widget().minimumSizeHint().width() for i in range(self.stack.count()))
+        sb = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        m = self.dock_left.widget().layout().contentsMargins()
+        self.dock_left.setMinimumWidth(max(300, need + sb + m.left() + m.right() + 4))
 
     def _open_step(self, k: int):
         for i, b in enumerate(self.step_btns):
@@ -560,8 +594,9 @@ class MainWindow(QMainWindow):
         self.cmb_res.setToolTip("Capture size. Full resolution is used for Z-stacks; live analysis uses a 640 px preview")
         self.cmb_res.currentIndexChanged.connect(lambda: self._on_source(self.cmb_source.currentIndex()))
         self.chk_autoexp = QCheckBox("Automatic exposure")
-        self.chk_autoexp.setToolTip("Turn off for measurements: automatic exposure changes brightness between frames")
+
         self.sl_exp = QSlider(Qt.Horizontal)
+        self.sl_exp.setMinimumWidth(60)  # the style default made this row 348 px wide
         self.sl_exp.setRange(78, 738)
         self.sl_exp.setValue(int(self.settings.value("exposure", 300)))
         self.lbl_exp = QLabel()
@@ -599,10 +634,13 @@ class MainWindow(QMainWindow):
                                          "Click, move only the stage's X knob for a few field widths, click again: "
                                          "the views are rotated so stage X is horizontal")
         self.btn_rot_measure.setCheckable(True)
-        rot = QHBoxLayout()
-        rot.addWidget(QLabel("View rotation"))
-        rot.addWidget(self.sp_rot, 1)
-        rot.addWidget(self.btn_rot_measure)
+        # two rows: side by side, label + spin box + "Measure from X pan" (or "Finish (after an X-only move)" while
+        # measuring) were wider than the panel
+        rot = QGridLayout()
+        rot.addWidget(QLabel("View rotation"), 0, 0)
+        rot.addWidget(self.sp_rot, 0, 1)
+        rot.addWidget(self.btn_rot_measure, 1, 0, 1, 2)
+        rot.setColumnStretch(1, 1)
         demo = QGridLayout()
         demo.addWidget(self._btn("Pan around", lambda: self._demo("pan"), "Simulator: move the stage in a loop"), 0, 0)
         demo.addWidget(self._btn("Focus sweep", lambda: self._demo("sweep"), "Simulator: hand-like focus sweep"), 0, 1)
@@ -836,6 +874,8 @@ class MainWindow(QMainWindow):
         t = self.t = DARK if self.dark else LIGHT
         QApplication.instance().setStyleSheet(stylesheet(t))
         self.btn_theme.setText("Light theme" if self.dark else "Dark theme")
+        if hasattr(self, "dock_left"):
+            QTimer.singleShot(0, self._fit_left_dock)  # after the new style sheet has re-polished the pages
         for c in (self.chip_rec, self.chip_state, self.chip_xy, self.chip_z, self.chip_rad, self.chip_src, self.chip_fps, self.chip_sat,
                   *self.step_chips):
             c.retheme(t)

@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 
 from .focus import brenner
-from .registration import phase_shift
+from .registration import (PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, deformation, phase_shift,
+                           within_envelope)
 
 
 @dataclass
@@ -24,6 +25,9 @@ class Keyframe:
     image: np.ndarray
     sharpness: float
     bp: np.ndarray | None = None
+    # keyframes that show parts of this view more sharply: (x offset, y offset, height, width, grid) relative to this
+    # keyframe, grid = YIELD_GRID x YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0)
+    yields: list = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +64,7 @@ class Mosaic:
     velocity: tuple | None = None  # last per-frame camera motion (constant-velocity prediction)
     last_good: tuple | None = None  # (frame, band-pass, position) of the latest frame with a known position
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
+    rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
 
     def reset(self) -> None:
         self.tiles.clear()
@@ -77,6 +82,7 @@ class Mosaic:
         self.last_good = None
         self.prev_bp = None
         self.recent_b.clear()
+        self.rep_cache.clear()
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -111,11 +117,58 @@ class Mosaic:
         b = b - b.mean()
         return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
 
-    def _match(self, a_img, a_bp, f, f_bp, win):
-        """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check."""
+    @staticmethod
+    def _repeat_distance(a32: np.ndarray, hwin: np.ndarray) -> float:
+        """Shortest translation (band-pass px) under which the view repeats, inf for an aperiodic view.
+
+        A view that repeats under a translation p (grating, stage micrometer, regular array) matches itself, and so
+        any frame of it, equally well at d and d + p: its autocorrelation has secondary peaks as high as the central
+        one. Periodicity is the same peak-separation test register_pair applies (PEAK_SEPARATION_MIN robust sigmas):
+        measured on band-pass frames, textured specimens separate by >= 9 (75 % overlap) and >= 14 for every other
+        valid condition of the accuracy matrix, a 9 x 13 px grating by <= 0.2. The repeat distance is then the
+        nearest secondary peak that is comparable (within PEAK_SEPARATION_MIN sigmas) to the central one."""
+        ac = correlation_peaks(correlation_surface(a32, a32, hwin))
+        if ac.separation >= PEAK_SEPARATION_MIN:
+            return math.inf
+        return min((math.hypot(sx, sy) for sx, sy, z in ac.candidates[1:] if z > -PEAK_SEPARATION_MIN),
+                   default=math.inf)
+
+    def _match(self, a_img, a_bp, f, f_bp, win, predict=None, gate=None):
+        """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check.
+
+        A periodic view fixes the shift only modulo its repeat distance R: the NCC passes at a wrong period just as
+        well (17/96 grating pairs on main were accepted up to 38 px off). Then the shift is refined from `predict`
+        (expected content shift in full preview px, from a motion model) and accepted only if the correlation
+        maximum found lies within `gate` px of the prediction and within R/4 of it, so that every other repeat is at
+        least 3x farther from the prediction than the chosen one. Without a prediction the quality is 0."""
         a32 = a_bp.astype(np.float32, copy=False)
         f32 = f_bp.astype(np.float32, copy=False)
         hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
+        hit = self.rep_cache.get(id(a_bp))
+        if hit is not None and hit[0] is a_bp:  # keyframes are matched against every frame: test them once
+            rep = hit[1]
+        else:
+            rep = self._repeat_distance(a32, hwin)
+            if len(self.rep_cache) >= 8:  # bounded: holds at most 8 band-pass frames
+                self.rep_cache.clear()
+            self.rep_cache[id(a_bp)] = (a_bp, rep)
+        if math.isfinite(rep):
+            if predict is None or gate is None:
+                dx, dy, _ = phase_shift(a32, f32, hwin)
+                return 2 * dx, 2 * dy, 0.0
+            px, py = predict[0] / 2, predict[1] / 2
+            tol = min(gate / 2, rep / 4)
+            try:
+                crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+                _, W = cv2.findTransformECC(a32, f32, np.float32([[1, 0, px], [0, 1, py]]), cv2.MOTION_TRANSLATION,
+                                            crit, None, 1)
+            except cv2.error:
+                return predict[0], predict[1], 0.0
+            dx, dy = float(W[0, 2]), float(W[1, 2])
+            if not np.isfinite(W).all() or math.hypot(dx - px, dy - py) > tol:
+                return predict[0], predict[1], 0.0
+            dx, dy = 2 * dx, 2 * dy
+            return dx, dy, self._verified(a32, f32, dx, dy)
         dx, dy, r = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
@@ -128,7 +181,21 @@ class Mosaic:
         except cv2.error:
             pass
         dx, dy = 2 * dx, 2 * dy
-        return dx, dy, self._ncc(a32, f32, dx, dy)
+        return dx, dy, self._verified(a32, f32, dx, dy)
+
+    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float) -> float:
+        """NCC of the overlap at the shift (full preview px), or 0 when a translation cannot describe the pair.
+
+        Under a rotation the NCC stays high enough to pass the gates (3 deg: NCC 0.59-0.69; on main 73/96 such
+        pairs were tracked with up to 2.2 px error, 26/96 loop-closed), so a match that could be accepted also gets
+        an affine ECC fit on the band-pass pair (at most 160 px wide: ~2-3 ms, rotation accurate to ~0.03 deg on the
+        accuracy matrix) and must lie inside the envelope register_pair uses for translation-only results
+        (registration.MAX_ROT_DEG, MAX_SCALE_DEV). Valid pairs measure <= 0.14 deg (rotation 1 deg: 0.97-1.02 deg,
+        scale 1.02: 0.020), 3 deg rotations 2.96-3.02 deg."""
+        q = self._ncc(a32, f32, dx, dy)
+        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2)):
+            return 0.0
+        return q
 
     def _accept(self, dx, dy, q, base_xy, h, w) -> bool:
         """Strong matches are accepted; weaker ones (motion blur) only if they agree with the constant-velocity
@@ -162,12 +229,21 @@ class Mosaic:
             return True, 1.0
         win = cv2.createHanningWindow((w, h), cv2.CV_32F)
         kf = self.keyframes[self.ref]
-        dx, dy, q = self._match(kf.image, kf.bp, f, fb, win)
+        # predicted position (constant velocity; at rest before a velocity is known; none while lost), used only to
+        # choose among the equally good shifts of a periodic view, with the same tolerance as the tracking gate
+        pred, gate = None, 0.025 * min(h, w)
+        if self.prev_frame is not None:
+            vx, vy = self.velocity if self.velocity is not None else (0.0, 0.0)
+            pred = (self.prev_xy[0] + vx, self.prev_xy[1] + vy)
+        expect = (lambda x0, y0: {"predict": (x0 - pred[0], y0 - pred[1]), "gate": gate}) if pred else \
+            (lambda x0, y0: {})
+        dx, dy, q = self._match(kf.image, kf.bp, f, fb, win, **expect(kf.x, kf.y))
         old_xy = (self.x, self.y)
         if self._accept(dx, dy, q, (kf.x, kf.y), h, w):
             self.x, self.y = kf.x - dx, kf.y - dy  # anchored to the reference keyframe
             rel = (-dx, -dy)
-        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win)),
+        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win,
+                                                                               **expect(*self.prev_xy))),
                                                           self.prev_xy, h, w):
             self.x, self.y = self.prev_xy[0] - pm[0], self.prev_xy[1] - pm[1]  # frame-to-frame dead reckoning
             rel, q = None, pm[2]
@@ -223,7 +299,8 @@ class Mosaic:
         """The view is still and sharp (matches the previous frame closely), so it can seed a new area."""
         if self.lost_view is None:
             return False
-        dx, dy, q = self._match(self.lost_view[0], self.lost_view[1], f, fb, win)
+        # the steadiness hypothesis is zero motion, within the 2 px tested below
+        dx, dy, q = self._match(self.lost_view[0], self.lost_view[1], f, fb, win, predict=(0.0, 0.0), gate=2.0)
         self.recent_b.append(b)
         return q > 0.8 and math.hypot(dx, dy) < 2.0 and b >= 0.8 * float(np.median(self.recent_b))
 
@@ -265,11 +342,78 @@ class Mosaic:
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
         kf = Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16))
+        kf.yields = self._sharper_overlaps(kf)
         self.keyframes.append(kf)
         if parent is not None:
             self.edges.append((parent, len(self.keyframes) - 1, rel[0], rel[1], weight))
         # splat the STORED 8-bit image: a later correction subtracts exactly the same contribution
-        self._splat(kf.image, x, y)
+        self._splat(kf.image, x, y, mask=self._yield_mask(kf))
+
+    @staticmethod
+    def _relative_sharpness(img: np.ndarray) -> float:
+        """Brenner energy per unit variance: sharpness of the same content compared between two frames, independent
+        of exposure and lamp flicker (which scale both by the same gain squared)."""
+        img = img.astype(np.float32)
+        v = float(img.var())
+        return brenner(img) / v if v > 1e-6 else 0.0
+
+    # Sharpness is compared tile by tile (1/8 of the view per axis, >= 1000 pixels at 320 x 240): a revisit defocused
+    # by a fraction of the depth of field is sharper where the surface is higher and blurrier where it is lower, so
+    # one global score can call it equal while it blurs half of the view (measured: a 0.5 DOF revisit scoring 1.005x
+    # the original overall still cut the Laplacian variance of part of the view by 25 %).
+    YIELD_GRID = 8
+
+    def _sharper_overlaps(self, kf: Keyframe) -> list:
+        """Existing keyframes that show a substantial part of kf's view (at least 1/4 of its width and height) more
+        sharply than kf does, with the tiles of kf's view where they do, compared over exactly the same content. A
+        revisit (loop closure, dwelling) may be defocused yet pass the keyframe gate, which compares against recent
+        frames only: it then still adds its pose-graph edges, but it must not blur the sharper view already in the
+        mosaic."""
+        h, w = kf.image.shape
+        g = self.YIELD_GRID
+        xs = np.linspace(0, w, g + 1).astype(int)
+        ys = np.linspace(0, h, g + 1).astype(int)
+        out = []
+        for k in self.keyframes:
+            kh, kw = k.image.shape
+            ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
+            x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
+            if x1 - x0 < w / 4 or y1 - y0 < h / 4:
+                continue
+            grid = np.zeros((g, g), np.float32)
+            for i in range(g):
+                for j in range(g):
+                    ta, tb, la, lb = ys[i], ys[i + 1], xs[j], xs[j + 1]
+                    if ta < y0 or tb > y1 or la < x0 or lb > x1:  # only tiles that both views show entirely
+                        continue
+                    mine = self._relative_sharpness(kf.image[ta:tb, la:lb])
+                    theirs = self._relative_sharpness(k.image[ta - oy:tb - oy, la - ox:lb - ox])
+                    grid[i, j] = float(mine < theirs)
+            if grid.any():
+                out.append((k.x - kf.x, k.y - kf.y, kh, kw, grid))
+        return out
+
+    @staticmethod
+    def _yield_mask(kf: Keyframe) -> np.ndarray | None:
+        """Canvas weight factor of kf: 1 - min(1, 2 f_k) * t_k under every keyframe k that is sharper in some tiles,
+        with f_k that keyframe's own feather and t_k its tile grid interpolated smoothly over kf's view. Wherever k
+        carries at least half of its peak blend weight (its central ~2/3 per axis) and is sharper, kf contributes
+        nothing; only in k's outer band, where k's weight fades out anyway, and between tiles does kf take over,
+        smoothly, so no seam is cut into the canvas. (Yielding in proportion to f_k alone left the revisit half the
+        weight a third of the way in from k's border: held out, a 0.5 DOF revisit still cut the Laplacian variance of
+        the view to 0.74, against 0.88 with the half-weight core.)"""
+        if not kf.yields:
+            return None
+        h, w = kf.image.shape
+        m = np.ones((h, w), np.float32)
+        for dx, dy, kh, kw, grid in kf.yields:
+            ox, oy = int(round(dx)), int(round(dy))
+            x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
+            if x1 > x0 and y1 > y0:
+                t = cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
+                f = np.minimum(1.0, 2.0 * _feather(kh, kw)[y0 - oy:y1 - oy, x0 - ox:x1 - ox])
+                m[y0:y1, x0:x1] *= 1.0 - f * t[y0:y1, x0:x1]
+        return m
 
     def _loop_closure(self, win) -> None:
         """Verified matches between the new keyframe and older overlapping ones become extra pose-graph edges.
@@ -285,7 +429,9 @@ class Mosaic:
         for i, k in enumerate(self.keyframes[:-1]):
             if i in linked or math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
                 continue
-            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
+            # predicted from the current estimate, within the drift this test tolerates
+            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win, predict=(k.x - cur.x, k.y - cur.y),
+                                    gate=0.1 * min(h, w))
             if q < self.LOOP_NCC:
                 continue
             ex, ey = -dx, -dy  # measured position of j relative to i
@@ -297,43 +443,71 @@ class Mosaic:
         self.edges += new
         self._relax()
 
+    # Robust pose graph (Mosaic._relax). Residual scale floor: an edge is only down-weighted when it disagrees with
+    # the graph by more than registration error can explain, even when the graph is so consistent that the measured
+    # residual scale is smaller. Accepted _match results over the accuracy matrix (tests/test_gen_registration.py)
+    # are within 0.26 px of the truth for pure translations (+3 DOF defocus, the worst) and within 0.48 px under
+    # 1 deg rotation or 1.02 scale, so sigma >= 0.5 px: with the Cauchy constant an edge 1.2 px off keeps half its
+    # weight. A false loop edge that passes _loop_closure's gate can be anything up to 24 px off.
+    RELAX_SIGMA_FLOOR = 0.5
+    RELAX_ITERS = 10
+
     def _relax(self) -> None:
-        """Least-squares pose graph: one sparse factorisation solves x and y.
+        """Robust least-squares pose graph: iteratively reweighted least squares with Cauchy weights on the edges.
 
         Row weights multiply residuals, so an edge of weight w enters the objective as w^2. A weak prior on every
         node's current position keeps unconnected areas where they are and fixes the gauge freedom of each
-        connected component (keyframe 0 gets a strong prior).
+        connected component (keyframe 0 gets a strong prior). Plain least squares spreads a false loop edge (one
+        that passed the NCC and 10 %-of-frame gates) over the whole graph; after the first solve every edge is
+        reweighted by w = 1 / (1 + (r / c)^2) of its residual r, with c = 2.385 sigma (the Cauchy constant with
+        95 % efficiency for Gaussian residuals) and sigma the robust residual scale (median / 1.1774 for 2-D
+        Gaussian residual lengths), never below RELAX_SIGMA_FLOOR. Consistent edges keep weight ~1, so the clean
+        solution is the least-squares one; an edge many sigma off loses its influence instead of bending the graph.
         """
         from scipy.sparse import coo_matrix
         from scipy.sparse.linalg import splu
 
         n = len(self.keyframes)
         m = len(self.edges)
-        ri, ci, vals = [], [], []
-        bx = np.zeros(n + m)
-        by = np.zeros(n + m)
-        for i, k in enumerate(self.keyframes):
-            wp = 10.0 if i == 0 else 0.01
-            ri.append(i), ci.append(i), vals.append(wp)
-            bx[i], by[i] = wp * k.x, wp * k.y
-        for r, (i, j, ex, ey, wt) in enumerate(self.edges, n):
-            ri += [r, r]
-            ci += [i, j]
-            vals += [-wt, wt]
-            bx[r], by[r] = wt * ex, wt * ey
-        A = coo_matrix((vals, (ri, ci)), shape=(n + m, n)).tocsc()
-        lu = splu((A.T @ A).tocsc())
-        sx = lu.solve(A.T @ bx)
-        sy = lu.solve(A.T @ by)
+        E = np.array([(i, j, ex, ey, wt) for i, j, ex, ey, wt in self.edges], np.float64).reshape(m, 5)
+        ii, jj = E[:, 0].astype(int), E[:, 1].astype(int)
+        wp = np.full(n, 0.01)
+        wp[0] = 10.0
+        px = np.array([k.x for k in self.keyframes])
+        py = np.array([k.y for k in self.keyframes])
+        rows = np.concatenate([np.arange(n), np.repeat(np.arange(n, n + m), 2)])
+        cols = np.concatenate([np.arange(n), np.stack([ii, jj], 1).ravel()])
+
+        def solve(rw):
+            w = E[:, 4] * rw
+            vals = np.concatenate([wp, np.stack([-w, w], 1).ravel()])
+            A = coo_matrix((vals, (rows, cols)), shape=(n + m, n)).tocsc()
+            bx = np.concatenate([wp * px, w * E[:, 2]])
+            by = np.concatenate([wp * py, w * E[:, 3]])
+            lu = splu((A.T @ A).tocsc())
+            return lu.solve(A.T @ bx), lu.solve(A.T @ by)
+
+        rw = np.ones(m)
+        sx, sy = solve(rw)
+        for _ in range(self.RELAX_ITERS if m else 0):
+            r = np.hypot(sx[jj] - sx[ii] - E[:, 2], sy[jj] - sy[ii] - E[:, 3])
+            sigma = max(float(np.median(r)) / 1.1774, self.RELAX_SIGMA_FLOOR)
+            new = 1.0 / (1.0 + (r / (2.385 * sigma)) ** 2)
+            done = np.max(np.abs(np.sqrt(new) - rw)) < 1e-3
+            rw = np.sqrt(new)  # row weight: the squared residual is weighted by w
+            sx, sy = solve(rw)
+            if done:
+                break
         corr = max(math.hypot(k.x - x, k.y - y) for k, x, y in zip(self.keyframes, sx, sy))
         if corr < 0.5:
             return
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
         for k, x, y in zip(self.keyframes, sx, sy):
             if math.hypot(k.x - x, k.y - y) > 0.5:  # move only what changed: remove old splat, add new
-                self._splat(k.image, k.x, k.y, weight=-1.0)
+                mask = self._yield_mask(k)
+                self._splat(k.image, k.x, k.y, weight=-1.0, mask=mask)
                 k.x, k.y = float(x), float(y)
-                self._splat(k.image, k.x, k.y)
+                self._splat(k.image, k.x, k.y, mask=mask)
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -351,9 +525,11 @@ class Mosaic:
         self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
 
     # ---------------------------------------------------------------- canvas
-    def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0) -> None:
+    def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0, mask: np.ndarray | None = None) -> None:
         h, w = img.shape
         feather = _feather(h, w) * weight
+        if mask is not None:
+            feather = feather * mask
         x0, y0 = int(round(x)), int(round(y))
         t = self.tile
         for ty in range(y0 // t, (y0 + h - 1) // t + 1):

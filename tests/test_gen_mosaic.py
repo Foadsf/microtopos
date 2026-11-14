@@ -127,7 +127,6 @@ _BLUR = ("known weakness on main: a revisit frame defocused by 0.5 DOF passes th
          "revisited spot loses up to 41% of its Laplacian variance (min ratio 0.59, seed 7; median 0.83)")
 
 
-@pytest.mark.xfail(strict=True, reason=_BLUR)
 @pytest.mark.parametrize("offset", [1.0, 15.0])
 def test_revisit_keeps_the_sharp_view(offset):
     ratios = [revisit(seed, offset, 0.5)[0] for seed in FAST_SEEDS]
@@ -135,7 +134,6 @@ def test_revisit_keeps_the_sharp_view(offset):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=_BLUR)
 @pytest.mark.parametrize("offset", [1.0, 3.0, 6.0, 15.0])
 def test_revisit_keeps_the_sharp_view_full(offset):
     ratios = [revisit(seed, offset, dz)[0] for seed in range(1, 9) for dz in (0.0, 0.5, 1.5)]

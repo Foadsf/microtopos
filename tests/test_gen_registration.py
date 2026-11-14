@@ -100,20 +100,13 @@ GATES = {
     "match_track": lambda r: r.m_q >= Mosaic.TRACK_NCC,
     "match_loop": lambda r: r.m_q >= Mosaic.LOOP_NCC,
 }
-_RP_BUG = ("register_pair accepts (ok=True) a wrong translation: with a qualified phase peak it keeps any ECC "
-           "result near it, with no minimum correlation (registration.py:94)")
 # (gate, cond) -> reason, for combinations that fail on main (strict: a fix turns them red, so the mark is removed
 # with the fix). The fast subset fails on the same combinations (fast counts out of 12 in brackets).
 KNOWN_BAD = {
-    ("register_pair", "grating"): _RP_BUG + "; periodic texture, off by whole periods (18/96 pairs, up to 45 px) [3]",
     ("match_track", "grating"): "phase correlation locks onto a wrong period of a grating (17/96, up to 38 px) [3]",
     ("match_loop", "grating"): "phase correlation locks onto a wrong period of a grating (17/96, up to 38 px) [3]",
-    ("register_pair", "rot3"): _RP_BUG + "; translation model under 3 deg rotation (85/96, up to 3.6 px) [11]",
     ("match_track", "rot3"): "NCC 0.59-0.69 under 3 deg rotation passes TRACK_NCC 0.5 (73/96, up to 2.2 px) [12]",
     ("match_loop", "rot3"): "NCC up to 0.69 under 3 deg rotation passes LOOP_NCC 0.65 (26/96, up to 1.3 px) [1]",
-    ("register_pair", "contrast5"): _RP_BUG + "; 5% contrast (3/96, up to 1.7 px) [2]",
-    ("register_pair", "contrast2"): _RP_BUG + "; 2% contrast (18/96, up to 17 px) [4]",
-    ("register_pair", "contrast1"): _RP_BUG + "; 1% contrast (34/96, up to 53 px) [3]",
 }
 
 
@@ -158,11 +151,6 @@ UNRELATED = {
 # seeds 7 and 10 with all 4 draws contain reproducers of the register_pair false accepts on main (no overlap:
 # 40x seed 7 draw 3, 40x seed 10 draw 2; different specimen: 40x seed 10 draw 3)
 NEG_FAST = {"seeds": (7, 10), "draws": 4}
-_RP_NEG = ("register_pair reports ok=True (method 'ecc') for frames that share no content: ECC correlation as low "
-           "as 0.04-0.39 is accepted because the random phase peak qualified (registration.py:94); measured on main ")
-RP_NEG_BUGS = {"no-overlap": _RP_NEG + "6/96 pairs (ECC 0.11-0.39) [fast 2/16]",
-               "no-overlap-diag": _RP_NEG + "7/96 pairs (ECC 0.04-0.32)",
-               "other-specimen": _RP_NEG + "5/96 pairs (ECC 0.19-0.26) [fast 1/16]"}
 
 
 def _unrelated(gate, key, run):
@@ -182,8 +170,7 @@ def _neg_params(fast: bool):
         for key in UNRELATED:
             if fast and key == "no-overlap-diag":
                 continue
-            marks = [pytest.mark.xfail(strict=True, reason=RP_NEG_BUGS[key])] if gate == "register_pair" else []
-            out.append(pytest.param(gate, key, marks=marks, id=f"{gate}-{key}"))
+            out.append(pytest.param(gate, key, id=f"{gate}-{key}"))
     return out
 
 

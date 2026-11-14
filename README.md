@@ -55,6 +55,20 @@ quantitatively** (no calibrated reference sample measured so far), and stitching
 checked visually. The Windows and macOS builds pass their self-tests on the build servers but have not been run
 on a real desktop.
 
+### Other cameras
+
+Any camera that appears as a video device (V4L2 on Linux) can feed MicroTopos. One user runs a Canon EOS 50D
+DSLR on a Nikon MM-11 with a BD Plan 5×/0.10: gphoto2 reads the live view over USB, ffmpeg converts it, and
+v4l2loopback publishes it as a virtual webcam that MicroTopos opens like any other
+([issue #2](https://github.com/Foadsf/microtopos/issues/2)). Three things differ from a USB eyepiece camera:
+
+- **No camera controls.** MicroTopos cannot lock the exposure or switch off sharpening through a loopback device,
+  so set manual exposure and no sharpening on the camera itself.
+- **Recordings are PNG, not MJPEG.** The loopback device delivers decoded frames, so "Record raw stream" saves
+  lossless PNG frames, which are larger.
+- **A motorised focus gives real Z.** If a stepper drives the focus knob, state each sweep's travel (steps × step
+  size) and direction with "Set Z…" for heights in µm.
+
 v0.8 follows an external source review (November 2026). It adds:
 
 - a self-test gate that cannot pass a failing NumPy verdict;

@@ -210,10 +210,15 @@ class MainWindow(QMainWindow):
         self.chip_state.reserve("OBJECTIVE_CHANGE", "Z_SWEEP  888 frames")
         self.chip_state.setToolTip("Motion state detected from the video: DWELL (still), PAN (X-Y moving), "
                                    "Z_SWEEP (focus moving), OBJECTIVE_CHANGE")
+        # every header chip reserves its widest text, so no later text (NO FRAMES, XY CAL, Z EST ...) re-wraps the row
         self.chip_xy = Chip(sticky=True)
+        self.chip_xy.reserve("XY NOMINAL 88.888 µm/px")
         self.chip_z = Chip(sticky=True)
+        self.chip_z.reserve("Z EST 88.888 µm/f")
         self.chip_rad = Chip(sticky=True)
+        self.chip_rad.reserve("DARK/FLAT ✓", "DARK/FLAT —")
         self.chip_src = Chip(sticky=True)
+        self.chip_src.reserve("SIMULATOR", "NO FRAMES", "CAMERA")
         self.chip_fps = Chip("", "neutral", sticky=True)
         self.chip_fps.reserve("88.8 fps in · 88.8 processed")
         self.chip_sat = Chip("CLIPPING", "danger", sticky=True)

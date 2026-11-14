@@ -24,6 +24,9 @@ def window(tmp_path_factory):
     w.show()
     for _ in range(20):
         app.processEvents()
+    w.timer.stop()  # the 15 Hz refresh rewrites the chips from live values; the tests drive them themselves
+    for _ in range(5):
+        app.processEvents()
     yield app, w
     w.close()
     app.processEvents()

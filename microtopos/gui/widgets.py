@@ -37,6 +37,9 @@ def stretch_levels(img: np.ndarray, previous: tuple[float, float] | None = None)
     return lo, hi
 
 
+CHIP_HPAD = 2 * 10 + 2 * 1 + 4  # the chip style sheet's left + right padding and border, plus slack for rounding
+
+
 class Chip(QLabel):
     """A small rounded status label. kind: success | warning | danger | info | neutral."""
 
@@ -71,9 +74,10 @@ class Chip(QLabel):
     def _stick(self):
         if not self.sticky:
             return
+        # text width + the style sheet's horizontal padding and border (CHIP_HPAD). Not sizeHint(): once a minimum
+        # width is set, a QLabel's size hint includes it, and the width grew on every call
         fm = self.fontMetrics()
-        pad = self.sizeHint().width() - fm.horizontalAdvance(self.text())  # padding + border of the style sheet
-        need = max([self.sizeHint().width()] + [fm.horizontalAdvance(t) + pad for t in self._reserve])
+        need = max(fm.horizontalAdvance(t) for t in [self.text(), *self._reserve]) + CHIP_HPAD
         if need > self.minimumWidth():
             self.setMinimumWidth(need)
 

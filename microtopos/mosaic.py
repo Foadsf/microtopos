@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from .focus import brenner
-from .registration import phase_shift
+from .registration import PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, phase_shift
 
 
 @dataclass
@@ -111,11 +111,51 @@ class Mosaic:
         b = b - b.mean()
         return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
 
-    def _match(self, a_img, a_bp, f, f_bp, win):
-        """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check."""
+    @staticmethod
+    def _repeat_distance(a32: np.ndarray, hwin: np.ndarray) -> float:
+        """Shortest translation (band-pass px) under which the view repeats, inf for an aperiodic view.
+
+        A view that repeats under a translation p (grating, stage micrometer, regular array) matches itself, and so
+        any frame of it, equally well at d and d + p: its autocorrelation has secondary peaks as high as the central
+        one. Periodicity is the same peak-separation test register_pair applies (PEAK_SEPARATION_MIN robust sigmas):
+        measured on band-pass frames, textured specimens separate by >= 9 (75 % overlap) and >= 14 for every other
+        valid condition of the accuracy matrix, a 9 x 13 px grating by <= 0.2. The repeat distance is then the
+        nearest secondary peak that is comparable (within PEAK_SEPARATION_MIN sigmas) to the central one."""
+        ac = correlation_peaks(correlation_surface(a32, a32, hwin))
+        if ac.separation >= PEAK_SEPARATION_MIN:
+            return math.inf
+        return min((math.hypot(sx, sy) for sx, sy, z in ac.candidates[1:] if z > -PEAK_SEPARATION_MIN),
+                   default=math.inf)
+
+    def _match(self, a_img, a_bp, f, f_bp, win, predict=None, gate=None):
+        """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check.
+
+        A periodic view fixes the shift only modulo its repeat distance R: the NCC passes at a wrong period just as
+        well (17/96 grating pairs on main were accepted up to 38 px off). Then the shift is refined from `predict`
+        (expected content shift in full preview px, from a motion model) and accepted only if the correlation
+        maximum found lies within `gate` px of the prediction and within R/4 of it, so that every other repeat is at
+        least 3x farther from the prediction than the chosen one. Without a prediction the quality is 0."""
         a32 = a_bp.astype(np.float32, copy=False)
         f32 = f_bp.astype(np.float32, copy=False)
         hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
+        rep = self._repeat_distance(a32, hwin)
+        if math.isfinite(rep):
+            if predict is None or gate is None:
+                dx, dy, _ = phase_shift(a32, f32, hwin)
+                return 2 * dx, 2 * dy, 0.0
+            px, py = predict[0] / 2, predict[1] / 2
+            tol = min(gate / 2, rep / 4)
+            try:
+                crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
+                _, W = cv2.findTransformECC(a32, f32, np.float32([[1, 0, px], [0, 1, py]]), cv2.MOTION_TRANSLATION,
+                                            crit, None, 1)
+            except cv2.error:
+                return predict[0], predict[1], 0.0
+            dx, dy = float(W[0, 2]), float(W[1, 2])
+            if not np.isfinite(W).all() or math.hypot(dx - px, dy - py) > tol:
+                return predict[0], predict[1], 0.0
+            dx, dy = 2 * dx, 2 * dy
+            return dx, dy, self._ncc(a32, f32, dx, dy)
         dx, dy, r = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
@@ -162,12 +202,21 @@ class Mosaic:
             return True, 1.0
         win = cv2.createHanningWindow((w, h), cv2.CV_32F)
         kf = self.keyframes[self.ref]
-        dx, dy, q = self._match(kf.image, kf.bp, f, fb, win)
+        # predicted position (constant velocity; at rest before a velocity is known; none while lost), used only to
+        # choose among the equally good shifts of a periodic view, with the same tolerance as the tracking gate
+        pred, gate = None, 0.025 * min(h, w)
+        if self.prev_frame is not None:
+            vx, vy = self.velocity if self.velocity is not None else (0.0, 0.0)
+            pred = (self.prev_xy[0] + vx, self.prev_xy[1] + vy)
+        expect = (lambda x0, y0: {"predict": (x0 - pred[0], y0 - pred[1]), "gate": gate}) if pred else \
+            (lambda x0, y0: {})
+        dx, dy, q = self._match(kf.image, kf.bp, f, fb, win, **expect(kf.x, kf.y))
         old_xy = (self.x, self.y)
         if self._accept(dx, dy, q, (kf.x, kf.y), h, w):
             self.x, self.y = kf.x - dx, kf.y - dy  # anchored to the reference keyframe
             rel = (-dx, -dy)
-        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win)),
+        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win,
+                                                                               **expect(*self.prev_xy))),
                                                           self.prev_xy, h, w):
             self.x, self.y = self.prev_xy[0] - pm[0], self.prev_xy[1] - pm[1]  # frame-to-frame dead reckoning
             rel, q = None, pm[2]
@@ -223,7 +272,8 @@ class Mosaic:
         """The view is still and sharp (matches the previous frame closely), so it can seed a new area."""
         if self.lost_view is None:
             return False
-        dx, dy, q = self._match(self.lost_view[0], self.lost_view[1], f, fb, win)
+        # the steadiness hypothesis is zero motion, within the 2 px tested below
+        dx, dy, q = self._match(self.lost_view[0], self.lost_view[1], f, fb, win, predict=(0.0, 0.0), gate=2.0)
         self.recent_b.append(b)
         return q > 0.8 and math.hypot(dx, dy) < 2.0 and b >= 0.8 * float(np.median(self.recent_b))
 
@@ -285,7 +335,9 @@ class Mosaic:
         for i, k in enumerate(self.keyframes[:-1]):
             if i in linked or math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
                 continue
-            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
+            # predicted from the current estimate, within the drift this test tolerates
+            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win, predict=(k.x - cur.x, k.y - cur.y),
+                                    gate=0.1 * min(h, w))
             if q < self.LOOP_NCC:
                 continue
             ex, ey = -dx, -dy  # measured position of j relative to i

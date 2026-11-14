@@ -106,6 +106,46 @@ def correlation_surface(a: np.ndarray, b: np.ndarray, window: np.ndarray | None 
     return np.fft.fftshift(np.fft.irfft2(np.conj(A) * B, s=(h, w)))
 
 
+def phase_surface(a: np.ndarray, b: np.ndarray, window: np.ndarray | None = None) -> np.ndarray:
+    """Phase-only correlation of the pair, same layout and sign convention as correlation_surface. Every frequency
+    gets equal weight, so broadband texture under a strong periodic pattern (stripes on a machined surface) pins
+    the shift although the pattern alone repeats; a pure grating has only a few coherent frequencies and stays
+    ambiguous. It is the surface phase_shift locates its peak on."""
+    h, w = a.shape
+    win = _hann(h, w) if window is None else window
+    A = np.fft.rfft2((a - a.mean()) * win)
+    B = np.fft.rfft2((b - b.mean()) * win)
+    X = np.conj(A) * B
+    return np.fft.fftshift(np.fft.irfft2(X / (np.abs(X) + 1e-9 * float(np.abs(X).max() + 1e-30)), s=(h, w)))
+
+
+def surface_peak(c: np.ndarray) -> tuple[float, float]:
+    """Sub-pixel shift (sx, sy) of a correlation surface's global maximum from a quadratic fit to its 3 x 3
+    neighbourhood (falls back to per-axis parabolas when the fit is not a maximum). On stripes the surface carries a
+    ridge through the peak along the stripes; cv2.phaseCorrelate's 5 x 5 weighted centroid is pulled along it
+    (measured 0.4 band-pass px per match, which keyframe chains add up), the 3 x 3 fit much less."""
+    h, w = c.shape
+    py, px = np.unravel_index(int(np.argmax(c)), c.shape)
+    if not (0 < py < h - 1 and 0 < px < w - 1):
+        return float(px - w // 2), float(py - h // 2)
+    z = c[py - 1:py + 2, px - 1:px + 2].astype(np.float64).ravel()
+    yy, xx = np.mgrid[-1:2, -1:2]
+    xx, yy = xx.ravel().astype(np.float64), yy.ravel().astype(np.float64)
+    A = np.stack([np.ones(9), xx, yy, xx * xx, xx * yy, yy * yy], 1)
+    _, b, cc, d, e, f = np.linalg.lstsq(A, z, rcond=None)[0]
+    H = np.array([[2 * d, e], [e, 2 * f]])
+    ox = oy = None
+    if np.linalg.det(H) > 0 and H[0, 0] < 0:
+        ox, oy = np.linalg.solve(H, [-b, -cc])
+    if ox is None or abs(ox) > 1 or abs(oy) > 1:
+        def para(m1, z0, p1):
+            den = m1 - 2 * z0 + p1
+            return 0.0 if den >= 0 else float(np.clip(0.5 * (m1 - p1) / den, -0.5, 0.5))
+        ox = para(c[py, px - 1], c[py, px], c[py, px + 1])
+        oy = para(c[py - 1, px], c[py, px], c[py + 1, px])
+    return float(px - w // 2 + ox), float(py - h // 2 + oy)
+
+
 @dataclass
 class Peaks:
     shift: tuple[float, float]  # integer shift of the global maximum (content shift, phase_shift convention)
@@ -149,11 +189,17 @@ def correlation_peaks(c: np.ndarray, comparable: float = PEAK_SEPARATION_MIN) ->
     return Peaks(shift, (c1 - second) / sigma, sigma, cands)
 
 
-def deformation(a: np.ndarray, b: np.ndarray, dx: float, dy: float, max_side: int = 160) -> tuple[float, float] | None:
+def deformation(a: np.ndarray, b: np.ndarray, dx: float, dy: float, max_side: int = 160,
+                rotation_only: bool = False) -> tuple[float, float] | None:
     """(scale, rotation in degrees) of b relative to a from an affine ECC fit started at the translation (dx, dy).
 
     Run on a copy reduced to at most max_side pixels (rotation and scale do not depend on resolution; measured on
-    160 x 120 band-pass pairs: rotation 1 deg -> 0.97-1.02 deg, scale 1.02 -> 0.020). None when the fit fails."""
+    160 x 120 band-pass pairs: rotation 1 deg -> 0.97-1.02 deg, scale 1.02 -> 0.020). None when the fit fails.
+
+    rotation_only fits rotation + translation (scale reported as 1). For striped views: stretch and shear along the
+    stripes are not in the data, so the affine fit is unconstrained there. Measured on stripes over 2-7 % grain:
+    correct pairs gave affine rotations up to 3.05 deg and scales 0.965-1.025, a true 3 deg rotation read -1.6 deg
+    (scale 0.88) or failed; the rotation-only fit read 0.00 deg on every correct pair and -2.94..-3.00 on 3 deg."""
     f = max(1, math.ceil(max(a.shape[:2]) / max_side))
     if f > 1:
         size = (a.shape[1] // f, a.shape[0] // f)
@@ -163,11 +209,13 @@ def deformation(a: np.ndarray, b: np.ndarray, dx: float, dy: float, max_side: in
     try:
         crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-4)
         _, A = cv2.findTransformECC(a.astype(np.float32, copy=False), b.astype(np.float32, copy=False), init,
-                                    cv2.MOTION_AFFINE, crit, None, 3)
+                                    cv2.MOTION_EUCLIDEAN if rotation_only else cv2.MOTION_AFFINE, crit, None, 3)
     except cv2.error:
         return None
     if not np.isfinite(A).all():
         return None
+    if rotation_only:
+        return 1.0, math.degrees(math.atan2(float(A[1, 0]), float(A[0, 0])))
     _, s, rot = _to_similarity(A)
     return s, rot
 

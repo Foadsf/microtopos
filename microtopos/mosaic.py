@@ -15,7 +15,7 @@ import numpy as np
 
 from .focus import brenner
 from .registration import (PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, deformation, phase_shift,
-                           within_envelope)
+                           phase_surface, surface_peak, within_envelope)
 
 
 @dataclass
@@ -117,6 +117,12 @@ class Mosaic:
         b = b - b.mean()
         return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-9))
 
+    # Peak separation (robust sigmas) of a pair's phase-only surface above which a periodic-looking view is matched
+    # as aperiodic. Measured on band-pass pairs flagged periodic, 40-60 pairs each: the tests' 9 x 13 px grating max
+    # 9.3, random-angle pure stripes max 8.2, 2-D gratings max 9.9; stripes over grain at 1 % of the stripe amplitude
+    # min 28.0, at 2 % min 70.6, a 2-D grating over 2 % grain min 58.2.
+    PAIR_UNIQUE_MIN = 18.0
+
     @staticmethod
     def _repeat_distance(a32: np.ndarray, hwin: np.ndarray) -> float:
         """Shortest translation (band-pass px) under which the view repeats, inf for an aperiodic view.
@@ -140,7 +146,13 @@ class Mosaic:
         well (17/96 grating pairs on main were accepted up to 38 px off). Then the shift is refined from `predict`
         (expected content shift in full preview px, from a motion model) and accepted only if the correlation
         maximum found lies within `gate` px of the prediction and within R/4 of it, so that every other repeat is at
-        least 3x farther from the prediction than the chosen one. Without a prediction the quality is 0."""
+        least 3x farther from the prediction than the chosen one. Without a prediction the quality is 0.
+
+        A view whose pattern repeats can still carry texture that does not (stripes on a machined surface with
+        grain between them). The repeat test looks at the view alone, where the strong pattern dominates; the shift
+        is chosen on the pair's phase-only surface, where the texture counts as much. So when that surface has one
+        clear peak (PAIR_UNIQUE_MIN), the pair is not ambiguous and is matched like an aperiodic one; without
+        this, a striped specimen with grain lost track at every pan start and could never recover."""
         a32 = a_bp.astype(np.float32, copy=False)
         f32 = f_bp.astype(np.float32, copy=False)
         hwin = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
@@ -152,7 +164,15 @@ class Mosaic:
             if len(self.rep_cache) >= 8:  # bounded: holds at most 8 band-pass frames
                 self.rep_cache.clear()
             self.rep_cache[id(a_bp)] = (a_bp, rep)
-        if math.isfinite(rep):
+        periodic = math.isfinite(rep)
+        pc = phase_surface(a32, f32, hwin) if periodic else None
+        if periodic and correlation_peaks(pc).separation >= self.PAIR_UNIQUE_MIN:
+            # pinned by the grain: take the phase-only peak itself. Plain correlation (ECC) is a ridge along the
+            # pattern and slides along it (measured: up to 16 px errors with ECC refinement allowed to move 8 px)
+            dx, dy = surface_peak(pc)
+            dx, dy = 2 * dx, 2 * dy
+            return dx, dy, self._verified(a32, f32, dx, dy, periodic)
+        if periodic:
             if predict is None or gate is None:
                 dx, dy, _ = phase_shift(a32, f32, hwin)
                 return 2 * dx, 2 * dy, 0.0
@@ -168,7 +188,7 @@ class Mosaic:
             if not np.isfinite(W).all() or math.hypot(dx - px, dy - py) > tol:
                 return predict[0], predict[1], 0.0
             dx, dy = 2 * dx, 2 * dy
-            return dx, dy, self._verified(a32, f32, dx, dy)
+            return dx, dy, self._verified(a32, f32, dx, dy, periodic)
         dx, dy, r = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
@@ -181,9 +201,9 @@ class Mosaic:
         except cv2.error:
             pass
         dx, dy = 2 * dx, 2 * dy
-        return dx, dy, self._verified(a32, f32, dx, dy)
+        return dx, dy, self._verified(a32, f32, dx, dy, periodic)
 
-    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float) -> float:
+    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float, periodic: bool = False) -> float:
         """NCC of the overlap at the shift (full preview px), or 0 when a translation cannot describe the pair.
 
         Under a rotation the NCC stays high enough to pass the gates (3 deg: NCC 0.59-0.69; on main 73/96 such
@@ -191,9 +211,11 @@ class Mosaic:
         an affine ECC fit on the band-pass pair (at most 160 px wide: ~2-3 ms, rotation accurate to ~0.03 deg on the
         accuracy matrix) and must lie inside the envelope register_pair uses for translation-only results
         (registration.MAX_ROT_DEG, MAX_SCALE_DEV). Valid pairs measure <= 0.14 deg (rotation 1 deg: 0.97-1.02 deg,
-        scale 1.02: 0.020), 3 deg rotations 2.96-3.02 deg."""
+        scale 1.02: 0.020), 3 deg rotations 2.96-3.02 deg. A periodic view (stripes) gets the rotation-only fit:
+        the affine one is unconstrained along the stripes (see registration.deformation), and its scale is not
+        checked."""
         q = self._ncc(a32, f32, dx, dy)
-        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2)):
+        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2, rotation_only=periodic)):
             return 0.0
         return q
 

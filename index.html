@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MicroTopos — microscope stitching, height maps and surface metrology</title>
+<meta name="description" content="Free software that turns a manual microscope and an eyepiece camera into a stitching, height-mapping and surface-metrology instrument.">
+<meta property="og:title" content="MicroTopos — microscope stitching, height maps and surface metrology">
+<meta property="og:description" content="Free software that turns a manual microscope and an eyepiece camera into a stitching, height-mapping and surface-metrology instrument.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-index home">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout wide">
+<main id="main" class="doc">
+
+<div id="preamble">
+<div class="sectionbody">
+<div class="openblock hero">
+<div class="content">
+<div class="exampleblock intro">
+<div class="content">
+<div class="paragraph kicker">
+<p>Free software · Linux, Windows, macOS</p>
+</div>
+<div class="paragraph display">
+<p>Your manual microscope, now a surface-measuring instrument.</p>
+</div>
+<div class="paragraph lead">
+<p>MicroTopos watches the eyepiece camera while you work the knobs as usual. Move the stage and it stitches a mosaic. Turn the fine focus through the sample and it builds a height map, an all-in-focus image and an ISO 25178-style roughness report. No motors, no encoders, no extra hardware.</p>
+</div>
+<div class="paragraph buttons">
+<p><a href="install.html" class="btn primary">Download 0.8.1</a> <a href="quick-start.html" class="btn">Try it in 5 minutes</a></p>
+</div>
+<div class="paragraph fineprint">
+<p>Portable single-file programs; nothing to install. Try it first with the built-in simulator, no microscope needed.</p>
+</div>
+</div>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/overview-dark.png" alt="The MicroTopos window with a height map and its profile">
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="what-it-does"><a class="anchor" href="#what-it-does"></a>What it does</h2>
+<div class="sectionbody">
+<div class="paragraph center">
+<p>Everything is detected from the video alone, so you keep the microscope you already have and the way you already use it.</p>
+</div>
+<div class="openblock cards">
+<div class="content">
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Stitch while you move</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/view-mosaic.png" alt="A stitched mosaic">
+</div>
+</div>
+<div class="paragraph">
+<p>Pan the X-Y stage and the field of view joins the mosaic in real time. A blue box shows where the camera is. If tracking is lost, it picks up again by itself when you come back to an area already mapped.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Height maps from a focus sweep</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/view-height.png" alt="A height map">
+</div>
+</div>
+<div class="paragraph">
+<p>Turn the fine focus slowly from blurry through sharp to blurry again. The sweep is detected, checked and reconstructed in the background, typically in a few seconds.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">A metrology report</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/view-report.png" alt="The surface report">
+</div>
+</div>
+<div class="paragraph">
+<p>Sa, Sq, Sz, Sdr, Sk, Spk, Svk, Sal, Str, grain size (ASTM E112) and more, with ISO 16610 Gaussian filters and every assumption printed next to the numbers.</p>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="how-a-session-goes"><a class="anchor" href="#how-a-session-goes"></a>How a session goes</h2>
+<div class="sectionbody">
+<div class="paragraph center">
+<p>A checklist on the left walks you through it, and a one-line coach above the image always says what to do next.</p>
+</div>
+<div class="openblock flow">
+<div class="content">
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Connect</div>
+<div class="paragraph">
+<p>Pick the camera. Exposure is locked and in-camera sharpening is switched off automatically.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Set up</div>
+<div class="paragraph">
+<p>Choose the objective, and optionally record dark and flat frames for even illumination.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Calibrate</div>
+<div class="paragraph">
+<p>Drag a line over a stage micrometer for µm per pixel; calibrate the focus knob for heights in µm.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Inspect</div>
+<div class="paragraph">
+<p>Pan to map, sweep focus to measure. Height maps stay pinned to their place in the mosaic.</p>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="built-to-be-honest"><a class="anchor" href="#built-to-be-honest"></a>Built to be honest</h2>
+<div class="sectionbody">
+<div class="openblock cards two">
+<div class="content">
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Every number says where it comes from</div>
+<div class="paragraph">
+<p>Uncalibrated lengths are labelled <strong>NOMINAL</strong>. Uncalibrated heights are relative <strong>focus frames</strong>, and so is a sweep whose direction is unknown. A carried-over Z scale is <strong>ESTIMATED</strong>, and simulator results are <strong>SIMULATED</strong>. Pixels without a reliable depth are left empty instead of guessed, and exports carry a validity mask.</p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">Verified against ground truth</div>
+<div class="paragraph">
+<p>A built-in self-test (<code>microtopos-selftest</code>, 130 checks) runs the whole pipeline on randomised synthetic specimens with known heights. A quick version runs on every release build on every platform. <a href="development.html#verification">See the measured numbers</a>.</p>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="start-now"><a class="anchor" href="#start-now"></a>Start now</h2>
+<div class="sectionbody">
+<div class="openblock cards">
+<div class="content">
+<div class="sidebarblock">
+<div class="content">
+<div class="title">1. Download</div>
+<div class="paragraph">
+<p>One file for Linux (x86-64, ARM64), Windows or macOS (Apple silicon, Intel).</p>
+</div>
+<div class="paragraph">
+<p><a href="install.html">Installation guide →</a></p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">2. Try the simulator</div>
+<div class="paragraph">
+<p>Run a demo pan and a demo focus sweep on a synthetic specimen in five minutes.</p>
+</div>
+<div class="paragraph">
+<p><a href="quick-start.html">Quick start →</a></p>
+</div>
+</div>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="title">3. Use your microscope</div>
+<div class="paragraph">
+<p>Step-by-step tutorials for height maps, mosaics and calibration.</p>
+</div>
+<div class="paragraph">
+<p><a href="tutorials.html">Tutorials →</a></p>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+
+</main>
+
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

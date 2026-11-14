@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A height map from a focus sweep · MicroTopos</title>
+<meta name="description" content="How to make a height map with a manual fine-focus knob: technique, what the program checks, and how to read the result.">
+<meta property="og:title" content="A height map from a focus sweep · MicroTopos">
+<meta property="og:description" content="How to make a height map with a manual fine-focus knob: technique, what the program checks, and how to read the result.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-tutorial-height-map">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html" aria-current="page">Tutorials</a><a href="manual.html">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">A height map from a focus sweep</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>A microscope objective shows only a thin slice of the sample sharply: its depth of field, about 10 µm at 10×/0.25 and under 1 µm at 40×/0.85. When you turn the fine focus through the sample, every point becomes sharpest at the knob position matching its height. MicroTopos measures the sharpness of every pixel in every frame and fits the peak. The result is a height map, a confidence map and one all-in-focus image.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="before-you-start"><a class="anchor" href="#before-you-start"></a>Before you start</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p>Select the right objective in step 2, or press <kbd>1</kbd> to <kbd>4</kbd>. It sets the focus windows and the roughness filter.</p>
+</li>
+<li>
+<p>Keep exposure manual (the default). Automatic exposure changes the brightness between frames and corrupts the sharpness comparison.</p>
+</li>
+<li>
+<p>Turn <strong>Show clipped pixels</strong> on (the default) under the Live view. Magenta stripes mark saturated pixels: they have no texture, so there is no focus signal there. Lower the exposure, or use <strong>Set once</strong> in step 1, until the stripes are gone.</p>
+</li>
+</ul>
+</div>
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-camera.png" alt="Step 1: camera" width="capture size" height="exposure with Set once">
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="the-sweep"><a class="anchor" href="#the-sweep"></a>The sweep</h2>
+<div class="sectionbody">
+<div class="olist arabic steps">
+<ol class="arabic">
+<li>
+<p><strong>Hold the stage still</strong> and turn the fine focus until the whole image is clearly blurry: below or above the surface, it does not matter which.</p>
+</li>
+<li>
+<p><strong>Turn slowly the other way.</strong> The image comes into focus, area by area, then goes blurry again. About 5–10 seconds for the whole sweep is right: at 12.5 frames per second that gives 60–120 frames.</p>
+</li>
+<li>
+<p><strong>Keep turning until the whole field is blurry again</strong>, then stop and take your hand off the knob.</p>
+</li>
+</ol>
+</div>
+<div class="paragraph">
+<p>While you turn, the header shows <code>Z_SWEEP</code> and the coach line reports the share of the field that has gone <strong>blurry → sharp → blurry</strong>:</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/live-sweep.png" alt="During the sweep: Z_SWEEP chip" width="frame count and coverage on the coach line" height="coverage map on the right">
+</div>
+</div>
+<div class="paragraph">
+<p>The sweep is used only when at least 50 % of the field has passed completely through focus. A short refocus, or a sweep that stops at sharp, is ignored. The coach line says so, so you know to try again. If you turn back through focus during the sweep, the reversal is detected and only one direction is used.</p>
+</div>
+<div class="admonitionblock tip">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Tip</div>
+</td>
+<td class="content">
+Turning evenly matters more than turning slowly. Until Z is calibrated, heights are measured in frames, so a sweep that speeds up and slows down stretches and squeezes the height scale. With a calibrated knob, use the same even speed you used for calibration.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="reading-the-result"><a class="anchor" href="#reading-the-result"></a>Reading the result</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Reconstruction runs in the background; on a laptop a 1080p sweep takes about 3–5 seconds. You can keep working meanwhile. The program does not switch tabs; a notice tells you when the map is ready.</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-height.png" alt="The Height tab: form-removed" width="filtered height with colour scale and a profile">
+</div>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Height tab</dt>
+<dd>
+<p>The menu above the map switches between the <strong>filtered height</strong>, the <strong>raw</strong> fitted height and the <strong>confidence</strong>. Pixels without a reliable focus peak, such as flat textureless areas, saturated spots and edges, are left empty (grey) instead of guessed. The second menu holds the last 10 maps.</p>
+</dd>
+<dt class="hdlist1">Profile</dt>
+<dd>
+<p>Drag the orange line. The plot below the map shows the height along it, with Ra and Rq for orientation only; profile filtering per ISO 21920 is not applied.</p>
+</dd>
+<dt class="hdlist1">All-in-focus</dt>
+<dd>
+<p>The sharp parts of every frame fused into one image at full camera resolution. <strong>Overlay grain boundaries</strong> outlines the watershed grains used in the report.</p>
+</dd>
+<dt class="hdlist1">3D</dt>
+<dd>
+<p>The filtered surface in perspective. Drag to rotate, scroll to zoom; <strong>Z exaggeration</strong> scales heights.</p>
+</dd>
+<dt class="hdlist1">Report</dt>
+<dd>
+<p>All parameters with units and meaning, plus the provenance: objective, frames used, pixel size, filters and calibration status. See <a href="metrology.html">Metrology</a>.</p>
+</dd>
+</dl>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-height-confidence.png" alt="The confidence map: bright where the focus peak is clear" width="dark where it is not">
+</div>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-3d.png" alt="The 3D view of the same surface">
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="repeatability"><a class="anchor" href="#repeatability"></a>Repeatability</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>To find out how well the instrument repeats on <strong>your</strong> sample, press <strong>Repeat sweep here</strong> in step 6 and make a second sweep without moving the stage. The report then lists σ<sub>inst</sub>, the standard deviation of the height difference divided by √2, and whether it is below Sq/10, the usual rule of thumb for a meaningful roughness value.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="when-the-sweep-is-ignored-or-the-map-is-poor"><a class="anchor" href="#when-the-sweep-is-ignored-or-the-map-is-poor"></a>When the sweep is ignored or the map is poor</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 40%;">
+<col style="width: 60%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">What you see</th>
+<th class="tableblock halign-left valign-top">What to do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">"That focus movement was not used (only N %…)"</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Start further out of focus and continue further past focus, so the whole field goes blurry, sharp and blurry again.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Large empty areas</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">The surface has little texture there, or it is saturated. Lower the exposure; record a flat frame (step 3); a higher-NA objective helps on smooth metal.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Stripes or steps across the map</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Uneven knob speed. Turn more evenly; heights assume an even speed while the knob moves.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Relief looks upside down</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">The sweep direction is unknown. Set it in step 5, or with <strong>Set Z…</strong> on the result line.</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">Map looks smeared</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">The stage moved during the sweep. If it moves a lot, the sweep is aborted and becomes a pan.</p></td>
+</tr>
+</tbody>
+</table>
+<div class="admonitionblock note">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Note</div>
+</td>
+<td class="content">
+To build a map only when you choose, turn off <strong>Reconstruct sweeps automatically</strong> on the right. Sweeps are then kept, and <strong>Reconstruct last sweep</strong> builds the last one, even an incomplete one. <kbd>Space</kbd> starts and stops a manual Z capture, for when automatic detection is not wanted.
+</td>
+</tr>
+</table>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="tutorials.html"><small>Previous</small>Tutorials</a><a class="next" href="tutorial-mosaic.html"><small>Next</small>Mapping with the X-Y stage</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#before-you-start">Before you start</a></li><li class="l1"><a href="#the-sweep">The sweep</a></li><li class="l1"><a href="#reading-the-result">Reading the result</a></li><li class="l1"><a href="#repeatability">Repeatability</a></li><li class="l1"><a href="#when-the-sweep-is-ignored-or-the-map-is-poor">When the sweep is ignored or the map is poor</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

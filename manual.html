@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manual · MicroTopos</title>
+<meta name="description" content="Reference for every part of the MicroTopos window: header, checklist steps, views, telemetry, exports, shortcuts and files.">
+<meta property="og:title" content="Manual · MicroTopos">
+<meta property="og:description" content="Reference for every part of the MicroTopos window: header, checklist steps, views, telemetry, exports, shortcuts and files.">
+<meta property="og:image" content="images/overview-dark.png">
+<link rel="icon" href="images/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/site.css">
+<script>try{const t=localStorage.getItem("mt-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="page-manual">
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-header"><div class="bar">
+  <a class="brand" href="index.html" aria-label="MicroTopos home"><img src="images/logo.svg" alt="" width="28" height="28"><span>MicroTopos</span></a>
+  <button class="nav-toggle" aria-expanded="false" aria-controls="site-nav" aria-label="Menu"><span></span><span></span><span></span></button>
+  <nav id="site-nav" class="site-nav"><a href="install.html">Install</a><a href="quick-start.html">Quick start</a><a href="tutorials.html">Tutorials</a><a href="manual.html" aria-current="page">Manual</a><a href="metrology.html">Metrology</a><a href="troubleshooting.html">Help</a><a href="development.html">Develop</a><a class="gh" href="https://github.com/Foadsf/microtopos" aria-label="Source on GitHub">GitHub</a>
+  <button class="theme-toggle" type="button" aria-label="Switch light or dark theme" title="Light / dark"></button></nav>
+</div></header>
+<div class="layout">
+<main id="main" class="doc">
+<h1 class="page-title">Manual</h1>
+<div id="preamble">
+<div class="sectionbody">
+<div class="paragraph">
+<p>This is the reference for every control. For a guided introduction, see the <a href="quick-start.html">quick start</a> and the <a href="tutorials.html">tutorials</a>.</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/overview-dark.png" alt="The main window: checklist (left)" width="coach line" height="tabs and views (middle)">
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="header-coach-line-and-result-line"><a class="anchor" href="#header-coach-line-and-result-line"></a>Header, coach line and result line</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The header row describes the <strong>live capture</strong>: the camera or replay, the motion state, and the calibration of the objective selected <strong>now</strong>. The <strong>result line</strong> below the coach describes the <strong>selected height map</strong>: its own objective, X-Y and Z status, valid area and warnings. The two can differ, for example when you look at a 40× result while the 10× objective is in use. Each result keeps its own provenance.</p>
+</div>
+<div class="paragraph">
+<p>The header chips summarise the capture at a glance:</p>
+</div>
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Chip</th>
+<th class="tableblock halign-left valign-top">Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>DWELL</code> / <code>PAN</code> / <code>Z_SWEEP</code> / <code>OBJECTIVE_CHANGE</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">the motion state detected from the video: still, stage moving, focus moving, or the view changed abruptly</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>● REC</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">raw camera frames are being recorded</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">source</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">the camera, the recording being replayed, or <code>SIMULATOR</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>XY …</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">lateral scale in µm per pixel and whether it is NOMINAL or CALIBRATED</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>Z …</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">what new sweeps will get: <code>FRAMES</code> (relative), or <code>EST</code> with the stored µm-per-frame estimate</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>DARK/FLAT</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">radiometric correction state for the current setting</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><code>CLIPPING</code></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">more than 1 % of the pixels are saturated</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">fps</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">frames per second received from the camera and processed</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">◧ ◨</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">show or hide the checklist and telemetry panels; <strong>Reset layout</strong> restores them</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>The result line shows the selected map&#8217;s label, objective, <code>XY</code> status, <code>Z</code> status (<code>CALIBRATED</code>, <code>ESTIMATED</code>, <code>NOMINAL</code> or <code>SIMULATED</code>, with the unit and whether the sweep direction is known), the valid fraction and the number of warnings. <strong>Set Z…</strong> states the knob travel and direction of that sweep; <strong>View height</strong> opens the Height tab. The window fits 1280×720 with both panels; hide them for a bigger image.</p>
+</div>
+<div class="paragraph">
+<p>The <strong>coach line</strong> under the header always describes the current situation and the next useful action. It changes with the state, for example during a sweep, after an ignored sweep, when tracking is lost or when you pan too fast. If you are unsure what to do, read it first.</p>
+</div>
+<div class="paragraph">
+<p>The motion state is detected automatically. Every feature is compared with its own noise level measured while the view was still, so the detection adapts to the scene, objective and exposure. Hysteresis keeps a short wobble from starting a sweep or a pan.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="the-checklist-left"><a class="anchor" href="#the-checklist-left"></a>The checklist (left)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>Each step has a status chip; click a step to open its settings.</p>
+</div>
+<div class="sect2">
+<h3 id="1-camera"><a class="anchor" href="#1-camera"></a>1. Camera</h3>
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-camera.png" alt="Step 1">
+</div>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Source</dt>
+<dd>
+<p>a camera, <strong>Simulator (synthetic specimen)</strong>, or a recording given with <code>--replay</code>. A microscope camera is preferred over a laptop webcam at start-up.</p>
+</dd>
+<dt class="hdlist1">Capture size</dt>
+<dd>
+<p>1920×1080 or 1280×720. Both have the same field of view; Z-stacks use the full capture size, and live analysis uses a 640 px preview.</p>
+</dd>
+<dt class="hdlist1">Automatic exposure</dt>
+<dd>
+<p>off by default and for all measurements.</p>
+</dd>
+<dt class="hdlist1">Exposure slider</dt>
+<dd>
+<p>manual exposure in milliseconds. It applies while you drag, and its range is the one the camera reports. <strong>Set once</strong> adjusts it until the brightest areas are just below saturation, then keeps it locked.</p>
+</dd>
+<dt class="hdlist1">View rotation</dt>
+<dd>
+<p>rotates the 2D views (Live, Mosaic, All-in-focus, Height, coverage) for a camera that sits rotated in the eyepiece. <strong>Measure from X pan</strong> sets it from a movement of the X knob alone. Display only: see <a href="tutorial-mosaic.html#rotating-the-views">rotating the views</a>.</p>
+</dd>
+<dt class="hdlist1">Linearise gamma</dt>
+<dd>
+<p>converts the camera&#8217;s gamma-encoded output to linear luminance before analysis. Off: Rec.601 luma of the camera&#8217;s output.</p>
+</dd>
+<dt class="hdlist1">Device reports</dt>
+<dd>
+<p>the values the camera actually accepted, read back after setting them.</p>
+</dd>
+<dt class="hdlist1">Demo</dt>
+<dd>
+<p>simulator only: <strong>Pan around</strong>, <strong>Focus sweep</strong>, <strong>Sweep + reversal</strong>.</p>
+</dd>
+</dl>
+</div>
+<div class="paragraph">
+<p>MicroTopos sets the camera after the stream has started and again after a reconnect, because many cameras ignore settings made earlier. On Linux it switches off automatic exposure, in-camera sharpening and backlight compensation. When the camera has them, it also locks automatic white balance, automatic gain and the dynamic frame rate.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="objective-step"><a class="anchor" href="#objective-step"></a>2. Objective</h3>
+<div class="paragraph">
+<p>Choose the objective in use. Keys <kbd>1</kbd> to <kbd>9</kbd> select the objectives in list order; the step&#8217;s title shows how many keys are in use. The numerical aperture sets the focus window size, the depth of field used by the reconstruction, and the default roughness S-filter (λ<sub>s</sub>). Change it whenever you turn the nosepiece. A detected objective change asks you to confirm and suggests the objective whose magnification best fits the change of texture scale.</p>
+</div>
+<div class="paragraph">
+<p>The list starts with four generic objectives (4×/0.10, 10×/0.25, 40×/0.85, 100×/1.25 oil). Replace it with the objectives on your nosepiece: click <strong>Edit objectives…</strong>.</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/dialog-objectives.png" alt="The objective editor with the Leitz NPL preset loaded">
+</div>
+</div>
+<div class="paragraph">
+<p>Enter one row per objective, in nosepiece order, with the values engraved on it: magnification, numerical aperture (NA), the immersion index <em>n</em> (1 for a dry objective, about 1.515 for oil) and the cover-glass note (<code>0.17</code> for a 0.17 mm cover glass, <code>0</code> or <code>∞/0</code> for uncovered specimens, <code>-</code> for either). Maker and series are optional. <strong>Apply preset</strong> fills the table with a known set, for example <strong>Leitz NPL (5x, 10x, 20x, 50x Fluotar)</strong>: NPL 5×/0.09, 10×/0.20 and 20×/0.40 (<code>∞/-</code>) and NPL Fluotar 50×/0.85 (<code>∞/0</code>), all dry. <strong>OK</strong> stays disabled while a value is impossible: an NA of 0 or less, an NA above the immersion index (a dry objective cannot exceed NA 1), a magnification out of range, or two objectives with the same name.</p>
+</div>
+<div class="paragraph">
+<p>The list is saved as <code>objectives.json</code> next to <code>calibration.json</code> in the data folder, with its origin (preset or edited), date and revision. Calibrations belong to the objective&#8217;s <strong>name</strong>:</p>
+</div>
+<div class="ulist">
+<ul>
+<li>
+<p>Renaming an objective takes its calibration along. A rename onto a name that already holds a calibration is refused.</p>
+</li>
+<li>
+<p>Removing an objective keeps its calibration; it comes back when you add an objective with the same name again.</p>
+</li>
+<li>
+<p>Changing an objective&#8217;s magnification clears its lateral scale, because the stage-micrometer value belonged to the old nameplate. Dark and flat frames and the Z estimate are kept.</p>
+</li>
+</ul>
+</div>
+<div class="paragraph">
+<p>Results and sessions record the optics of the objective they were made with, so editing the list never changes an existing result. Sessions from older versions that name a built-in objective still open after you replace the list.</p>
+</div>
+<div class="admonitionblock important">
+<table>
+<tr>
+<td class="icon">
+<div class="title">Important</div>
+</td>
+<td class="content">
+The nameplate magnification does not give the true pixel size. The camera&#8217;s sensor pitch and any relay lens between the eyepiece tube and the sensor are unknown, so calibrate the lateral scale once per objective with a stage micrometer (step 4). Until then lengths are <strong>nominal</strong>.
+</td>
+</tr>
+</table>
+</div>
+</div>
+<div class="sect2">
+<h3 id="3-dark-flat"><a class="anchor" href="#3-dark-flat"></a>3. Dark &amp; flat</h3>
+<div class="paragraph">
+<p>Records averaged dark and flat frames for the current objective, capture size and exposure. See <a href="tutorial-calibration.html#dark-and-flat-frames-step-3-optional">calibration</a>.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="4-lateral-scale"><a class="anchor" href="#4-lateral-scale"></a>4. Lateral scale</h3>
+<div class="paragraph">
+<p>Calibrates µm per pixel with the blue line on a stage micrometer. See <a href="tutorial-calibration.html#lateral-scale-step-4">calibration</a>.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="5-z-scale"><a class="anchor" href="#5-z-scale"></a>5. Z scale</h3>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Sweep direction</dt>
+<dd>
+<p>Up, Down or Unknown, for new sweeps. Unknown keeps the relief&#8217;s sign undetermined, and results say so.</p>
+</dd>
+<dt class="hdlist1">Set Z of the selected result…</dt>
+<dd>
+<p>knob travel (µm) and direction of <strong>that</strong> sweep; calibrates that result only. It can also keep the µm-per-frame value as an estimate for later sweeps with the same objective.</p>
+</dd>
+<dt class="hdlist1">DOF ruler (experimental)</dt>
+<dd>
+<p>stores a model estimate of µm per frame.</p>
+</dd>
+</dl>
+</div>
+<div class="paragraph">
+<p>See <a href="tutorial-calibration.html#z-scale-step-5">calibration</a> for what each status means.</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="6-inspect"><a class="anchor" href="#6-inspect"></a>6. Inspect</h3>
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/step-inspect.png" alt="Step 6">
+</div>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Mode</dt>
+<dd>
+<p><strong>Auto</strong> detects pans and sweeps; <strong>Pan</strong> and <strong>Z capture</strong> force a state; <strong>Pause</strong> stops detection.</p>
+</dd>
+<dt class="hdlist1">Focus measure</dt>
+<dd>
+<p><strong>DoG band-pass</strong> (default, robust to noise); Tenengrad, SML, Vollath F4 and F5 for comparison.</p>
+</dd>
+<dt class="hdlist1">Form removal order</dt>
+<dd>
+<p>polynomial removed before roughness: 0 = mean only, 1 = plane (tilt), 2 = quadratic, 3 = cubic.</p>
+</dd>
+<dt class="hdlist1">S-filter λs / L-filter λc</dt>
+<dd>
+<p>the ISO 16610-61 Gaussian filter cut-offs in µm. The S-filter removes noise below λs; the optional L-filter removes waviness above λc. A cut-off shorter than 4 pixels is not applied, and the report says so.</p>
+</dd>
+<dt class="hdlist1">Start Z capture</dt>
+<dd>
+<p>(<kbd>Space</kbd>) starts and stops a manual sweep capture.</p>
+</dd>
+<dt class="hdlist1">Repeat sweep here</dt>
+<dd>
+<p>the next sweep at the same place is compared with the last for repeatability, σ<sub>inst</sub>.</p>
+</dd>
+<dt class="hdlist1">Recompute metrology</dt>
+<dd>
+<p>recomputes the report with the current filter settings without a new sweep (in the background).</p>
+</dd>
+<dt class="hdlist1">Super-resolve current view</dt>
+<dd>
+<p>experimental: drizzles still frames with sub-pixel shifts onto a 2× finer grid (4× the pixels). Frames that do not register reliably are left out. It refuses when the frames have too little sub-pixel motion between them to add information.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="the-views-middle"><a class="anchor" href="#the-views-middle"></a>The views (middle)</h2>
+<div class="sectionbody">
+<div class="paragraph">
+<p>The tool bar of each view sits above the image. Every 2D view has µm axes; hover for the value under the cursor, scroll to zoom, drag to pan, and click the small <strong>A</strong> button in the corner (or right-click › <strong>View All</strong>) to show everything again.</p>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Live</dt>
+<dd>
+<p>the camera preview. <strong>Outline in-focus regions</strong> marks the areas that are currently at their sharpest during a sweep. <strong>Show clipped pixels</strong> stripes saturated areas in magenta. <strong>Record raw stream</strong> saves every frame for replay with <code>--replay</code>: the camera&#8217;s exact MJPEG bytes, or lossless PNG when the camera only delivers decoded frames. A full disk or a write error stops the recording with a message.</p>
+</dd>
+<dt class="hdlist1">Mosaic</dt>
+<dd>
+<p>the stitched map, with the camera box. <strong>Image</strong>, <strong>Image + height overlay</strong> or <strong>Height only</strong>; opacity slider; <strong>Export height mosaic</strong>; <strong>Reset mosaic</strong> (<kbd>R</kbd>). Height maps are only levelled and blended with maps of the same quantity: calibrated µm with calibrated µm. A map in relative frames, or with an unknown direction, keeps its own colour scale and is never blended. The legend says how many groups there are. A height map that finishes after the mosaic was reset is not pinned into the new mosaic. Very large mosaics are drawn at a reduced scale, which the status line shows.</p>
+</dd>
+<dt class="hdlist1">All-in-focus</dt>
+<dd>
+<p>the extended-depth-of-field image at full resolution; <strong>Overlay grain boundaries</strong>.</p>
+</dd>
+<dt class="hdlist1">Height</dt>
+<dd>
+<p>filtered height, raw height or confidence; history of the last 10 maps; <strong>Lock colour range</strong> keeps one scale while you compare maps; profile line and plot. The profile values are unfiltered and labelled with their unit; in the confidence view the line shows confidence only.</p>
+</dd>
+<dt class="hdlist1">3D</dt>
+<dd>
+<p>the surface in perspective; <strong>Z exaggeration</strong> (shown on the status line) and colour map (viridis, cividis, inferno, plasma, magma, turbo). Pixels without a depth are holes, not a flat fill. The view is kept when you change the colours.</p>
+</dd>
+<dt class="hdlist1">Report</dt>
+<dd>
+<p>what the numbers are first (calibration and direction status, warnings, the surface operator), then height, material-ratio, spatial, repeatability and image-based groups. A withheld value says why. Provenance comes last (<kbd>F1</kbd> opens it).</p>
+</dd>
+</dl>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-edf-grains.png" alt="All-in-focus image with grain boundaries">
+</div>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="images/tab-report.png" alt="The report: parameters with units and meaning" width="then provenance">
+</div>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="telemetry-right"><a class="anchor" href="#telemetry-right"></a>Telemetry (right)</h2>
+<div class="sectionbody">
+<div class="imageblock narrow">
+<div class="content">
+<img src="images/telemetry-sweep.png" alt="The telemetry panel during a sweep">
+</div>
+</div>
+<div class="dlist">
+<dl>
+<dt class="hdlist1">Sharpness</dt>
+<dd>
+<p>the image sharpness over time. A sweep shows as a rise and fall.</p>
+</dd>
+<dt class="hdlist1">Focus sweep coverage</dt>
+<dd>
+<p>per pixel, how strongly it has been in focus during the current sweep.</p>
+</dd>
+<dt class="hdlist1">Motion line</dt>
+<dd>
+<p>frame-to-frame shift in pixels, correlation and the sharpness trend as a z-score.</p>
+</dd>
+<dt class="hdlist1">Reconstruction</dt>
+<dd>
+<p>progress, <strong>Cancel</strong>, <strong>Reconstruct sweeps automatically</strong> and <strong>Reconstruct last sweep</strong>.</p>
+</dd>
+<dt class="hdlist1">Export</dt>
+<dd>
+<p><strong>.gsf</strong> (Gwyddion), <strong>TIFF</strong> (32-bit float heights, NaN where there is no depth), <strong>STL</strong> (a visualisation mesh, not a measurement archive). Every height export writes a validity mask (<code>name.mask.png</code>) and a provenance file (<code>name.json</code>) beside it, and a confirmation first says what will be written. <strong>Report</strong> writes a folder with <code>report.json</code>, <code>summary.csv</code>, <code>edf.png</code>, <code>confidence.png</code> and <code>valid_mask.png</code>. The files are written complete or not at all. <strong>Save</strong> / <strong>Open</strong> session.</p>
+</dd>
+<dt class="hdlist1">Diagnostics</dt>
+<dd>
+<p>the live event log, for bug reports.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="keyboard-shortcuts"><a class="anchor" href="#keyboard-shortcuts"></a>Keyboard shortcuts</h2>
+<div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 25%;">
+<col style="width: 75%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">Key</th>
+<th class="tableblock halign-left valign-top">Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><kbd>1</kbd> – <kbd>9</kbd></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">select the first, second, … objective in the objective list</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><kbd>Space</kbd></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">start / stop a manual Z capture</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><kbd>R</kbd></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">reset the mosaic</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><span class="keyseq"><kbd>Ctrl</kbd>+<kbd>S</kbd></span> / <span class="keyseq"><kbd>Ctrl</kbd>+<kbd>O</kbd></span></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">save / open a session</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><span class="keyseq"><kbd>Ctrl</kbd>+<kbd>E</kbd></span></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">export the report bundle</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock"><kbd>F1</kbd></p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">open the Report tab</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>Shortcuts are ignored while you type in a field.</p>
+</div>
+</div>
+</div>
+<div class="sect1">
+<h2 id="files-and-settings"><a class="anchor" href="#files-and-settings"></a>Files and settings</h2>
+<div class="sectionbody">
+<div class="ulist">
+<ul>
+<li>
+<p><strong>Calibrations</strong> (<code>calibration.json</code> and dark/flat frames) are kept in the program&#8217;s data folder, for example <code>~/.local/share/MicroTopos/MicroTopos</code> on Linux. On Windows the folder is under <code>%APPDATA%</code>, and on macOS under <code>~/Library/Application Support</code>.</p>
+</li>
+<li>
+<p><strong>Settings</strong> (window layout, theme, exposure, view rotation, last folders) use Qt&#8217;s settings store, for example <code>~/.config/MicroTopos/MicroTopos.conf</code> on Linux.</p>
+</li>
+<li>
+<p><strong>Recordings</strong> go to a new folder under <code>recordings</code> in the current directory. Each frame is listed in <code>frames.json</code> with its sequence number, time, size and checksum. The manifest is kept up to date while recording, so a disconnect leaves a usable recording, marked incomplete.</p>
+</li>
+<li>
+<p><strong>Sessions</strong> (<code>.npz</code>, schema 2) contain the original arrays of the selected result (heights, raw fit, confidence, processing image, filtered surface), all report values and warnings, the settings and the mosaic. A session can also hold a mosaic alone. Opening validates the file before anything changes, and an older session is converted with a note about what had to be recomputed.</p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<nav class="prev-next"><a class="prev" href="tutorial-calibration.html"><small>Previous</small>Calibration for real units</a><a class="next" href="metrology.html"><small>Next</small>Metrology</a></nav>
+</main>
+<nav class="outline" aria-label="On this page"><p>On this page</p><ul><li class="l1"><a href="#header-coach-line-and-result-line">Header, coach line and result line</a></li><li class="l1"><a href="#the-checklist-left">The checklist (left)</a></li><li class="l2"><a href="#1-camera">1. Camera</a></li><li class="l2"><a href="#objective-step">2. Objective</a></li><li class="l2"><a href="#3-dark-flat">3. Dark &amp; flat</a></li><li class="l2"><a href="#4-lateral-scale">4. Lateral scale</a></li><li class="l2"><a href="#5-z-scale">5. Z scale</a></li><li class="l2"><a href="#6-inspect">6. Inspect</a></li><li class="l1"><a href="#the-views-middle">The views (middle)</a></li><li class="l1"><a href="#telemetry-right">Telemetry (right)</a></li><li class="l1"><a href="#keyboard-shortcuts">Keyboard shortcuts</a></li><li class="l1"><a href="#files-and-settings">Files and settings</a></li></ul></nav>
+</div>
+<footer class="site-footer"><div class="bar">
+<p><strong>MicroTopos 0.8.1</strong> · free software under the GNU GPL v3 or later</p>
+<p><a href="https://github.com/Foadsf/microtopos">Source</a> · <a href="https://github.com/Foadsf/microtopos/releases">Releases</a> · <a href="https://github.com/Foadsf/microtopos/issues">Report a problem</a> · <a href="development.html">Develop</a></p>
+</div></footer>
+<div class="lightbox" hidden><img alt=""><p></p></div>
+<script src="assets/site.js" defer></script>
+</body>
+</html>

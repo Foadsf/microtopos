@@ -37,15 +37,27 @@ def stretch_levels(img: np.ndarray, previous: tuple[float, float] | None = None)
     return lo, hi
 
 
+CHIP_HPAD = 2 * 10 + 2 * 1 + 4  # the chip style sheet's left + right padding and border, plus slack for rounding
+
+
 class Chip(QLabel):
     """A small rounded status label. kind: success | warning | danger | info | neutral."""
 
-    def __init__(self, text: str = "", kind: str = "neutral", tokens: dict | None = None):
+    def __init__(self, text: str = "", kind: str = "neutral", tokens: dict | None = None, sticky: bool = False):
         super().__init__(text)
         self.kind = kind
         self.tokens = tokens or {}
+        # sticky: the width only grows, so a text that changes every frame (fps, motion state) never shrinks the
+        # chip and re-wraps the header row it sits in (the header flickered between one and two rows)
+        self.sticky = sticky
+        self._reserve: list[str] = []
         self.setAlignment(Qt.AlignCenter)
         self._apply()
+
+    def reserve(self, *texts: str):
+        """Widest texts this chip will show; with sticky, its width is reserved for them from the start."""
+        self._reserve = list(texts)
+        self._stick()
 
     def set(self, text: str, kind: str | None = None, tip: str | None = None):
         self.setText(text)
@@ -59,6 +71,16 @@ class Chip(QLabel):
         self.tokens = tokens
         self._apply()
 
+    def _stick(self):
+        if not self.sticky:
+            return
+        # text width + the style sheet's horizontal padding and border (CHIP_HPAD). Not sizeHint(): once a minimum
+        # width is set, a QLabel's size hint includes it, and the width grew on every call
+        fm = self.fontMetrics()
+        need = max(fm.horizontalAdvance(t) for t in [self.text(), *self._reserve]) + CHIP_HPAD
+        if need > self.minimumWidth():
+            self.setMinimumWidth(need)
+
     def _apply(self):
         t = self.tokens
         if not t:
@@ -68,6 +90,8 @@ class Chip(QLabel):
         r, g, b = hex_rgb(col)
         self.setStyleSheet(f"background: rgba({r},{g},{b},0.16); color: {col}; border: 1px solid rgba({r},{g},{b},0.5);"
                            f" border-radius: {RADIUS + 4}px; padding: 3px 10px; font-weight: 700; font-size: 12px;")
+        self.ensurePolished()
+        self._stick()
 
 
 class Toast(QLabel):
@@ -336,10 +360,12 @@ class FlowWidget(QWidget):
             QTimer.singleShot(0, self._reflow)
         return False
 
-    def _arrange(self, width: int, apply: bool) -> int:
+    def _arrange(self, width: int, apply: bool, reserved: bool = False) -> int:
+        """Place the visible widgets; with `reserved`, also count hidden ones that retain their size when hidden
+        (a CLIPPING or REC chip), so the row count, and with it the height, does not change when they toggle."""
         x = y = line = 0
         for w in self._ws:
-            if w.isHidden():
+            if w.isHidden() and not (reserved and w.sizePolicy().retainSizeWhenHidden()):
                 continue
             h = w.sizeHint()
             if x and x + h.width() > width:
@@ -351,7 +377,8 @@ class FlowWidget(QWidget):
         return y + line
 
     def _reflow(self):
-        h = self._arrange(max(1, self.width()), True)
+        width = max(1, self.width())
+        h = max(self._arrange(width, True), self._arrange(width, False, reserved=True))
         if h != self.minimumHeight():
             self.setMinimumHeight(h)
 
@@ -359,7 +386,7 @@ class FlowWidget(QWidget):
         return True
 
     def heightForWidth(self, width):
-        return self._arrange(width, False)
+        return max(self._arrange(width, False), self._arrange(width, False, reserved=True))
 
     def sizeHint(self):
         vis = [w.sizeHint() for w in self._ws if not w.isHidden()]

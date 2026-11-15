@@ -174,13 +174,16 @@ class MainWindow(QMainWindow):
         self._fill_sources()
         self._set_rotation(self.sp_rot.value())
         self._apply_theme()
-        g = self.settings.value("geometry")
-        if g is not None:
-            self.restoreGeometry(g)
         self._default_state = self.saveState()  # for "Reset layout"
+        # dock layout first, window geometry second: restoring the docks into a window that restoreGeometry() has
+        # already marked maximised (but not yet shown) leaves stale dock-separator widgets from the unmaximised
+        # size, each drawing a 1-px line across the middle panel
         st = self.settings.value("state")
         if st is not None:
             self.restoreState(st)
+        g = self.settings.value("geometry")
+        if g is not None:
+            self.restoreGeometry(g)
         self.timer = QTimer(self, interval=66, timeout=self._tick)  # 15 Hz: above the camera's 12.5 fps
         self.timer.start()
         self._refresh_checklist()

@@ -43,9 +43,14 @@ uv run microtopos-bench        # CPU vs OpenCL focus-measure timing with a parit
 
 Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Python 3.11 the Qt bindings abort with a reference-count error, so 3.11 is not supported.
 
-## Status (v0.8, November 2026)
+## Status (v0.9, November 2026)
 
-v0.8.1 adds a user-editable objective list (step 2, "Edit objectives…") with presets, including the Leitz NPL
+v0.9.0 adds an optional brightness stretch for dim live views and fixes raw recordings from MJPEG cameras (saved
+as 1-pixel strips before; old recordings still replay). Stitching follows striped specimens again, five
+registration and mosaic bugs found by a new generalisation test matrix are fixed, and the window header and side
+panel no longer jump or get cut off. See "Other cameras" for DSLRs through v4l2loopback.
+
+v0.8.1 added a user-editable objective list (step 2, "Edit objectives…") with presets, including the Leitz NPL
 5×/0.09, 10×/0.20, 20×/0.40 and Fluotar 50×/0.85 set.
 
 Early but working. Tested with a Bresser MikrOkular Full HD eyepiece camera on Linux Mint: live capture,

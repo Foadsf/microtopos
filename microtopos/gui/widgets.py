@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from .theme import RADIUS, hex_rgb
@@ -174,6 +174,8 @@ class ImagePanel(pg.GraphicsLayoutWidget):
     """Image in physical units (um axes), optional colour bar, NaN shown as the neutral 'nan' token,
     cursor readout and an empty-state message."""
 
+    clicked_px = Signal(float, float)  # (x_px, y_px) in unrotated image coordinates, left-click only
+
     def __init__(self, tokens: dict, empty_text: str, colorbar_label: str | None = None, cmap: str = "viridis"):
         super().__init__()
         self.tokens = tokens
@@ -209,6 +211,7 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.um_per_px = 1.0
         self.unit = ""
         self.scene().sigMouseMoved.connect(self._moved)
+        self.scene().sigMouseClicked.connect(self._clicked)
         self.retheme(tokens)
         self._show_empty(True)
 
@@ -287,6 +290,20 @@ class ImagePanel(pg.GraphicsLayoutWidget):
             elif self.data is not None:
                 h, w = self.data.shape[:2]
                 self.overlay.setRect(QRectF(0, 0, w * self.um_per_px, h * self.um_per_px))
+
+    def _clicked(self, ev):
+        """Left-click inside the image: emit the click's pixel coordinates in the unrotated image,
+        for interactive tools such as 3-point levelling."""
+        if self.data is None or ev.button() != Qt.LeftButton:
+            return
+        pos = ev.position() if hasattr(ev, "position") else ev.scenePos()
+        if not self.plot.sceneBoundingRect().contains(pos):
+            return
+        p = self.group.mapFromScene(pos)  # µm in the unrotated image
+        x, y = p.x() / self.um_per_px, p.y() / self.um_per_px
+        h, w = self.data.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            self.clicked_px.emit(float(x), float(y))
 
     def _moved(self, pos):
         if self.data is None or not self.plot.sceneBoundingRect().contains(pos):

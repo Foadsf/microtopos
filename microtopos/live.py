@@ -15,11 +15,11 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, radiometric_key
+from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, bgr_to_rgb_u8, radiometric_key
 from .camera import FrameSource
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
-from .mosaic import Mosaic, height_partitions, preview_factor, render_tiles
+from .mosaic import Mosaic, height_partitions, preview_factor, render_tiles, render_tiles_rgb
 from .optics import Objective
 
 PREVIEW_W = 640
@@ -47,23 +47,25 @@ class SweepCapture:
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
     manual: bool = False  # True when captured under manual Z override (Space)
+    color_frames: list | None = None  # corrected colour frames matching `frames`, when the engine runs in colour mode
 
 
 class SweepBuffer:
     """Frames of a sweep in progress with their z, tiles, sequence numbers and times, thinned together."""
 
     def __init__(self):
-        self.frames, self.z, self.tiles, self.seqs, self.stamps = [], [], [], [], []
+        self.frames, self.color_frames, self.z, self.tiles, self.seqs, self.stamps = [], [], [], [], [], []
 
-    def append(self, frame, z, tiles, seq, ts):
+    def append(self, frame, z, tiles, seq, ts, bgr=None):
         self.frames.append(frame)
+        self.color_frames.append(bgr)
         self.z.append(z)
         self.tiles.append(tiles)
         self.seqs.append(seq)
         self.stamps.append(ts)
 
     def thin(self):
-        for name in ("frames", "z", "tiles", "seqs", "stamps"):
+        for name in ("frames", "color_frames", "z", "tiles", "seqs", "stamps"):
             setattr(self, name, getattr(self, name)[::2])
 
     def __len__(self):
@@ -73,6 +75,7 @@ class SweepBuffer:
 @dataclass
 class Snapshot:
     preview: np.ndarray | None = None
+    preview_rgb: np.ndarray | None = None  # colour preview matching `preview`, when colour mode is on
     state: State = State.DWELL
     fps_in: float = 0.0
     fps_proc: float = 0.0
@@ -107,6 +110,8 @@ class LiveEngine:
         self.source: FrameSource | None = None
         self.exposure: float | None = None
         self.linearize = False
+        self.color_mode = False  # when True, colour frames flow through SweepBuffer.color_frames and the RGB mosaic
+        self.keep_overview_insets = True  # keep the previous objective's overview as an inset when the magnification changes
         self.on_sweep = None  # callback(SweepCapture)
         self.on_objective_hint = None  # callback(ratio)
         self.sync_callbacks = False  # True: call on_sweep in the engine thread (deterministic batch processing)
@@ -125,6 +130,7 @@ class LiveEngine:
         self._buf = SweepBuffer()
         self._sweep_pose = (0.0, 0.0)
         self._sweep_simulated = False
+        self._sweep_manual = False  # the open sweep (if any) was captured under manual Z override
         self._n_preroll = 0
         self._stride, self._zcount = 1, 0
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
@@ -173,6 +179,14 @@ class LiveEngine:
 
     def set_objective(self, obj: Objective):
         with self._lock:
+            old_obj = self.objective
+            if self.keep_overview_insets and len(self.mosaic.keyframes) >= 1 and obj.magnification != old_obj.magnification:
+                img, origin = self.mosaic.image()
+                if np.isfinite(img).any():
+                    cal = self.store.get(old_obj)
+                    pw = self._snap.preview_shape[1] or PREVIEW_W
+                    um_old = cal.um_per_px(pw, old_obj)
+                    self.mosaic.add_inset(old_obj.name, um_old, origin[0] * um_old, origin[1] * um_old, img)
             self.objective = obj
             self._corrector_key = None
             self._cancel_calibration("the objective changed")
@@ -182,13 +196,34 @@ class LiveEngine:
         with self._lock:
             self.sm.override = mode
 
-    def reset_mosaic(self):
+    def reset_mosaic(self, keep_insets: bool = False):
         with self._lock:
-            self.mosaic.reset()
+            self.mosaic.reset(keep_insets=keep_insets)
             self._areas_seen = 1
             self._pending_patches.clear()
             self.mosaic_generation += 1
             self.mosaic_version += 1
+
+    def load_mosaic_state(self, meta: dict, arrays: dict[str, np.ndarray]):
+        """Replace the mosaic with a serialized pose graph (keyframes, edges, patches, insets) and re-render."""
+        with self._lock:
+            self.mosaic.load_state_arrays(meta, arrays)
+            self._areas_seen = self.mosaic.areas
+            self._pending_patches.clear()
+            self.mosaic_version += 1
+        self._render_now()
+
+    def _render_now(self):
+        """Render the current mosaic state into the snapshot view (called from the GUI thread)."""
+        with self._lock:
+            tiles = dict(self.mosaic.tiles)
+            tiles_low = dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None
+            tiles_rgb = dict(self.mosaic.tiles_rgb) if self.color_mode and self.mosaic.tiles_rgb else None
+            tile = self.mosaic.tile
+            patches = list(self.mosaic.patches)
+            ver = self.mosaic_version
+            nkf = len(self.mosaic.keyframes)
+        self._render(tiles, tile, patches, ver, nkf, tiles_low, tiles_rgb)
 
     def _reset_motion(self):
         self.sm.reset()
@@ -196,6 +231,7 @@ class LiveEngine:
         self._preroll.clear()
         self._buf = SweepBuffer()
         self._sweep_simulated = False
+        self._sweep_manual = False
         self._n_preroll = 0
         self._cov = None
         self._dwell.clear()
@@ -236,10 +272,11 @@ class LiveEngine:
         if len(buf) - n_pre < 8 or not self.on_sweep:
             return
         z = None if any(v is None for v in buf.z) else np.array(buf.z)
+        c_frames = list(buf.color_frames) if self.color_mode and all(c is not None for c in buf.color_frames) else None
         cap = SweepCapture(list(buf.frames), z, pose, self.objective.name, shape, simulated, _completeness(buf.tiles),
                            list(buf.seqs), list(buf.stamps), getattr(self.source, "source_id", ""),
                            self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape,
-                           self.objective, manual=manual)
+                           self.objective, manual=manual, color_frames=c_frames)
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -259,8 +296,10 @@ class LiveEngine:
     def mosaic_full(self):
         """Full-resolution mosaic and its height partitions, e.g. for saving (takes the engine lock briefly)."""
         with self._lock:
-            tiles, tile, patches = dict(self.mosaic.tiles), self.mosaic.tile, list(self.mosaic.patches)
-        img, origin, _ = render_tiles(tiles, tile, 1)
+            tiles = dict(self.mosaic.tiles)
+            tiles_low = dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None
+            tile, patches = self.mosaic.tile, list(self.mosaic.patches)
+        img, origin, _ = render_tiles(tiles, tile, 1, tiles_low)
         return (img, origin), height_partitions(patches)
 
     def add_height_patch(self, pose, edf_preview, height_preview, z_unit, z_key=None, rid="",
@@ -327,16 +366,21 @@ class LiveEngine:
         with self._lock:
             if self._held is not None:
                 held, self._held = self._held, None
-                self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
+                self._emit(held[0], held[1], held[2], held[4], held[5], held[6], manual=held[7])
             elif self.sm.state == State.Z_SWEEP and len(self._buf) and _completeness(self._buf.tiles) >= 0.5:
                 h, w = self._buf.frames[0].shape
                 sim = self._sweep_simulated or any(v is not None for v in self._buf.z)
-                self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape)
+                self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape,
+                           manual=self.sm.override == Override.Z)
                 self._buf = SweepBuffer()
 
-    def _render(self, tiles, tile, patches, version, nkf):
+    def _render(self, tiles, tile, patches, version, nkf, tiles_low=None, tiles_rgb=None):
         d = preview_factor(tiles, tile, 1600)
-        self._mosaic_view = (render_tiles(tiles, tile, d), height_partitions(patches), nkf, len(patches))
+        if tiles_rgb:
+            view = render_tiles_rgb(tiles_rgb, tile, d)
+        else:
+            view = render_tiles(tiles, tile, d, tiles_low)
+        self._mosaic_view = (view, height_partitions(patches), nkf, len(patches))
         self._view_version = version
 
     def _process(self, bgr, truth, fps_in, fps_proc, seq, ts):
@@ -379,7 +423,12 @@ class LiveEngine:
         full_u8 = np.clip(corr + 0.5, 0, 255).astype(np.uint8)
         h, w = raw.shape
         pw = min(PREVIEW_W, w)
-        prev = cv2.resize(corr, (pw, int(round(h * pw / w))), interpolation=cv2.INTER_AREA) if pw < w else corr
+        ph = round(h * pw / w)
+        prev = cv2.resize(corr, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else corr
+        prev_rgb = None
+        if self.color_mode:
+            rgb_full = bgr_to_rgb_u8(bgr)
+            prev_rgb = cv2.resize(rgb_full, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else rgb_full
 
         while self._pending_patches:
             op = self._pending_patches.pop(0)
@@ -393,7 +442,7 @@ class LiveEngine:
                 continue
             self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu, zkey, rid)
             self.mosaic_version += 1
-        um = self.store.get(self.objective).um_per_px(prev.shape[1], self.objective)
+        um = self.store.get(self.objective).um_per_px(prev.shape[1], self.objective, prev.shape[0])
         fm = focus_map(prev, "DoG band-pass", 9, self.objective.psf_sigma_px(um))
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
@@ -411,6 +460,7 @@ class LiveEngine:
                 if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it
                     self._buf, self._sweep_pose, self._n_preroll = self._held[:3]
                     self._sweep_simulated = self._held[5]
+                    self._sweep_manual = self._held[7]
                     self._held = None
                     self.log("sweep resumed (merged with the previous incomplete part)", seq)
                 else:
@@ -420,6 +470,7 @@ class LiveEngine:
                     self._n_preroll = len(self._buf)
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
                     self._sweep_simulated = simulated
+                    self._sweep_manual = self.sm.override == Override.Z
                     self._cov = None
                 self._stride, self._zcount = 1, 0
             elif ev.kind == "sweep_ended":
@@ -436,13 +487,13 @@ class LiveEngine:
                                manual=manual)
                 else:  # incomplete: hold it for a few seconds in case focusing resumes
                     self._held = (self._buf, self._sweep_pose, self._n_preroll, seq + HOLD_FRAMES, (h, w), sim_sweep,
-                                  prev.shape)
+                                  prev.shape, manual)
                 self._buf = SweepBuffer()
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
-        self._preroll.append((full_u8, z_true, tiles, seq, ts))
+        self._preroll.append((full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None))
         if self._held is not None and (seq > self._held[3] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
@@ -455,13 +506,13 @@ class LiveEngine:
                     self._buf.thin()  # sequence numbers are thinned too, so z spacing stays in source frames
                     self._n_preroll = (self._n_preroll + 1) // 2
                     self._stride *= 2
-                self._buf.append(full_u8, z_true, tiles, seq, ts)
+                self._buf.append(full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None)
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov
         if state in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE) and self.sm.override != Override.PAUSE:
             was_lost = self.mosaic.lost
-            added, _ = self.mosaic.track(prev)
+            added, _ = self.mosaic.track(prev, rgb=prev_rgb)
             if added and self.mosaic.areas != self._areas_seen:
                 self._areas_seen = self.mosaic.areas
                 self.log(f"mosaic: started separate area {self.mosaic.areas} (position of this view unknown)", seq)
@@ -475,7 +526,10 @@ class LiveEngine:
             # rendering happens after the lock is released (at most twice a second, at display size)
             self._view_t = now
             render = (dict(self.mosaic.tiles), self.mosaic.tile, list(self.mosaic.patches), self.mosaic_version,
-                      len(self.mosaic.keyframes))
+                      len(self.mosaic.keyframes),
+                      dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None,
+                      dict(self.mosaic.tiles_rgb) if self.color_mode and self.mosaic.tiles_rgb else None,
+            )
         if state == State.DWELL:
             self._dwell.append(full_u8)
             self._avg.append(prev)
@@ -485,7 +539,8 @@ class LiveEngine:
             self._avg.clear()
             display = prev
         self._snap = Snapshot(
-            preview=display.astype(np.float32), state=state, fps_in=fps_in, fps_proc=fps_proc, shift_px=feat.shift_px,
+            preview=display.astype(np.float32), preview_rgb=prev_rgb, state=state, fps_in=fps_in, fps_proc=fps_proc,
+            shift_px=feat.shift_px,
             response=feat.response, z_score=feat.z_score, brenner_hist=list(self._bhist), saturation=sat,
             sweep_frames=len(self._buf), coverage=self._cov, in_focus=in_focus, frame_shape=(h, w),
             mosaic_version=self._view_version, mosaic_lost=self.mosaic.lost, dwell_frames=len(self._dwell), seq=seq,

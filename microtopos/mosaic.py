@@ -97,13 +97,14 @@ class Mosaic:
     rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
     _last_drot: float = field(default=0.0, repr=False)  # in-plane rotation measured by the last verified match
 
-    def reset(self) -> None:
+    def reset(self, keep_insets: bool = False) -> None:
         self.tiles.clear()
         self.tiles_low.clear()
         self.tiles_rgb.clear()
         self.keyframes.clear()
         self.patches.clear()
-        self.insets.clear()
+        if not keep_insets:
+            self.insets.clear()
         self.x = self.y = 0.0
         self.lost = False
         self.prev_frame = None

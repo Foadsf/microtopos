@@ -47,23 +47,138 @@ def _dog_umat(u: cv2.UMat, window: int, psf_sigma_px: float) -> cv2.UMat:
     return cv2.boxFilter(cv2.multiply(bp, bp), cv2.CV_32F, (window, window), borderType=cv2.BORDER_REFLECT)
 
 
+def _tenengrad_umat(u: cv2.UMat) -> cv2.UMat:
+    """Tenengrad focus measure: sum of squared Sobel gradients."""
+    gx = cv2.Sobel(u, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(u, cv2.CV_32F, 0, 1, ksize=3)
+    return cv2.add(cv2.multiply(gx, gx), cv2.multiply(gy, gy))
+
+
+def _sml_umat(u: cv2.UMat, radius: int = 1) -> cv2.UMat:
+    """SML focus measure: local standard deviation in a (2r+1) x (2r+1) box."""
+    k = (2 * radius + 1, 2 * radius + 1)
+    mean = cv2.boxFilter(u, cv2.CV_32F, k, normalize=True, borderType=cv2.BORDER_REFLECT)
+    mean2 = cv2.boxFilter(cv2.multiply(u, u), cv2.CV_32F, k, normalize=True, borderType=cv2.BORDER_REFLECT)
+    return cv2.sqrt(cv2.max(cv2.subtract(mean2, cv2.multiply(mean, mean)), 0.0))
+
+
 def focus_map_backend(img: np.ndarray, measure: str, window: int, psf_sigma_px: float,
                       backend: str = "cpu") -> tuple[np.ndarray, str]:
-    """(focus map, backend that actually ran). Anything but OpenCL+DoG, or any OpenCL failure, runs on the CPU."""
-    if backend == "opencl" and measure == "DoG band-pass" and cv2.ocl.haveOpenCL():
+    """(focus map, backend that actually ran). Anything but OpenCL, an unsupported measure, or any OpenCL
+    failure runs on the CPU. DoG, Tenengrad and SML are available on OpenCL."""
+    used = "cpu"
+    if backend == "opencl" and cv2.ocl.haveOpenCL() and measure in ("DoG band-pass", "Tenengrad", "SML"):
         try:
             cv2.ocl.setUseOpenCL(True)
-            out = _dog_umat(cv2.UMat(img.astype(np.float32, copy=False)), window, psf_sigma_px).get()
-            return out, "opencl"
+            u = cv2.UMat(img.astype(np.float32, copy=False))
+            if measure == "DoG band-pass":
+                out = _dog_umat(u, window, psf_sigma_px)
+            elif measure == "Tenengrad":
+                out = _tenengrad_umat(u)
+            else:
+                out = _sml_umat(u)
+            return out.get(), "opencl"
         except cv2.error:
-            pass
-    return focus_map(img, measure, window, psf_sigma_px), "cpu"
+            used = "cpu"
+    return focus_map(img, measure, window, psf_sigma_px), used
+
+
+def _guided_filter_cpu(w: np.ndarray, p: np.ndarray, guide: np.ndarray, radius: int,
+                       eps: float) -> np.ndarray:
+    """Guided filter (He et al.) with per-pixel data weights w; NaN in p counts as weight 0."""
+    w = np.where(np.isfinite(p), w, 0.0).astype(np.float32)
+    p0 = np.where(np.isfinite(p), p, 0.0).astype(np.float32)
+    I = guide.astype(np.float32)
+    k = (2 * radius + 1, 2 * radius + 1)
+
+    def box(x):
+        return cv2.boxFilter(x, cv2.CV_32F, k, normalize=False, borderType=cv2.BORDER_REFLECT)
+
+    sw = box(w) + 1e-6
+    mI = box(w * I) / sw
+    mp = box(w * p0) / sw
+    vI = box(w * I * I) / sw - mI * mI
+    cIp = box(w * I * p0) / sw - mI * mp
+    A = cIp / (vI + eps)
+    B = mp - A * mI
+    n = box(np.ones_like(I))
+    support = box((w > 0).astype(np.float32)) / n
+    A = box(A) / n
+    B = box(B) / n
+    out = A * I + B
+    return np.where(support > 0.15, out, np.nan).astype(np.float32)
+
+
+def _guided_filter_umat(w: np.ndarray, p: np.ndarray, guide: np.ndarray, radius: int,
+                        eps: float) -> np.ndarray:
+    """Same maths as _guided_filter_cpu on OpenCV UMat (OpenCL) buffers; returns a numpy array."""
+    shape = guide.shape
+    # NaN in p counts as weight 0 (same contract as _guided_filter_cpu): substitute before any box
+    # filter so NaN cannot leak through UMat reductions.
+    finite = np.isfinite(p)
+    p = np.where(finite, p, 0.0).astype(np.float32)
+    w = np.where(finite, w, 0.0).astype(np.float32)
+    uw = cv2.UMat(w)
+    uP = cv2.UMat(p)
+    uI = cv2.UMat(guide)
+    one = cv2.UMat(np.ones(shape, np.float32))
+    eps_u = cv2.UMat(np.full(shape, eps, np.float32))
+    onee6_u = cv2.UMat(np.full(shape, 1e-6, np.float32))
+    k = (2 * radius + 1, 2 * radius + 1)
+
+    def box(x):
+        return cv2.boxFilter(x, cv2.CV_32F, k, normalize=False, borderType=cv2.BORDER_REFLECT)
+
+    sw = cv2.add(box(uw), onee6_u)
+    mI = cv2.divide(box(cv2.multiply(uw, uI)), sw)
+    mp = cv2.divide(box(cv2.multiply(uw, uP)), sw)
+    vI = cv2.subtract(cv2.divide(box(cv2.multiply(uw, cv2.multiply(uI, uI))), sw),
+                      cv2.multiply(mI, mI))
+    cIp = cv2.subtract(cv2.divide(box(cv2.multiply(uw, cv2.multiply(uI, uP))), sw),
+                       cv2.multiply(mI, mp))
+    A = cv2.divide(cIp, cv2.add(vI, eps_u))
+    B = cv2.subtract(mp, cv2.multiply(A, mI))
+    n = box(one)
+    support = cv2.divide(box(cv2.UMat((w > 0).astype(np.float32))), n)
+    A = cv2.divide(box(A), n)
+    B = cv2.divide(box(B), n)
+    out = cv2.add(cv2.multiply(A, uI), B)
+    sp = support.get() if isinstance(support, cv2.UMat) else np.asarray(support)
+    o = out.get() if isinstance(out, cv2.UMat) else np.asarray(out)
+    return np.where(sp > 0.15, o, np.nan).astype(np.float32)
+
+
+def guided_filter_backend(p: np.ndarray, w: np.ndarray, guide: np.ndarray, radius: int,
+                          eps: float = 1e-2, backend: str = "cpu") -> tuple[np.ndarray, str]:
+    """Edge-preserving weighted average of p guided by `guide`; returns (result, backend that actually ran).
+
+    NaN in p counts as weight 0. OpenCL is used only when requested and available; any failure falls back
+    to the CPU reference. p, w and guide must have the same shape.
+    """
+    p = np.asarray(p, np.float32)
+    w = np.asarray(w, np.float32)
+    guide = np.asarray(guide, np.float32)
+    if p.shape != w.shape or p.shape != guide.shape:
+        raise ValueError("guided_filter_backend: p, w and guide must have the same shape")
+    used = "cpu"
+    if backend == "opencl" and cv2.ocl.haveOpenCL():
+        try:
+            return _guided_filter_umat(w, p, guide, radius, eps), "opencl"
+        except cv2.error:
+            used = "cpu"
+    return _guided_filter_cpu(w, p, guide, radius, eps), used
 
 
 def parity(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    """Relative L2 difference and maximum absolute difference."""
-    d = a.astype(np.float64) - b.astype(np.float64)
-    return float(np.linalg.norm(d) / (np.linalg.norm(a) + 1e-30)), float(np.abs(d).max())
+    """Relative L2 difference and maximum absolute difference over finite pixels (NaN tolerated on either
+    side; all-NaN input yields NaN, NaN)."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    m = np.isfinite(a) & np.isfinite(b)
+    if not m.any():
+        return float("nan"), float("nan")
+    d = a[m] - b[m]
+    return float(np.linalg.norm(d) / max(np.linalg.norm(a[m]), 1e-30)), float(np.abs(d).max())
 
 
 def benchmark(w: int = 960, h: int = 540, reps: int = 20, window: int = 9, psf: float = 1.0, threads=(1, 4, 0)) -> dict:

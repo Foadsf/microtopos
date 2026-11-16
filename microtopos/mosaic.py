@@ -25,8 +25,8 @@ class Keyframe:
     image: np.ndarray
     sharpness: float
     bp: np.ndarray | None = None
-    # keyframes that show parts of this view more sharply: (x offset, y offset, height, width, grid) relative to this
-    # keyframe, grid = YIELD_GRID x YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0)
+    # keyframes that show parts of this view more sharply: (other_kf_index, grid) where grid = YIELD_GRID x
+    # YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0)
     yields: list = field(default_factory=list)
 
 
@@ -364,10 +364,17 @@ class Mosaic:
     def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
         kf = Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16))
-        kf.yields = self._sharper_overlaps(kf)
+        kf_idx = len(self.keyframes)
+        kf_yields, older_yields = self._sharper_overlaps(kf)
+        kf.yields = kf_yields
         self.keyframes.append(kf)
+        for k_idx, grid in older_yields:
+            k = self.keyframes[k_idx]
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k))
+            k.yields.append((kf_idx, grid))
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k))
         if parent is not None:
-            self.edges.append((parent, len(self.keyframes) - 1, rel[0], rel[1], weight))
+            self.edges.append((parent, kf_idx, rel[0], rel[1], weight))
         # splat the STORED 8-bit image: a later correction subtracts exactly the same contribution
         self._splat(kf.image, x, y, mask=self._yield_mask(kf))
 
@@ -385,24 +392,25 @@ class Mosaic:
     # the original overall still cut the Laplacian variance of part of the view by 25 %).
     YIELD_GRID = 8
 
-    def _sharper_overlaps(self, kf: Keyframe) -> list:
-        """Existing keyframes that show a substantial part of kf's view (at least 1/4 of its width and height) more
-        sharply than kf does, with the tiles of kf's view where they do, compared over exactly the same content. A
-        revisit (loop closure, dwelling) may be defocused yet pass the keyframe gate, which compares against recent
-        frames only: it then still adds its pose-graph edges, but it must not blur the sharper view already in the
-        mosaic."""
+    def _sharper_overlaps(self, kf: Keyframe) -> tuple[list, list]:
+        """Compare kf with existing keyframes that share at least 1/4 width and height of overlap.
+
+        Returns (kf_yields, older_yields) where:
+        - kf_yields: [(k_idx, grid)] of tiles in kf where an existing keyframe k is sharper;
+        - older_yields: [(k_idx, grid)] of tiles in existing keyframe k where the new kf is sharper.
+        """
         h, w = kf.image.shape
         g = self.YIELD_GRID
         xs = np.linspace(0, w, g + 1).astype(int)
         ys = np.linspace(0, h, g + 1).astype(int)
-        out = []
-        for k in self.keyframes:
+        kf_out, older_out = [], []
+        for k_idx, k in enumerate(self.keyframes):
             kh, kw = k.image.shape
             ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
             x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
             if x1 - x0 < w / 4 or y1 - y0 < h / 4:
                 continue
-            grid = np.zeros((g, g), np.float32)
+            grid_kf = np.zeros((g, g), np.float32)
             for i in range(g):
                 for j in range(g):
                     ta, tb, la, lb = ys[i], ys[i + 1], xs[j], xs[j + 1]
@@ -410,26 +418,40 @@ class Mosaic:
                         continue
                     mine = self._relative_sharpness(kf.image[ta:tb, la:lb])
                     theirs = self._relative_sharpness(k.image[ta - oy:tb - oy, la - ox:lb - ox])
-                    grid[i, j] = float(mine < theirs)
-            if grid.any():
-                out.append((k.x - kf.x, k.y - kf.y, kh, kw, grid))
-        return out
+                    grid_kf[i, j] = float(mine < theirs)
+            if grid_kf.any():
+                kf_out.append((k_idx, grid_kf))
+            xs_k = xs if kw == w else np.linspace(0, kw, g + 1).astype(int)
+            ys_k = ys if kh == h else np.linspace(0, kh, g + 1).astype(int)
+            kx0, ky0 = max(0, -ox), max(0, -oy)
+            kx1, ky1 = min(kw, w - ox), min(kh, h - oy)
+            grid_k = np.zeros((g, g), np.float32)
+            for i in range(g):
+                for j in range(g):
+                    ta, tb, la, lb = ys_k[i], ys_k[i + 1], xs_k[j], xs_k[j + 1]
+                    if ta < ky0 or tb > ky1 or la < kx0 or lb > kx1:
+                        continue
+                    theirs = self._relative_sharpness(k.image[ta:tb, la:lb])
+                    mine = self._relative_sharpness(kf.image[ta + oy:tb + oy, la + ox:lb + ox])
+                    grid_k[i, j] = float(theirs < mine)
+            if grid_k.any():
+                older_out.append((k_idx, grid_k))
+        return kf_out, older_out
 
-    @staticmethod
-    def _yield_mask(kf: Keyframe) -> np.ndarray | None:
+    def _yield_mask(self, kf: Keyframe) -> np.ndarray | None:
         """Canvas weight factor of kf: 1 - min(1, 2 f_k) * t_k under every keyframe k that is sharper in some tiles,
         with f_k that keyframe's own feather and t_k its tile grid interpolated smoothly over kf's view. Wherever k
         carries at least half of its peak blend weight (its central ~2/3 per axis) and is sharper, kf contributes
         nothing; only in k's outer band, where k's weight fades out anyway, and between tiles does kf take over,
-        smoothly, so no seam is cut into the canvas. (Yielding in proportion to f_k alone left the revisit half the
-        weight a third of the way in from k's border: held out, a 0.5 DOF revisit still cut the Laplacian variance of
-        the view to 0.74, against 0.88 with the half-weight core.)"""
+        smoothly, so no seam is cut into the canvas."""
         if not kf.yields:
             return None
         h, w = kf.image.shape
         m = np.ones((h, w), np.float32)
-        for dx, dy, kh, kw, grid in kf.yields:
-            ox, oy = int(round(dx)), int(round(dy))
+        for k_idx, grid in kf.yields:
+            k = self.keyframes[k_idx]
+            kh, kw = k.image.shape
+            ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
             x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
             if x1 > x0 and y1 > y0:
                 t = cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -524,12 +546,18 @@ class Mosaic:
         if corr < 0.5:
             return
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
-        for k, x, y in zip(self.keyframes, sx, sy):
-            if math.hypot(k.x - x, k.y - y) > 0.5:  # move only what changed: remove old splat, add new
-                mask = self._yield_mask(k)
-                self._splat(k.image, k.x, k.y, weight=-1.0, mask=mask)
-                k.x, k.y = float(x), float(y)
-                self._splat(k.image, k.x, k.y, mask=mask)
+        moved_kfs = {idx for idx, (k, x, y) in enumerate(zip(self.keyframes, sx, sy)) if math.hypot(k.x - x, k.y - y) > 0.5}
+        resplat = moved_kfs | {idx for idx, k in enumerate(self.keyframes) if any(j in moved_kfs for j, _ in k.yields)}
+        # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k))
+        for idx in moved_kfs:
+            k = self.keyframes[idx]
+            k.x, k.y = float(sx[idx]), float(sy[idx])
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k))
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -614,7 +642,7 @@ class Mosaic:
             for p in P:
                 p.offset = 0.0
             return
-        rows, rhs = [], []
+        rows, rhs, pairs = [], [], []
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = P[i], P[j]
@@ -633,11 +661,32 @@ class Mosaic:
                 r[i], r[j] = 1, -1  # (h_i + o_i) - (h_j + o_j) = 0
                 rows.append(r)
                 rhs.append(-float(np.median(da[ok] - db[ok])))
+                pairs.append((i, j))
         if not rows:
+            for p in P:
+                p.offset = 0.0
             return
-        r0 = np.zeros(n)
-        r0[0] = 1
-        sol = np.linalg.lstsq(np.vstack([r0] + rows), np.array([0.0] + rhs), rcond=None)[0]
+        adj: list[list[int]] = [[] for _ in range(n)]
+        for i, j in pairs:
+            adj[i].append(j)
+            adj[j].append(i)
+        seen = [False] * n
+        anchors = []
+        for start in range(n):
+            if seen[start]:
+                continue
+            stack = [start]
+            seen[start] = True
+            while stack:
+                u = stack.pop()
+                for v in adj[u]:
+                    if not seen[v]:
+                        seen[v] = True
+                        stack.append(v)
+            r0 = np.zeros(n)
+            r0[start] = 1.0
+            anchors.append(r0)
+        sol = np.linalg.lstsq(np.vstack(anchors + rows), np.array([0.0] * len(anchors) + rhs), rcond=None)[0]
         for p, o in zip(P, sol):
             p.offset = float(o)
 

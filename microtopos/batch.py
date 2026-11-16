@@ -54,7 +54,12 @@ def run_batch(recording: str | Path, outdir: str | Path, objective: str = "10x /
     out.mkdir(parents=True, exist_ok=True)
     st = settings or zstack.ZSettings(workers=1)  # one worker: identical results on every run
     sweeps = []
-    for k, cap in enumerate(caps, 1):
+    k = 0
+    for cap in caps:
+        if cap.completeness < 0.5 and not cap.manual:
+            log(f"ignored incomplete focus movement ({len(cap.frames)} frames, {cap.completeness:.0%} completeness)")
+            continue
+        k += 1
         cal = store.get(obj)
         um = cal.um_per_px(cap.shape[1], obj)
         unit = units.UM if z_um_per_frame else units.FRAMES

@@ -46,6 +46,7 @@ class SweepCapture:
     linearize: bool = False
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
+    manual: bool = False  # True when captured under manual Z override (Space)
 
 
 class SweepBuffer:
@@ -94,6 +95,7 @@ class Snapshot:
     engine_error: str | None = None  # last processing failure (the engine keeps running)
     source_generation: int = 0
     mosaic_generation: int = 0
+    raw_p995: float | None = None  # 99.5th percentile of uncorrected camera luma (for auto-exposure)
 
 
 class LiveEngine:
@@ -122,6 +124,7 @@ class LiveEngine:
         self._preroll = collections.deque(maxlen=PREROLL)
         self._buf = SweepBuffer()
         self._sweep_pose = (0.0, 0.0)
+        self._sweep_simulated = False
         self._n_preroll = 0
         self._stride, self._zcount = 1, 0
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
@@ -192,6 +195,7 @@ class LiveEngine:
         self._held = None
         self._preroll.clear()
         self._buf = SweepBuffer()
+        self._sweep_simulated = False
         self._n_preroll = 0
         self._cov = None
         self._dwell.clear()
@@ -200,7 +204,13 @@ class LiveEngine:
     def request_calibration(self, kind: str, n: int = 24):
         """Average the next n raw frames into a dark or flat frame. The source, objective, exposure and gamma
         setting are frozen now; if any changes before the average is complete, the request is cancelled."""
+        from .camera import SimulatorSource
+
         with self._lock:
+            if isinstance(self.source, SimulatorSource) and self.store.directory is not None:
+                self.calib_error = f"{kind.capitalize()} frame cancelled: the simulator never writes to disk."
+                self._calib_req = None
+                return
             self.calib_error = None
             self._calib_req = {"kind": kind, "n": n, "frames": [], "gen": self.source_generation,
                                "objective": self.objective.name, "exposure": self.exposure,
@@ -222,14 +232,14 @@ class LiveEngine:
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
 
-    def _emit(self, buf: SweepBuffer, pose, n_pre, shape, simulated, prev_shape):
+    def _emit(self, buf: SweepBuffer, pose, n_pre, shape, simulated, prev_shape, manual: bool = False):
         if len(buf) - n_pre < 8 or not self.on_sweep:
             return
         z = None if any(v is None for v in buf.z) else np.array(buf.z)
         cap = SweepCapture(list(buf.frames), z, pose, self.objective.name, shape, simulated, _completeness(buf.tiles),
                            list(buf.seqs), list(buf.stamps), getattr(self.source, "source_id", ""),
                            self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape,
-                           self.objective)
+                           self.objective, manual=manual)
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -320,7 +330,8 @@ class LiveEngine:
                 self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
             elif self.sm.state == State.Z_SWEEP and len(self._buf) and _completeness(self._buf.tiles) >= 0.5:
                 h, w = self._buf.frames[0].shape
-                self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), False, self._snap.preview_shape)
+                sim = self._sweep_simulated or any(v is not None for v in self._buf.z)
+                self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape)
                 self._buf = SweepBuffer()
 
     def _render(self, tiles, tile, patches, version, nkf):
@@ -347,6 +358,8 @@ class LiveEngine:
                     or req["exposure"] != self.exposure or req["linearize"] != self.linearize
                     or req["shape"] != raw.shape):
                 self._cancel_calibration("the camera mode, exposure or objective changed while recording")
+            elif truth is not None and self.store.directory is not None:
+                self._cancel_calibration("the simulator never writes to disk")
             else:
                 req["frames"].append(raw)
                 if len(req["frames"]) >= req["n"]:
@@ -359,8 +372,10 @@ class LiveEngine:
                         self.store.save()
                     self._corrector_key = None
                     self._calib_req = None
+        raw_luma = bgr_to_luma(bgr, False) if self.linearize else raw
+        raw_p995 = float(np.percentile(raw_luma[::4, ::4], 99.5))
         corr = self._corrector_for(raw.shape)(raw)
-        sat = float(np.mean(raw >= 250))
+        sat = float(np.mean(raw_luma >= 250))
         full_u8 = np.clip(corr + 0.5, 0, 255).astype(np.uint8)
         h, w = raw.shape
         pw = min(PREVIEW_W, w)
@@ -395,6 +410,7 @@ class LiveEngine:
             if ev.kind == "sweep_started":
                 if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it
                     self._buf, self._sweep_pose, self._n_preroll = self._held[:3]
+                    self._sweep_simulated = self._held[5]
                     self._held = None
                     self.log("sweep resumed (merged with the previous incomplete part)", seq)
                 else:
@@ -403,19 +419,24 @@ class LiveEngine:
                         self._buf.append(*item)
                     self._n_preroll = len(self._buf)
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
+                    self._sweep_simulated = simulated
                     self._cov = None
                 self._stride, self._zcount = 1, 0
             elif ev.kind == "sweep_ended":
                 comp = _completeness(self._buf.tiles)
+                manual = bool(ev.detail.get("manual"))
                 self.log(f"sweep ended: {len(self._buf)} frames ({self._n_preroll} pre-roll), completeness "
-                         f"{comp:.2f}{', ABORTED by motion' if ev.detail.get('aborted') else ''}", seq)
+                         f"{comp:.2f}{', ABORTED by motion' if ev.detail.get('aborted') else ''}"
+                         f"{', manual' if manual else ''}", seq)
+                sim_sweep = self._sweep_simulated or simulated
                 if ev.detail.get("aborted"):
                     self._held = None
-                elif comp < 0.5:  # incomplete: hold it for a few seconds in case focusing resumes
-                    self._held = (self._buf, self._sweep_pose, self._n_preroll, seq + HOLD_FRAMES, (h, w), simulated,
+                elif manual or comp >= 0.5:
+                    self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape,
+                               manual=manual)
+                else:  # incomplete: hold it for a few seconds in case focusing resumes
+                    self._held = (self._buf, self._sweep_pose, self._n_preroll, seq + HOLD_FRAMES, (h, w), sim_sweep,
                                   prev.shape)
-                else:
-                    self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), simulated, prev.shape)
                 self._buf = SweepBuffer()
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
@@ -472,7 +493,7 @@ class LiveEngine:
             sweep_completeness=_completeness(self._buf.tiles) if state == State.Z_SWEEP and seq % 4 == 0
             else (self._snap.sweep_completeness if state == State.Z_SWEEP else 0.0),
             engine_error=self.error, source_generation=self.source_generation,
-            mosaic_generation=self.mosaic_generation)
+            mosaic_generation=self.mosaic_generation, raw_p995=raw_p995)
         return render
 
 

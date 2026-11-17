@@ -60,6 +60,32 @@ quantitatively** (no calibrated reference sample measured so far), and stitching
 checked visually. The Windows and macOS builds pass their self-tests on the build servers but have not been run
 on a real desktop.
 
+### New capabilities (feat/missing-capabilities, in development)
+
+The following are implemented on the `feat/missing-capabilities` branch and verified by the offscreen GUI tests
+and the full test suite (`pytest -m ""`):
+
+- **Motorised stage drivers**: `SimulatedStageDriver` (synthetic, for offline development) and `GrblStageDriver`
+  (serial; opt-in via the `[serial]` extra / `pyserial`), with stage-coupled Z-readback and Z-sweep from the GUI
+  stage panel (connect, zero, and multi-level Z-sweep).
+- **Multi-aspect/resolution camera & calibration support**; 16-bit capture (`Y16` / 16-bit PNG); colour pipeline:
+  RGB EDF and RGB mosaic.
+- **Interactive replay transport bar** (`ReplaySource`): pause/resume, seek, single-frame step, playback speed
+  and loop, driven from the GUI replay bar — no real camera required.
+- **Mosaicking**: disconnected-area bridging (cross-area loop closure), multi-scale `MosaicInset` overlays,
+  `feather`/`multiband` blending, rotational stage tracking (`track_rotation`), and full mosaic-graph session
+  persistence (schema 2).
+- **3D reconstruction & compute**: focus-breathing correction (`estimate_breathing_scales`), out-of-core tiled
+  Z-stack reconstruction (`allow_tiling`), calibrated optical DOF ruler (`theoretical_fwhm_um`), and expanded
+  OpenCL (`cv2.UMat`) focus metrics and guided filter.
+- **Metrology**: ISO 21920 1D profile filtering (`Ra`, `Rq`, `Rz`, …), ISO 25178 `Sdq`, volume parameters
+  (`Vmp`, `Vmc`, `Vvc`, `Vvv`), feature parameters (`Sds`, `Ssc`, `Spd`, `Spc`, `S5p`, `S5v`, `S10z`),
+  interactive 3-point levelling, exclusion-mask ROI, step-height ROIs, topographic grain segmentation, and
+  configurable super-resolution.
+
+The Windows-on-ARM caveat is unchanged: a native Windows-on-ARM build is not possible yet (no OpenCV wheels for
+that platform); Windows x86_64 runs on Windows-on-ARM via emulation.
+
 ### Other cameras
 
 Any camera that appears as a video device (V4L2 on Linux) can feed MicroTopos. One user runs a Canon EOS 50D

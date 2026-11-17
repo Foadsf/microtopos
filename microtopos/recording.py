@@ -79,6 +79,10 @@ class RecordingWriter:
         with self._lock:
             self._add(raw, seq, t)
 
+    def _fail(self, message: str) -> None:
+        self.error = message
+        raise RecordingError(message)
+
     def _add(self, raw: np.ndarray, seq: int, t: float) -> None:
         if self.closed:
             raise RecordingError("recording already closed")
@@ -86,19 +90,26 @@ class RecordingWriter:
         if enc is not None:
             data = enc.tobytes()
             if not is_jpeg(data):
-                raise RecordingError("the camera buffer is not a JPEG image; raw recording is not possible")
-            if self.n % 100 == 0 and cv2.imdecode(enc, cv2.IMREAD_COLOR) is None:
-                raise RecordingError("the camera's JPEG data does not decode")
+                self._fail("the camera buffer is not a JPEG image; raw recording is not possible")
+            try:
+                decoded = cv2.imdecode(enc, cv2.IMREAD_COLOR) if self.n % 100 == 0 else True
+            except cv2.error as e:
+                self._fail(f"the camera's JPEG data does not decode: {e}")
+            if decoded is None:
+                self._fail("the camera's JPEG data does not decode")
             mode, ext = "mjpeg-raw", "jpg"
         else:
-            ok, buf = cv2.imencode(".png", raw)
+            try:
+                ok, buf = cv2.imencode(".png", raw)
+            except cv2.error as e:
+                self._fail(f"PNG encoding failed: {e}")
             if not ok:
-                raise RecordingError("PNG encoding failed")
+                self._fail("PNG encoding failed")
             data, mode, ext = buf.tobytes(), "decoded-png", "png"
         if self.meta["mode"] is None:
             self.meta["mode"] = mode
         elif self.meta["mode"] != mode:
-            raise RecordingError(f"the frame format changed during the recording ({self.meta['mode']} -> {mode})")
+            self._fail(f"the frame format changed during the recording ({self.meta['mode']} -> {mode})")
         name = f"{self.n:06d}.{ext}"
         try:
             with open(self.folder / name, "wb") as f:
@@ -107,8 +118,7 @@ class RecordingWriter:
             self.error = f"could not write {name}: {e}"
             raise RecordingError(self.error) from e
         if written != len(data):
-            self.error = f"short write for {name}"
-            raise RecordingError(self.error)
+            self._fail(f"short write for {name}")
         self.entries.append({"file": name, "seq": int(seq), "t": round(float(t), 4), "bytes": len(data),
                              "crc32": zlib.crc32(data)})
         self.bytes += len(data)

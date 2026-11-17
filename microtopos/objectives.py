@@ -276,15 +276,29 @@ def commit_edit(directory: Path | None, store, old: ObjectiveSet, new_objs: list
         old_by_name = {o.name: o for o in old.objectives}
         inverse = {b: a for a, b in renames.items()}
         for o in new_objs:
-            prev = old_by_name.get(inverse.get(o.name, o.name))
+            if o.name in inverse:
+                prev = old_by_name.get(inverse[o.name])
+            elif o.name in renames:
+                prev = None
+            else:
+                prev = old_by_name.get(o.name)
             c = store.cals.get(o.name)
-            if prev is not None and prev.magnification != o.magnification and c is not None \
-                    and c.lateral_um_per_px_full:
+            if c is None or not c.lateral_um_per_px_full:
+                continue
+            ref_mag = prev.magnification if prev is not None else c.lateral_magnification
+            if ref_mag is not None and ref_mag != o.magnification:
                 c.lateral_um_per_px_full, c.lateral_source, c.lateral_date = None, "", ""
+                c.lateral_magnification = None
                 store.touch(o.name)
-                notes.append(f"{o.name}: magnification changed from {prev.magnification:g}x to "
+                notes.append(f"{o.name}: magnification changed from {ref_mag:g}x to "
                              f"{o.magnification:g}x, so its lateral calibration was cleared; measure it again.")
+            elif c.lateral_magnification is None:
+                c.lateral_magnification = o.magnification
         kept = [n for n in old.names if n not in names and n not in renames and store.has_data(n)]
+        for n in kept:
+            c = store.cals.get(n)
+            if c is not None and c.lateral_um_per_px_full and c.lateral_magnification is None:
+                c.lateral_magnification = old_by_name[n].magnification
         notes += [f"{n!r} was removed from the list; its calibration is kept and returns if you add it again."
                   for n in kept]
     src = source or (old.source if old.source.endswith("+ edited") else f"{old.source} + edited")

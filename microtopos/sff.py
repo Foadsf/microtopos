@@ -61,7 +61,7 @@ def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5) -> int | None:
     lt = np.log(tiles + 1e-6)
     mids = []
     for j in range(lt.shape[1]):
-        tr = np.convolve(lt[:, j], np.ones(3) / 3, mode="same")
+        tr = np.convolve(np.pad(lt[:, j], 1, mode="edge"), np.ones(3) / 3, mode="valid")
         pk, _ = find_peaks(tr, prominence=min_prominence, distance=4)
         if len(pk) >= 2:
             mids.append(0.5 * (pk[0] + pk[-1]))

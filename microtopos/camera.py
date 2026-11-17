@@ -69,12 +69,20 @@ class V4L2Controls:
     def __init__(self, path: str):
         self.path = path
         self.available = bool(path) and shutil.which("v4l2-ctl") is not None
+        self._lock = threading.Lock()
+        self.last_error: str | None = None
 
     def list(self) -> dict[str, dict]:
         if not self.available:
             return {}
-        out = subprocess.run(["v4l2-ctl", "-d", self.path, "--list-ctrls"], capture_output=True, text=True,
-                             timeout=3).stdout
+        with self._lock:
+            try:
+                out = subprocess.run(["v4l2-ctl", "-d", self.path, "--list-ctrls"], capture_output=True, text=True,
+                                     timeout=3).stdout
+                self.last_error = None
+            except (subprocess.SubprocessError, OSError) as e:
+                self.last_error = str(e)
+                return {}
         ctrls = {}
         for line in out.splitlines():
             m = re.match(r"\s*(\w+)\s+0x[0-9a-f]+\s+\((\w+)\)\s*:\s*(.*)", line)
@@ -88,8 +96,14 @@ class V4L2Controls:
         """Set controls in order and return what the device reports afterwards."""
         if not self.available:
             return {}
-        for k, v in values.items():
-            subprocess.run(["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"], capture_output=True, timeout=3)
+        with self._lock:
+            for k, v in values.items():
+                try:
+                    subprocess.run(["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"],
+                                   capture_output=True, timeout=3)
+                except (subprocess.SubprocessError, OSError) as e:
+                    self.last_error = str(e)
+                    return {}
         cur = self.list()
         return {k: cur.get(k, {}).get("value") for k in values}
 
@@ -148,6 +162,7 @@ class CameraSource(FrameSource):
         self.req = (width, height, fps)
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
+        self._ctrl_lock = threading.Lock()
 
     def open(self) -> cv2.VideoCapture:
         api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
@@ -179,9 +194,13 @@ class CameraSource(FrameSource):
 
         Remembered and re-applied by the capture thread after the first frame and after every reconnect,
         because many UVC drivers reset or ignore controls set before streaming starts."""
-        self._want = (exposure, sharpness_off)
-        self._apply_pending = True
-        return self._apply_controls()
+        with self._ctrl_lock:
+            self._want = (exposure, sharpness_off)
+            self._apply_pending = True
+            if self._running:
+                return dict(getattr(self, "applied", {}))
+            self.applied = self._apply_controls()
+            return dict(self.applied)
 
     def _apply_controls(self, cap=None) -> dict:
         want = getattr(self, "_want", None)
@@ -279,11 +298,12 @@ class CameraSource(FrameSource):
             last_ok = time.perf_counter()
             self.error = None
             if getattr(self, "_apply_pending", False) or n_total == 0:
-                self._apply_pending = False
-                try:
-                    self.applied = self._apply_controls(cap)
-                except Exception as e:  # a missing control must not stop the stream
-                    self.applied = {"error": str(e)}
+                with self._ctrl_lock:
+                    self._apply_pending = False
+                    try:
+                        self.applied = self._apply_controls(cap)
+                    except Exception as e:  # a missing control must not stop the stream
+                        self.applied = {"error": str(e)}
             n_total += 1
             if raw.ndim == 3:  # the backend decoded already: raw MJPEG is not available from this camera
                 frame = raw

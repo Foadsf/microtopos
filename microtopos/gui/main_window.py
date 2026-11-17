@@ -864,7 +864,7 @@ class MainWindow(QMainWindow):
             return
         p = self.stage_driver.pose()
         self.lbl_stg_pose.setText(f"stage: X {p.x_um:+.2f} µm  Y {p.y_um:+.2f} µm  Z {p.z_um:+.2f} µm  "
-                                  f"({'busy' if p.busy else 'idle'})")
+                                  f"({'busy' if p.moving else 'idle'})")
 
     def _stage_jog(self, dx_um: float, dy_um: float):
         if self.stage_driver is None:
@@ -1220,7 +1220,7 @@ class MainWindow(QMainWindow):
         self.cmb_res.setVisible(self.sim_source is None)
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
-            self.replay_seek.setRange(0, max(0, self.source.total_frames() - 1))
+            self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()

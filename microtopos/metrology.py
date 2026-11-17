@@ -1,4 +1,5 @@
-"""ISO 25178-style areal surface texture parameters (not a certified implementation), texture and grains.
+"""ISO 25178-style areal surface texture parameters, ISO 21920 1D profile filtering,
+interactive 3-point levelling / mask / step-height metrology tools, texture and 2D/3D grains.
 
 Pipeline: F-operator (polynomial form removal) -> S-filter (Gaussian low-pass, nesting index lambda_s)
 -> optional L-filter (Gaussian high-pass, nesting index lambda_c) -> parameters on valid pixels only.
@@ -29,10 +30,18 @@ MIN_VALID_FRACTION = 0.30
 MIN_CUTOFF_PX = 4.0
 ACF_MIN_PAIRS = 200  # valid pixel pairs needed before an autocorrelation lag counts as measured
 FORM_NAMES = {0: "mean only", 1: "plane", 2: "quadratic", 3: "cubic"}
-PARAMETER_KEYS = ("Sa", "Sq", "Sp", "Sv", "Sz", "Ssk", "Sku", "Sdr_pct", "PSD_beta", "fractal_dimension", "psd_f",
-                  "psd_p", "psd_band", "Sk", "Spk", "Svk", "Smr1_pct", "Smr2_pct", "Sal_um", "Str", "Std_deg",
-                  "eligibility", "sl_surface", "valid_fraction", "filter_notes", "lambda_s_requested_um",
-                  "lambda_c_requested_um")
+PARAMETER_KEYS = (
+    "Sa", "Sq", "Sp", "Sv", "Sz", "Ssk", "Sku",
+    "Sdq", "Sdr_pct",
+    "PSD_beta", "fractal_dimension", "psd_f", "psd_p", "psd_band",
+    "Sk", "Spk", "Svk", "Smr1_pct", "Smr2_pct",
+    "Vmp", "Vmc", "Vvc", "Vvv",
+    "Sds_per_mm2", "Ssc_per_um", "Spd_per_mm2", "Spc_per_um", "S5p", "S5v", "S10z",
+    "Sal_um", "Str", "Std_deg",
+    "topo_grain_count", "topo_mean_grain_area_um2",
+    "eligibility", "sl_surface", "valid_fraction", "filter_notes",
+    "lambda_s_requested_um", "lambda_c_requested_um",
+)
 _METRO_WARN = ("reliable depth", "S-filter", "L-filter", "Sdr withheld")
 
 
@@ -63,6 +72,79 @@ def remove_form(z: np.ndarray, order: int = 1) -> np.ndarray:
     return np.where(valid, z - form, np.nan).astype(np.float32)
 
 
+def level_three_points(z: np.ndarray, pts_xy_px: list[tuple[float, float]], radius_px: int = 3) -> np.ndarray:
+    """Interactive 3-point levelling: subtract the plane passing through 3 user-selected points (or local patches)."""
+    if len(pts_xy_px) != 3:
+        raise ValueError("3-point levelling requires exactly 3 points")
+    h, w = z.shape
+    samples = []
+    for x, y in pts_xy_px:
+        ix, iy = round(x), round(y)
+        x0, x1 = max(0, ix - radius_px), min(w, ix + radius_px + 1)
+        y0, y1 = max(0, iy - radius_px), min(h, iy + radius_px + 1)
+        patch = z[y0:y1, x0:x1]
+        fin = patch[np.isfinite(patch)]
+        if not fin.size:
+            raise ValueError(f"point ({x:.1f}, {y:.1f}) has no valid height")
+        samples.append((float(x), float(y), float(np.median(fin))))
+    A = np.array([[1.0, p[0], p[1]] for p in samples], np.float64)
+    b = np.array([p[2] for p in samples], np.float64)
+    if abs(np.linalg.det(A)) < 1e-9:
+        raise ValueError("the 3 points are collinear")
+    c0, cx, cy = np.linalg.solve(A, b)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    plane = c0 + cx * xx + cy * yy
+    return np.where(np.isfinite(z), z - plane, np.nan).astype(np.float32)
+
+
+def apply_exclusion_mask(z: np.ndarray, rect_px: tuple[int, int, int, int], invert: bool = False) -> np.ndarray:
+    """Mask out a rectangular region `(x0, y0, x1, y1)` in pixel coordinates (or keep only that region if `invert`)."""
+    h, w = z.shape
+    x0, y0, x1, y1 = rect_px
+    x0, x1 = max(0, min(x0, x1)), min(w, max(x0, x1))
+    y0, y1 = max(0, min(y0, y1)), min(h, max(y0, y1))
+    mask = np.zeros((h, w), bool)
+    mask[y0:y1, x0:x1] = True
+    out = z.copy()
+    out[~mask if invert else mask] = np.nan
+    return out
+
+
+def step_height_regions(z: np.ndarray, rect_a_px: tuple[int, int, int, int],
+                        rect_b_px: tuple[int, int, int, int]) -> dict:
+    """ISO 5436-style two-region step height measurement with common-plane tilt removal."""
+    h, w = z.shape
+
+    def mask_of(r):
+        x0, y0, x1, y1 = r
+        m = np.zeros((h, w), bool)
+        m[max(0, min(y0, y1)):min(h, max(y0, y1)), max(0, min(x0, x1)):min(w, max(x0, x1))] = True
+        return m & np.isfinite(z)
+
+    ma, mb = mask_of(rect_a_px), mask_of(rect_b_px)
+    if ma.sum() < 9 or mb.sum() < 9:
+        raise ValueError("each step-height region needs at least 9 valid pixels")
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    both = ma | mb
+    # Fit z = c_a * I_a + c_b * I_b + gx * x + gy * y so a shared tilt across both terraces is removed
+    X = np.column_stack([ma[both].astype(float), mb[both].astype(float), xx[both], yy[both]])
+    coef, *_ = np.linalg.lstsq(X, z[both].astype(np.float64), rcond=None)
+    ca, cb, gx, gy = coef
+    step = float(cb - ca)
+    ra = z[ma] - (ca + gx * xx[ma] + gy * yy[ma])
+    rb = z[mb] - (cb + gx * xx[mb] + gy * yy[mb])
+    se = float(math.sqrt(np.var(ra) / ma.sum() + np.var(rb) / mb.sum()))
+    return {
+        "step_height": step,
+        "abs_step_height": abs(step),
+        "std_a": float(np.std(ra)),
+        "std_b": float(np.std(rb)),
+        "standard_error": se,
+        "pixels_a": int(ma.sum()),
+        "pixels_b": int(mb.sum()),
+    }
+
+
 def cutoff_resolvable(lam_um: float, um_per_px: float) -> bool:
     """Whether a Gaussian filter with this cutoff is qualified at this sampling (see MIN_CUTOFF_PX)."""
     return lam_um / um_per_px >= MIN_CUTOFF_PX
@@ -84,6 +166,82 @@ def gaussian_filter_nan(z: np.ndarray, lam_um: float, um_per_px: float) -> np.nd
     return np.where(valid & (den > 1e-3), num / np.maximum(den, 1e-6), np.nan).astype(np.float32)
 
 
+def gaussian_filter_1d_nan(prof: np.ndarray, lam_um: float, step_um: float) -> np.ndarray:
+    """ISO 16610-21 / ISO 21920 1D Gaussian low-pass filter on a line profile with NaN handling.
+
+    A cutoff below MIN_CUTOFF_PX samples is not resolvable: the unfiltered profile is returned so the
+    caller can still report metrics rather than crashing.
+    """
+    if lam_um <= 0 or lam_um / max(step_um, 1e-9) < MIN_CUTOFF_PX:
+        return prof.copy()
+    sigma = SIGMA_PER_LAMBDA * lam_um / step_um
+    valid = np.isfinite(prof)
+    if not valid.any():
+        return prof.copy()
+    v = valid.astype(np.float32).reshape(1, -1)
+    p0 = np.where(valid, prof, 0.0).astype(np.float32).reshape(1, -1)
+    ksize = math.ceil(sigma * 6.0) | 1
+    num = cv2.GaussianBlur(p0, (ksize, 1), sigmaX=sigma, sigmaY=0, borderType=cv2.BORDER_REFLECT).ravel()
+    den = cv2.GaussianBlur(v, (ksize, 1), sigmaX=sigma, sigmaY=0, borderType=cv2.BORDER_REFLECT).ravel()
+    return np.where(valid & (den > 1e-3), num / np.maximum(den, 1e-6), np.nan).astype(np.float32)
+
+
+def profile_parameters(prof: np.ndarray, step_um: float, lam_s_um: float = 0.0, lam_c_um: float = 0.0) -> dict:
+    """ISO 21920 1D profile filtering (F-operator line levelling -> S-filter -> L-filter) and Ra/Rq/Rz/Pt metrics.
+
+    Returns the primary profile (line levelled), waviness (L-filtered) and roughness profiles together with
+    Pa/Pq/Pt on the primary profile and Ra/Rq/Rp/Rv/Rz/Rsk/Rku on the roughness profile; Wa/Wq are added when
+    the waviness profile has enough samples.
+    """
+    valid = np.isfinite(prof)
+    if valid.sum() < 5:
+        return {}
+    x = np.arange(len(prof), dtype=np.float64) * step_um
+    # Least-squares line removal (F-operator)
+    slope, intercept = np.polyfit(x[valid], prof[valid].astype(np.float64), 1)
+    primary = np.where(valid, prof - (slope * x + intercept), np.nan).astype(np.float32)
+    if lam_s_um > 0 and lam_s_um / max(step_um, 1e-9) >= MIN_CUTOFF_PX:
+        primary = gaussian_filter_1d_nan(primary, lam_s_um, step_um)
+    if lam_c_um > 0 and lam_c_um / max(step_um, 1e-9) >= MIN_CUTOFF_PX:
+        waviness = gaussian_filter_1d_nan(primary, lam_c_um, step_um)
+        roughness = np.where(np.isfinite(primary) & np.isfinite(waviness), primary - waviness, np.nan)
+    else:
+        waviness = np.full_like(primary, np.nan)
+        roughness = primary
+    pv = primary[np.isfinite(primary)].astype(np.float64)
+    rv = roughness[np.isfinite(roughness)].astype(np.float64)
+    if rv.size < 4:
+        return {}
+    rv = rv - rv.mean()
+    pv = pv - pv.mean()
+    rq = float(np.sqrt(np.mean(rv * rv)))
+    # Rz over up to 5 sampling sections
+    n_sec = min(5, max(1, rv.size // 8))
+    chunks = np.array_split(rv, n_sec)
+    rz = float(np.mean([c.max() - c.min() for c in chunks if c.size]))
+    out = {
+        "primary_profile": primary,
+        "waviness_profile": waviness,
+        "roughness_profile": roughness,
+        "Pa": float(np.mean(np.abs(pv))),
+        "Pq": float(np.sqrt(np.mean(pv * pv))),
+        "Pt": float(pv.max() - pv.min()),
+        "Ra": float(np.mean(np.abs(rv))),
+        "Rq": rq,
+        "Rp": float(rv.max()),
+        "Rv": float(-rv.min()),
+        "Rz": rz,
+        "Rsk": float(np.mean(rv**3) / rq**3) if rq > 0 else 0.0,
+        "Rku": float(np.mean(rv**4) / rq**4) if rq > 0 else 0.0,
+    }
+    wv = waviness[np.isfinite(waviness)].astype(np.float64)
+    if wv.size >= 4:
+        wv = wv - wv.mean()
+        out["Wa"] = float(np.mean(np.abs(wv)))
+        out["Wq"] = float(np.sqrt(np.mean(wv * wv)))
+    return out
+
+
 def sl_surface(z: np.ndarray, um_per_px: float, form_order: int, lam_s: float, lam_c: float,
                notes: list | None = None) -> np.ndarray:
     """Form removal, then S- and L-filters. A filter whose cutoff is not resolvable is skipped and noted."""
@@ -103,20 +261,14 @@ def sl_surface(z: np.ndarray, um_per_px: float, form_order: int, lam_s: float, l
     return s
 
 
-def height_parameters(s: np.ndarray, um_per_px: float) -> dict:
-    v = s[np.isfinite(s)].astype(np.float64)
-    if v.size < 16:
-        return {}
-    v = v - v.mean()
-    sq = float(np.sqrt(np.mean(v * v)))
-    out = {"Sa": float(np.mean(np.abs(v))), "Sq": sq, "Sp": float(v.max()), "Sv": float(-v.min()),
-           "Sz": float(v.max() - v.min()),
-           "Ssk": float(np.mean(v**3) / sq**3) if sq > 0 else float("nan"),
-           "Sku": float(np.mean(v**4) / sq**4) if sq > 0 else float("nan")}
-    sdr = developed_area_ratio(s, um_per_px)
-    if sdr is not None:
-        out["Sdr_pct"] = sdr
-    return out
+def root_mean_square_gradient(s: np.ndarray, d: float) -> float | None:
+    """Sdq (dimensionless root-mean-square surface slope) per ISO 25178-2."""
+    gx = (s[:, 1:] - s[:, :-1])[:-1, :] / d
+    gy = (s[1:, :] - s[:-1, :])[:, :-1] / d
+    ok = np.isfinite(gx) & np.isfinite(gy)
+    if ok.sum() < 16:
+        return None
+    return float(np.sqrt(np.mean(gx[ok] ** 2 + gy[ok] ** 2)))
 
 
 def developed_area_ratio(s: np.ndarray, d: float) -> float | None:
@@ -137,11 +289,32 @@ def developed_area_ratio(s: np.ndarray, d: float) -> float | None:
     return float((np.mean(area) / d2 - 1.0) * 100.0)
 
 
+def height_parameters(s: np.ndarray, um_per_px: float) -> dict:
+    v = s[np.isfinite(s)].astype(np.float64)
+    if v.size < 16:
+        return {}
+    v = v - v.mean()
+    sq = float(np.sqrt(np.mean(v * v)))
+    out = {"Sa": float(np.mean(np.abs(v))), "Sq": sq, "Sp": float(v.max()), "Sv": float(-v.min()),
+           "Sz": float(v.max() - v.min()),
+           "Ssk": float(np.mean(v**3) / sq**3) if sq > 0 else float("nan"),
+           "Sku": float(np.mean(v**4) / sq**4) if sq > 0 else float("nan")}
+    sdq = root_mean_square_gradient(s, um_per_px)
+    if sdq is not None:
+        out["Sdq"] = sdq
+    sdr = developed_area_ratio(s, um_per_px)
+    if sdr is not None:
+        out["Sdr_pct"] = sdr
+    return out
+
+
 def functional_parameters(s: np.ndarray) -> dict:
-    """Material-ratio (Abbott-Firestone) parameters Sk, Spk, Svk, Smr1, Smr2 (ISO 25178-2 / ISO 13565-2 method).
+    """Material-ratio parameters Sk, Spk, Svk, Smr1, Smr2 and volume parameters Vmp, Vmc, Vvc, Vvv (ISO 25178-2).
 
     The equivalent straight line is the 40 % secant of the material-ratio curve with the smallest height
     difference; Spk and Svk are the heights of triangles with the same area as the peak and valley regions.
+    Volumes are computed from the 10 % / 80 % material-ratio levels: Vmp (above z_10), Vmc (core above z_80),
+    Vvc (core below z_10) and Vvv (below z_80), in height units per sampled area.
     """
     v = s[np.isfinite(s)].astype(np.float64)
     if v.size < 200:
@@ -151,15 +324,12 @@ def functional_parameters(s: np.ndarray) -> dict:
     z = np.sort(v)[::-1]  # heights from highest to lowest
     n = z.size
     mr = (np.arange(n) + 0.5) / n * 100.0  # material ratio (%) at each sorted height
-    w = int(round(0.4 * n))
+    w = round(0.4 * n)
     i = int(np.argmin(z[: n - w] - z[w:]))
     m1, z1, z2 = mr[i], z[i], z[i + w]
     slope = (z2 - z1) / (mr[i + w] - m1)
     z_at0 = z1 - slope * m1
     z_at100 = z1 + slope * (100.0 - m1)
-    # Smr1 / Smr2 are where the material-ratio curve crosses the core limits. With ties (a flat plateau) the
-    # crossing is the first sample at or below the upper limit and the last sample at or above the lower limit,
-    # which is continuous under tiny perturbations (strict counting jumped from 0 % to 90 % on a plateau).
     asc = z[::-1]
     i1 = n - int(np.searchsorted(asc, z_at0, side="right"))  # samples strictly above the upper limit
     i2 = n - int(np.searchsorted(asc, z_at100, side="left"))  # samples at or above the lower limit
@@ -169,17 +339,98 @@ def functional_parameters(s: np.ndarray) -> dict:
     a2 = (z_at100 - z[z < z_at100]).sum() / n * 100.0
     spk = 2 * a1 / smr1 if smr1 > 0 else 0.0
     svk = 2 * a2 / (100.0 - smr2) if smr2 < 100 else 0.0
-    return {"Sk": float(z_at0 - z_at100), "Spk": float(spk), "Svk": float(svk), "Smr1_pct": smr1, "Smr2_pct": smr2}
+    # ISO 25178-2 volume parameters (p = 10%, q = 80% material ratio):
+    # Units: height unit per unit area (when z is in µm, µm^3/µm^2 == mL/m^2)
+    idx_10 = min(n - 1, max(0, round(0.10 * n)))
+    idx_80 = min(n - 1, max(0, round(0.80 * n)))
+    z_10, z_80 = z[idx_10], z[idx_80]
+    vmp = float(np.maximum(z[:idx_10] - z_10, 0.0).sum() / n)
+    vmc = float(np.maximum(z[idx_10:idx_80] - z_80, 0.0).sum() / n)
+    vvc = float(np.maximum(z_10 - z[idx_10:idx_80], 0.0).sum() / n)
+    vvv = float(np.maximum(z_80 - z[idx_80:], 0.0).sum() / n)
+    return {
+        "Sk": float(z_at0 - z_at100), "Spk": float(spk), "Svk": float(svk),
+        "Smr1_pct": smr1, "Smr2_pct": smr2,
+        "Vmp": vmp, "Vmc": vmc, "Vvc": vvc, "Vvv": vvv,
+    }
+
+
+def feature_parameters(s: np.ndarray, um_per_px: float) -> dict:
+    """ISO 25178-2 summit / feature parameters: Sds, Ssc, Spd, Spc, S5p, S5v, S10z.
+
+    Sds: summit density (summits per mm²). Ssc: mean summit curvature (1/um). Spd: density of
+    Wolf-pruned significant peaks; Spc: their mean curvature. S5p/S5v: mean height/depth of the 5
+    highest peaks / 5 deepest pits; S10z = S5p + S5v.
+    """
+    valid = np.isfinite(s)
+    if valid.sum() < 64:
+        return {}
+    z = (s - np.nanmean(s)).astype(np.float32)
+    c = z[1:-1, 1:-1]
+    win_valid = (cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8))[1:-1, 1:-1] > 0)
+    nbr_max = np.full_like(c, -np.inf)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nbr_max = np.maximum(nbr_max, z[1 + dy:z.shape[0] - 1 + dy, 1 + dx:z.shape[1] - 1 + dx])
+    summits = win_valid & (c > nbr_max)
+    n_summits = int(summits.sum())
+    area_mm2 = float(valid[1:-1, 1:-1].sum()) * (um_per_px * 1e-3) ** 2
+    out: dict[str, float] = {}
+    if area_mm2 > 0:
+        out["Sds_per_mm2"] = n_summits / area_mm2
+    # Mean summit curvature: -0.5 * (d2z/dx2 + d2z/dy2) at summits (1/um)
+    d2x = (z[1:-1, 2:] - 2 * c + z[1:-1, :-2]) / (um_per_px ** 2)
+    d2y = (z[2:, 1:-1] - 2 * c + z[:-2, 1:-1]) / (um_per_px ** 2)
+    curv = -0.5 * (d2x + d2y)
+    if n_summits > 0:
+        out["Ssc_per_um"] = float(np.mean(curv[summits]))
+    # Wolf-pruned / h-minima significant hills & dales (5% Sz pruning per ISO 25178-2)
+    fin = z[valid]
+    sz = float(fin.max() - fin.min())
+    if sz > 1e-9:
+        h_prune = 0.05 * sz
+        z_fill = np.where(valid, z, float(np.nanmedian(z)))
+        peak_seeds = label(h_minima(-z_fill, h_prune))
+        pit_seeds = label(h_minima(z_fill, h_prune))
+        peak_heights, peak_curvs = [], []
+        for rp in regionprops(peak_seeds, intensity_image=z_fill):
+            coords = rp.coords
+            # exclude border-touching or invalid seeds
+            if np.all(valid[coords[:, 0], coords[:, 1]]):
+                vals = z_fill[coords[:, 0], coords[:, 1]]
+                mi = int(np.argmax(vals))
+                py, px = int(coords[mi, 0]), int(coords[mi, 1])
+                if 1 <= py < z.shape[0] - 1 and 1 <= px < z.shape[1] - 1 and win_valid[py - 1, px - 1]:
+                    peak_heights.append(float(z[py, px]))
+                    peak_curvs.append(float(curv[py - 1, px - 1]))
+        pit_depths = []
+        for rp in regionprops(pit_seeds, intensity_image=z_fill):
+            coords = rp.coords
+            if np.all(valid[coords[:, 0], coords[:, 1]]):
+                vals = z_fill[coords[:, 0], coords[:, 1]]
+                mi = int(np.argmin(vals))
+                py, px = int(coords[mi, 0]), int(coords[mi, 1])
+                if 1 <= py < z.shape[0] - 1 and 1 <= px < z.shape[1] - 1 and win_valid[py - 1, px - 1]:
+                    pit_depths.append(float(-z[py, px]))
+        if area_mm2 > 0:
+            out["Spd_per_mm2"] = len(peak_heights) / area_mm2
+        if peak_curvs:
+            out["Spc_per_um"] = float(np.mean(peak_curvs))
+        if peak_heights:
+            top5p = sorted(peak_heights, reverse=True)[:5]
+            out["S5p"] = float(np.mean(top5p))
+        if pit_depths:
+            top5v = sorted(pit_depths, reverse=True)[:5]
+            out["S5v"] = float(np.mean(top5v))
+        if "S5p" in out and "S5v" in out:
+            out["S10z"] = out["S5p"] + out["S5v"]
+    return out
 
 
 def spatial_parameters(s: np.ndarray, um_per_px: float, threshold: float = 0.2, notes: list | None = None) -> dict:
-    """Sal (fastest autocorrelation decay length to 0.2), Str (texture aspect ratio) and Std (lay direction).
-
-    The autocorrelation at each lag is normalised by the number of valid pixel pairs at that lag; a lag with
-    fewer than ACF_MIN_PAIRS pairs is unknown, not zero correlation. A direction whose decay is not observed
-    before an unknown lag is unknown, so Sal and Str are withheld rather than guessed. A flat field (no variance)
-    or a spectrum without a dominant direction gives no Std.
-    """
+    """Sal, Str and Std."""
     notes = [] if notes is None else notes
     valid = np.isfinite(s)
     if valid.mean() < MIN_VALID_FRACTION:
@@ -189,7 +440,7 @@ def spatial_parameters(s: np.ndarray, um_per_px: float, threshold: float = 0.2, 
         notes.append("Sal, Str and Std withheld: the surface has no height variation.")
         return {}
     h, w = z.shape
-    shape = (2 * h, 2 * w)  # zero padding: linear, not circular, autocorrelation
+    shape = (2 * h, 2 * w)
     acf = np.fft.fftshift(np.real(np.fft.ifft2(np.abs(np.fft.fft2(z, s=shape)) ** 2)))
     pairs = np.fft.fftshift(np.real(np.fft.ifft2(np.abs(np.fft.fft2(valid.astype(float), s=shape)) ** 2)))
     supported = pairs >= ACF_MIN_PAIRS
@@ -208,9 +459,9 @@ def spatial_parameters(s: np.ndarray, um_per_px: float, threshold: float = 0.2, 
         if below.size and below[0] < first_unknown:
             lengths.append(float(r[below[0]]))
         elif unknown.size:
-            lengths.append(np.nan)  # decay not observed before the support ran out
+            lengths.append(np.nan)
         else:
-            lengths.append(np.inf)  # observed all the way and never decayed (strong lay)
+            lengths.append(np.inf)
     lengths = np.array(lengths, float)
     out = {}
     n_unknown = int(np.sum(np.isnan(lengths)))
@@ -222,7 +473,6 @@ def spatial_parameters(s: np.ndarray, um_per_px: float, threshold: float = 0.2, 
             out["Sal_um"] = float(lengths.min() * um_per_px)
         if np.all(np.isfinite(lengths)):
             out["Str"] = float(lengths.min() / lengths.max())
-    # Std: the lay runs perpendicular to the direction of maximum spectral energy
     P = np.fft.fftshift(np.abs(np.fft.fft2(z * np.outer(np.hanning(h), np.hanning(w)))) ** 2)
     fy, fx = np.mgrid[-(h // 2):h - h // 2, -(w // 2):w - w // 2]
     ang = (np.degrees(np.arctan2(fy / h, fx / w)) + 180.0) % 180.0
@@ -300,7 +550,7 @@ def grains(img: np.ndarray, um_per_px: float, h_rel: float = 0.15) -> dict:
         try:
             hull = pts[ConvexHull(pts).vertices]
             feret.append(float(pdist(hull).max()) * um_per_px)
-        except Exception:  # degenerate (collinear) region
+        except Exception:  # degenerate (collinear) region  # noqa: BLE001
             feret.append(float(rp.feret_diameter_max) * um_per_px)
     out = {"grain_count": len(areas), "watershed_labels": labels}
     # Heyn mean lineal intercept on every 8th row and column: boundary crossings per unit line length
@@ -315,6 +565,39 @@ def grains(img: np.ndarray, um_per_px: float, h_rel: float = 0.15) -> dict:
         out.update(mean_grain_area_um2=float(np.mean(areas)), median_grain_area_um2=float(np.median(areas)),
                    mean_circularity=float(np.mean(circ)), mean_max_feret_um=float(np.mean(feret)),
                    grain_areas_um2=np.array(areas))
+    return out
+
+
+def grains_topographic(s: np.ndarray, um_per_px: float, h_rel: float = 0.15) -> dict:
+    """3D topographic hill/grain segmentation on the height map (`sl_surface`) via h-minima watershed.
+
+    Watershed runs on the gradient magnitude of the height field; markers are h-minima of that gradient
+    (flat hilltops / plateaus and depressions). Regions touching the border or below 20 px are excluded.
+    """
+    valid = np.isfinite(s)
+    if valid.mean() < MIN_VALID_FRACTION:
+        return {}
+    fill = float(np.nanmedian(s))
+    z_clean = np.where(valid, s, fill).astype(np.float32)
+    sm = cv2.GaussianBlur(z_clean, (0, 0), 1.0)
+    grad = cv2.magnitude(cv2.Sobel(sm, cv2.CV_32F, 1, 0), cv2.Sobel(sm, cv2.CV_32F, 0, 1))
+    gs = cv2.GaussianBlur(grad, (0, 0), 2.0)
+    hval = h_rel * float(np.percentile(gs[valid], 95))
+    if hval <= 0:
+        return {"topo_grain_count": 0}
+    markers = label(h_minima(gs, hval))
+    labels = watershed(grad, markers)
+    h, w = labels.shape
+    areas = []
+    for rp in regionprops(labels):
+        r0, c0, r1, c1 = rp.bbox
+        if r0 == 0 or c0 == 0 or r1 == h or c1 == w or rp.area < 20:
+            continue
+        if np.mean(valid[rp.coords[:, 0], rp.coords[:, 1]]) >= 0.8:
+            areas.append(rp.area * um_per_px ** 2)
+    out: dict = {"topo_grain_count": len(areas), "topo_watershed_labels": labels}
+    if areas:
+        out["topo_mean_grain_area_um2"] = float(np.mean(areas))
     return out
 
 
@@ -341,7 +624,7 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
         lam_s = lam_s_um
     res = {"valid_fraction": valid_frac, "um_per_px": um_per_px, "z_unit": z_unit, "lambda_s_um": lam_s,
            "lambda_c_um": lam_c_um, "form_order": form_order, "form_name": FORM_NAMES.get(form_order, "?"),
-           "warnings": []}
+           "lambda_s_default": lam_s_um is None, "warnings": []}
     s = sl_surface(height, um_per_px, form_order, lam_s, lam_c_um, notes)
     res["sl_surface"] = s
     # record what was APPLIED; a refused cut-off is kept separately so the report cannot claim it
@@ -354,7 +637,7 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
         reason = (f"only {valid_frac:.0%} of pixels have a reliable depth (needs {MIN_VALID_FRACTION:.0%})")
         res["warnings"].append(f"Only {valid_frac:.0%} of pixels have a reliable depth (< {MIN_VALID_FRACTION:.0%}); "
                                "height parameters withheld. Needs more texture, light or a wider focus sweep.")
-        for g in ("height", "functional", "spatial", "spectral", "Sdr"):
+        for g in ("height", "functional", "spatial", "spectral", "Sdr", "feature"):
             elig[g] = reason
     else:
         hp = height_parameters(s, um_per_px)
@@ -363,12 +646,18 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
         fp = functional_parameters(s)
         res.update(fp)
         elig["functional"] = "ok" if fp else "too few valid pixels (needs 200)"
+        feat = feature_parameters(s, um_per_px)
+        res.update(feat)
+        elig["feature"] = "ok" if feat else "too few valid pixels"
         sp_notes: list[str] = []
         res.update(spatial_parameters(s, um_per_px, notes=sp_notes))
         notes += sp_notes
         elig["spatial"] = "ok" if not sp_notes else "; ".join(sp_notes)
-        if z_unit != units.UM:  # Sdr needs heights and lateral spacing in the same unit
+        if z_unit != units.UM:  # Sdr and slope-derived quantities need heights and lateral spacing in the same unit
             res.pop("Sdr_pct", None)
+            res.pop("Sdq", None)
+            res.pop("Ssc_per_um", None)
+            res.pop("Spc_per_um", None)
             elig["Sdr"] = "withheld: heights are not in µm"
         else:
             elig["Sdr"] = "ok" if "Sdr_pct" in res else "too few valid 2x2 cells"
@@ -380,8 +669,9 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
             elig["spectral"] = "ok"
         else:
             elig["spectral"] = "field too small for a spectral band"
+        res.update(grains_topographic(s, um_per_px))
     elig["texture"] = "image-based (all-in-focus image, not heights)"
-    elig["grains"] = "image-based watershed of the all-in-focus image; not verified as metallurgical grains"
+    elig["grains"] = "image-based watershed of the all-in-focus image; topographic 3D regions also reported"
     res["eligibility"] = elig
     res["filter_notes"] = ([default_note] if default_note else []) + [n for n in notes if "filter" in n]
     res["warnings"] += [n for n in notes if "filter" in n]

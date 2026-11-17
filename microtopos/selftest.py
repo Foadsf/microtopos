@@ -117,7 +117,7 @@ def check_registration(seed):
     sim = SpecimenSimulator(seed, _obj("40x / 0.85"))
     zs = sim.sweep_trajectory()
     fr, tr = _frames(sim, zs)
-    warps, pairs = register_sweep(fr, factor=2)
+    warps, _ = register_sweep(fr, factor=2)
     ref = len(fr) // 2
     errs, serr = [], []
     for W, t in zip(warps, tr):
@@ -182,8 +182,8 @@ def check_hand_sweep(seed):
     return [("hand sweep (z unknown, direction stated): signed rank correlation", seed, f"{rho:+.3f}",
              f">= {THRESH['rank_r']}",
              rho >= THRESH["rank_r"]),
-            ("DOF ruler (experimental): um/frame error", seed, f"{err:+.0f}% (est {est or float('nan'):.3f}, "
-             f"true mean {true_step:.3f})", "info", None)]
+            ("DOF ruler (experimental): um/frame error", seed, (f"{err:+.0f}% (est {est or float('nan'):.3f}, "
+             f"true mean {true_step:.3f})"), "info", None)]
 
 
 def check_reversal(seed):
@@ -303,7 +303,7 @@ def check_fast_pan(seed, speeds=(30, 60)):
         n = int(2.5 * sim.out_w / v)
         xs = list(np.zeros(15)) + list(np.arange(1, n + 1) * v) + [n * v] * 20
         for i, xp in enumerate(xs):
-            vel = (xs[i] - xs[i - 1]) if i else 0.0
+            vel = (xp - xs[i - 1]) if i else 0.0
             sim.stage_x_um = xp * sim.um_per_px
             luma = bgr_to_luma(sim.render(motion_px=(-0.4 * vel, 0.0))[0])
             st, _, ev = sm.update(luma)
@@ -558,7 +558,7 @@ def check_unobservable_motion(seed):
     rows.append(("registration: textured (+2, -3) control", seed, f"({qx:+.3f}, {qy:+.3f}) {q.method}", "+/- 0.05",
                  abs(qx - 2) < 0.05 and abs(qy + 3) < 0.05 and q.ok))
     seq = [tex] * 3 + [flat] * 7 + [tex] * 3
-    warps, pairs = register_sweep(seq, ref=0, factor=1)
+    warps, _ = register_sweep(seq, ref=0, factor=1)
     worst = max(math.hypot(*W[:, 2]) for W in warps)
     rows.append(("registration chain through 7 blank frames: no invented motion", seed, f"max |shift| {worst:.2f} px",
                  "< 1", worst < 1.0))

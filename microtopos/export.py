@@ -137,8 +137,8 @@ def write_binary_stl(
     z_clean = np.where(valid, height_map, fill).astype(np.float32)
 
     scale = min(1.0, float(max_grid_dim) / float(max(h, w)))
-    gh = max(4, int(round(h * scale)))
-    gw = max(4, int(round(w * scale)))
+    gh = max(4, round(h * scale))
+    gw = max(4, round(w * scale))
     z_mesh = cv2.resize(z_clean, (gw, gh), interpolation=cv2.INTER_AREA) if (gh, gw) != (h, w) else z_clean
 
     # Rescale dx and dy so total physical span (w - 1)*pixel_um is preserved!
@@ -274,20 +274,34 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
 SESSION_SCHEMA = 2
 SESSION_ARRAYS = ("edf", "edf_proc", "height", "height_raw", "sl_surface", "confidence", "support", "mosaic_image",
                   "height_mosaic")
+MOSAIC_ARRAY_PREFIX = "mosaic_"
+MOSAIC_META_KEY = "mosaic_meta"
+MOSAIC_ARRAYS_KEY = "mosaic_arrays"
 _LIMIT_PX = 400_000_000  # refuse absurd arrays from a damaged or foreign file before touching the UI
 
 
 def save_session(path: Path | str, result: dict | None, settings: dict, extra: dict | None = None) -> None:
     """Schema-2 session: the result's original arrays (incl. the processing EDF and filtered surface), all scalars
-    and warnings, settings, and optionally a mosaic. `result` may be None for a mosaic-only session."""
+    and warnings, settings, and optionally a mosaic (keyframes, edges, patches, insets). `result` may be None for
+    a mosaic-only session; a Mosaic instance is passed via result["mosaic"] (or extra["mosaic"])."""
+    from .mosaic import Mosaic
+
     result = dict(result or {})
     result.update(extra or {})
+    mosaic = result.pop("mosaic", None)
+    if mosaic is not None and not isinstance(mosaic, Mosaic):
+        raise ExportError("result['mosaic'] must be a Mosaic instance")
     arrays = {k: result[k] for k in SESSION_ARRAYS if isinstance(result.get(k), np.ndarray)}
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
-    blob = json.dumps({"schema": SESSION_SCHEMA, "result": meta, "settings": _jsonable(settings),
-                       "has_result": "height" in arrays}, allow_nan=False)
+    blob = {"schema": SESSION_SCHEMA, "result": meta, "settings": _jsonable(settings),
+            "has_result": "height" in arrays}
+    if mosaic is not None:
+        mmeta, marrays = mosaic.to_state_arrays()
+        blob[MOSAIC_META_KEY] = mmeta
+        blob[MOSAIC_ARRAYS_KEY] = sorted(marrays)
+        arrays.update({MOSAIC_ARRAY_PREFIX + k: v for k, v in marrays.items()})
     buf = io.BytesIO()
-    np.savez_compressed(buf, __meta__=np.array(blob), **arrays)
+    np.savez_compressed(buf, __meta__=np.array(json.dumps(blob, allow_nan=False)), **arrays)
     _atomic_bytes(path, buf.getvalue())
 
 
@@ -295,23 +309,40 @@ def load_session(path: Path | str) -> tuple[dict, dict]:
     """Load and validate a session. Raises ValueError for a file that is inconsistent; returns (result, settings).
 
     result["session_schema"] says which schema the file had; schema-1 files lack the processing EDF and the
-    filtered surface, and result["migrated"] lists what the caller has to recompute."""
+    filtered surface, and result["migrated"] lists what the caller has to recompute. When the file contains a
+    saved mosaic, result["mosaic"] holds the reconstructed Mosaic (tracking can continue from it).
+    """
+    from .mosaic import Mosaic
+
     with np.load(path, allow_pickle=False) as z:
         if "__meta__" not in z.files:
             raise ValueError("not a MicroTopos session")
         meta = json.loads(str(z["__meta__"]))
         result = dict(meta.get("result", {}))
+        marrays = {}
         for k in SESSION_ARRAYS:
             if k in z.files:
                 a = z[k]
                 if a.size > _LIMIT_PX:
                     raise ValueError(f"array {k} is too large ({a.shape})")
                 result[k] = a
+        if MOSAIC_META_KEY in meta:
+            for name in meta.get(MOSAIC_ARRAYS_KEY, []):
+                key = MOSAIC_ARRAY_PREFIX + name
+                if key in z.files:
+                    a = z[key]
+                    if a.size > _LIMIT_PX:
+                        raise ValueError(f"array {key} is too large ({a.shape})")
+                    marrays[name] = a
     schema = int(meta.get("schema", 1))
     if schema > SESSION_SCHEMA:
         raise ValueError(f"session schema {schema} is newer than this program supports ({SESSION_SCHEMA})")
     result["session_schema"] = schema
     result["migrated"] = [k for k in ("edf_proc", "sl_surface") if "height" in result and k not in result]
+    if MOSAIC_META_KEY in meta:
+        mosaic = Mosaic()
+        mosaic.load_state_arrays(meta[MOSAIC_META_KEY], marrays)
+        result["mosaic"] = mosaic
     if "height" in result:
         h = result["height"]
         if h.ndim != 2:

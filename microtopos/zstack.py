@@ -16,6 +16,7 @@ Z coordinates
 from __future__ import annotations
 
 import datetime
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ import cv2
 import numpy as np
 
 from . import metrology, sff, units
+from .backend import focus_map_backend
 from .focus import focus_map, tile_scores
 from .optics import Objective
 from .registration import RegistrationCancelled, register_sweep, warp_scale_shift, warp_support, warp_to_reference
@@ -43,7 +45,9 @@ class ZSettings:
     workers: int = 4
     conf_threshold: float = 0.25
     memory_fraction: float = 0.8  # refuse a job whose estimated peak exceeds this share of available memory
-    backend: str = "cpu"  # "cpu" (reference) or "opencl" (DoG focus measure only, CPU fallback; see backend.py)
+    backend: str = "cpu"  # "cpu" (reference) or "opencl" (focus measure + guided filter; CPU fallback; see backend.py)
+    correct_breathing: bool = False  # estimate per-frame magnification drift with focus and compensate it
+    allow_tiling: bool = True  # split the volume into horizontal strips when RAM is tight
 
 
 def rescale_warp(W: np.ndarray, f: float) -> np.ndarray:
@@ -93,13 +97,16 @@ def hand_sweep_z(positions: np.ndarray, keep: np.ndarray) -> np.ndarray:
 def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective: Objective, um_per_px: float,
                 z_unit: str, z_um_per_frame: float | None = None, settings: ZSettings | None = None,
                 progress=None, cancelled=None, sample_pos: np.ndarray | None = None,
-                z_sign: int | None = None) -> dict:
+                z_sign: int | None = None,
+                color_frames: list[np.ndarray] | None = None) -> dict:
     """frames: radiometrically corrected luma (uint8 or float32), all the same size; um_per_px is THEIR pixel size.
 
     z_labels: physical z per frame (simulator ground truth or a motorised drive), or None for a hand sweep.
     z_um_per_frame: µm per source frame for this sweep; used only when z_labels is None.
     sample_pos: source frame number of each frame (default 0, 1, 2, ...); used only when z_labels is None.
     z_sign: +1 / -1 when the sweep direction is known (hand sweep); None = orientation unknown.
+    color_frames: full-resolution colour (BGR or grey) image per frame, aligned with `frames`; when given an
+    all-in-focus colour fusion is fused with the same warps and weights and returned as `edf_rgb`.
     """
     st = settings or ZSettings()
     z_unit = units.canon(z_unit)
@@ -127,6 +134,8 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         raise ValueError("frames of a sweep must all have the same size")
     if z_labels is not None and len(z_labels) != len(frames):
         raise ValueError(f"{len(z_labels)} z labels for {len(frames)} frames")
+    if color_frames is not None and len(color_frames) != len(frames):
+        raise ValueError(f"{len(color_frames)} colour frames for {len(frames)} frames")
     if sample_pos is not None:
         sample_pos = np.asarray(sample_pos, np.float64)
         if len(sample_pos) != len(frames) or not np.all(np.isfinite(sample_pos)) or np.any(np.diff(sample_pos) <= 0):
@@ -134,14 +143,14 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     if z_sign not in (None, 1, -1):
         raise ValueError("z_sign must be +1, -1 or None")
     f = max(1.0, W / float(st.proc_width))
-    pw, ph = int(round(W / f)), int(round(H / f))
+    pw, ph = round(W / f), round(H / f)
     f = W / pw
     um_proc = um_per_px * f
 
     # 1 ---- segmentation on small tiles -------------------------------------------------------------
     step("segment", 0.02, "Analysing sweep direction...")
     small_w = 320
-    sw, sh = small_w, int(round(H * small_w / W))
+    sw, sh = small_w, round(H * small_w / W)
     tiles = np.array([tile_scores(cv2.resize(fr, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32), grid=6)
                       for fr in frames])
     n_in = len(frames)
@@ -185,7 +194,10 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     n = len(idx)
     need = estimate_peak_bytes(n, ph, pw)
     avail = available_memory_bytes()
-    if avail is not None and need > st.memory_fraction * avail:
+    n_strips = 1
+    if avail is not None and st.allow_tiling and st.memory_fraction > 0:
+        n_strips = min(16, max(1, math.ceil(need / (st.memory_fraction * avail))))
+    if avail is not None and need > st.memory_fraction * avail and n_strips <= 1:
         raise MemoryError(f"This sweep needs about {need / 2**30:.1f} GiB but only {avail / 2**30:.1f} GiB is "
                           "available; lower the processing width or sweep with fewer frames.")
     done("segment")
@@ -199,7 +211,9 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     try:
         warps, pairs = register_sweep(list(proc), factor=reg_factor, workers=st.workers, cancelled=cancelled,
                                       progress=(lambda q: progress(0.08 + 0.3 * q, "Registering frames..."))
-                                      if progress else None)
+                                      if progress else None,
+                                      correct_breathing=st.correct_breathing,
+                                      z=None if not st.correct_breathing else [float(v) for v in z])
     except RegistrationCancelled:
         raise Cancelled() from None
     eccs = np.array([p.ecc for p in pairs if p.ok])
@@ -216,43 +230,114 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
 
     # 3 ---- focus volume (aligned frames are written into one preallocated stack) -------------------------
     step("focus", 0.4, "Computing focus volume...")
-    aligned = np.empty_like(proc)
-    support = np.ones((ph, pw), bool)
-    for k in range(n):
-        warp_to_reference(proc[k], warps[k], out=aligned[k])
-        support &= warp_support((ph, pw), warps[k])
-    del proc
     window = objective.focus_window_px(um_proc)
     psf_px = objective.psf_sigma_px(um_proc)
-    fv = np.empty_like(aligned)
-    from .backend import focus_map_backend
-    ran = set()
-    for k in range(n):
-        if k % 16 == 0:
-            check_cancel()
-        fv[k], used = focus_map_backend(aligned[k], st.measure, window, psf_px, st.backend)
-        ran.add(used)
-    # the focus window reaches window//2 px: pixels that close to unobserved border are not supported either
-    r = window // 2
-    support = cv2.erode(support.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8),
-                        borderType=cv2.BORDER_CONSTANT, borderValue=1).astype(bool)
-    done("focus")
 
-    # 4 ---- depth -------------------------------------------------------------------------------------
-    step("depth", 0.5, "Fitting depth and confidence...")
-    fit = sff.fit_depth(fv, z, st.conf_threshold)
-    fit.z[~support] = np.nan
-    fit.confidence[~support] = 0.0
-    wts = sff.softmax_weights_inplace(fv)  # fv is not needed any more: becomes the fusion weights
-    del fv
-    edf_proc = np.zeros((ph, pw), np.float32)
-    for k in range(n):
-        edf_proc += wts[k] * aligned[k]
-    del aligned
-    check_cancel()
-    height = sff.refine_depth(fit.z, fit.confidence, edf_proc, radius=max(2, window // 2))
-    height[~support] = np.nan
-    done("depth")
+    def process_volume_tiled(n_strips: int):
+        """Focus volume, depth fit and EDF fusion in horizontal strips with overlap halos, so peak memory
+        stays bounded instead of growing with the sweep length. Returns (fit, height, confidence, support,
+        edf_proc, wts, ran)."""
+        splits = np.array_split(np.arange(ph), n_strips)
+        height = np.full((ph, pw), np.nan, np.float32)
+        confidence = np.zeros((ph, pw), np.float32)
+        support = np.zeros((ph, pw), bool)
+        wts = np.empty((n, ph, pw), np.float32)
+        edf_proc = np.zeros((ph, pw), np.float32)
+        ran = set()
+        fwhm_vals = []
+        aligned_full = np.empty((ph, pw), np.float32)
+        for rows in splits:
+            y0, y1 = int(rows[0]), int(rows[-1]) + 1
+            local = slice(y0, y1)
+            hh = y1 - y0
+            fv = np.empty((n, hh, pw), np.float32)
+            supp = np.ones((hh, pw), bool)
+            for k in range(n):
+                if k % 16 == 0:
+                    check_cancel()
+                # Strip-local reference→moving warp: fold the strip's row offset into the translation term so
+                # warpAffine's destination (strip-sized) lines up with the full-frame coordinates the warp was
+                # estimated in; writing into a full-size buffer with a strip-sized source silently misaligns
+                # every row below the strip.
+                Ws = warps[k].copy()
+                # Strip-local fold of the full-frame warp: dst pixel (u, v) in the strip is full-frame dst
+                # (u, v + y0), and the strip view's row coordinate y refers to proc row y + y0, so the
+                # view-relative source row is W(u, v + y0)_y - y0 -> fold (W[1,1] - 1) * y0 into the vertical
+                # translation. Without this, rows below the first strip source from outside the frame.
+                Ws[0, 2] += float(warps[k][0, 1]) * y0
+                Ws[1, 2] += float(warps[k][1, 1] - 1.0) * y0
+                warp_to_reference(proc[k][y0:y1], Ws, out=aligned_full[y0:y1])
+                strip = aligned_full[y0:y1]
+                supp &= warp_support((hh, pw), Ws)
+                fv[k], used = focus_map_backend(strip, st.measure, window, psf_px, st.backend)
+                ran.add(used)
+            r = window // 2
+            supp = cv2.erode(supp.astype(np.uint8),
+                             np.ones((2 * r + 1, 2 * r + 1), np.uint8),
+                             borderType=cv2.BORDER_CONSTANT, borderValue=1).astype(bool)
+            fit = sff.fit_depth(fv, z, st.conf_threshold)
+            fit.z[~supp] = np.nan
+            fit.confidence[~supp] = 0.0
+            wts[:, y0:y1] = sff.softmax_weights_inplace(fv)
+            del fv
+            acc = sff.EDFAccumulator((hh, pw))
+            for k in range(n):
+                warp_to_reference(proc[k], warps[k], out=aligned_full)
+                acc.add(aligned_full[local],
+                        cv2.resize(wts[k, y0:y1], (pw, hh), interpolation=cv2.INTER_LINEAR))
+            edf_proc[y0:y1] = acc.result()
+            del acc
+            height[y0:y1] = fit.z
+            confidence[y0:y1] = fit.confidence
+            support[y0:y1] = supp
+            fwhm_vals.append(fit.fwhm_z_median)
+        fwhm = float(np.median(fwhm_vals)) if fwhm_vals else float("nan")
+        fit = sff.DepthFit(height, height.copy(), confidence,
+                           np.zeros((ph, pw), np.int32), fwhm)
+        return fit, height, confidence, support, edf_proc, wts, ran
+
+    if n_strips == 1:
+        aligned = np.empty_like(proc)
+        support = np.ones((ph, pw), bool)
+        for k in range(n):
+            warp_to_reference(proc[k], warps[k], out=aligned[k])
+            support &= warp_support((ph, pw), warps[k])
+        del proc
+        fv = np.empty_like(aligned)
+        ran = set()
+        for k in range(n):
+            if k % 16 == 0:
+                check_cancel()
+            fv[k], used = focus_map_backend(aligned[k], st.measure, window, psf_px, st.backend)
+            ran.add(used)
+        # the focus window reaches window//2 px: pixels that close to unobserved border are not supported either
+        r = window // 2
+        support = cv2.erode(support.astype(np.uint8), np.ones((2 * r + 1, 2 * r + 1), np.uint8),
+                            borderType=cv2.BORDER_CONSTANT, borderValue=1).astype(bool)
+        done("focus")
+
+        # 4 ---- depth -------------------------------------------------------------------------------------
+        step("depth", 0.5, "Fitting depth and confidence...")
+        fit = sff.fit_depth(fv, z, st.conf_threshold)
+        fit.z[~support] = np.nan
+        fit.confidence[~support] = 0.0
+        wts = sff.softmax_weights_inplace(fv)  # fv is not needed any more: becomes the fusion weights
+        del fv
+        edf_proc = np.zeros((ph, pw), np.float32)
+        for k in range(n):
+            edf_proc += wts[k] * aligned[k]
+        del aligned
+        check_cancel()
+        height = sff.refine_depth(fit.z, fit.confidence, edf_proc, radius=max(2, window // 2),
+                                  backend=st.backend)
+        height[~support] = np.nan
+        done("depth")
+    else:
+        step("focus", 0.4, "Computing focus volume (tiled strips)...")
+        fit, height, _confidence, support, edf_proc, wts, ran = process_volume_tiled(n_strips)
+        done("focus")
+        step("depth", 0.5, "Fitting depth and confidence (tiled)...")
+        done("depth")
 
     # 5 ---- all-in-focus at capture resolution ---------------------------------------------------------
     step("edf", 0.62, "Fusing all-in-focus image...")
@@ -265,6 +350,24 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         if progress and j % 8 == 0:
             progress(0.62 + 0.23 * j / n, "Fusing all-in-focus image...")
     edf = np.clip(acc.result(), 0, 255).astype(np.float32)
+
+    # colour all-in-focus fusion with the same warps and weights (untiled path only)
+    edf_rgb = None
+    if color_frames is not None and n_strips == 1:
+        acc_rgb = sff.EDFAccumulator((H, W, 3))
+        for j, i in enumerate(idx):
+            check_cancel()
+            c_fr = color_frames[i]
+            if c_fr.ndim == 2:
+                c_fr = cv2.cvtColor(c_fr, cv2.COLOR_GRAY2BGR)
+            c_fr = np.clip(c_fr + 0.5, 0, 255).astype(np.uint8).astype(np.float32)
+            Wf = rescale_warp(warps[j], f)
+            acc_rgb.add(warp_to_reference(c_fr, Wf),
+                        cv2.resize(wts[j], (W, H), interpolation=cv2.INTER_LINEAR))
+            if progress and j % 8 == 0:
+                progress(0.84 + 0.04 * j / n, "Fusing the colour all-in-focus image...")
+        edf_rgb = cv2.cvtColor(np.clip(acc_rgb.result(), 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+        del acc_rgb
     del acc, wts
     done("edf")
 
@@ -288,7 +391,8 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         progress(1.0, f"Done in {timings['total']:.1f} s")
     return {
         **m,
-        "edf": edf, "edf_proc": edf_proc.astype(np.float32), "height": height, "height_raw": fit.z_raw,
+        "edf": edf, "edf_proc": edf_proc.astype(np.float32), "edf_rgb": edf_rgb,
+        "height": height, "height_raw": fit.z_raw,
         "confidence": fit.confidence, "support": support, "um_per_px_capture": um_per_px, "objective": objective.name,
         "objective_spec": objective.to_dict(),
         "frames_in": n_in, "frames_used": int(n), "reversal_at": reversal_at,

@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from microtopos import __version__  # noqa: E402
+from microtopos import __version__
 
 system = {"Linux": "linux", "Windows": "windows", "Darwin": "macos"}[platform.system()]
 arch = {"x86_64": "x86_64", "AMD64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}.get(platform.machine(),

@@ -19,10 +19,13 @@ from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from microtopos import export
+from microtopos.camera import ReplaySource
 from microtopos.gui.main_window import MainWindow
 from microtopos.gui.theme import DARK
 from microtopos.gui.widgets import ImagePanel
 from microtopos.mosaic import Mosaic
+from microtopos.recording import RecordingWriter
+from microtopos.stage import SimulatedStageDriver
 
 
 @pytest.fixture(scope="module")
@@ -228,6 +231,151 @@ def test_mosaic_session_save_and_load_roundtrip(window, qapp, tmp_path):
         w._load_session()
     _pump(qapp, 25)
     assert len(w.engine.mosaic.keyframes) == kf_before
+
+
+# ---------------------------------------------------------------- replay transport, stage driver, mosaic toggles
+
+def _make_recording(tmp_path, n_frames: int = 8):
+    d = tmp_path / "rec"
+    d.mkdir()
+    w = RecordingWriter(d, "sim")
+    for i in range(n_frames):
+        frame = np.full((16, 16, 3), fill_value=(10 * i) % 256, dtype=np.uint8)
+        w.add(frame, seq=i, t=0.1 * i)
+    w.close()
+    return d
+
+
+def _wait_for(qapp, cond, timeout: float = 5.0) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        qapp.processEvents()
+        time.sleep(0.02)
+        if cond():
+            return True
+    return False
+
+
+def test_replay_ui_transport_bar(tmp_path, qapp):
+    """Opening MainWindow(replay=...) shows the replay bar and the pause / seek / step / speed /
+    loop controls drive the ReplaySource (offscreen, no real camera)."""
+    rec_dir = _make_recording(tmp_path)
+    w = MainWindow(simulator_only=False, replay=str(rec_dir))
+    w.show()
+    _pump(qapp)
+    try:
+        assert isinstance(w.source, ReplaySource)
+        assert w.replay_widget.isVisible()
+        src: ReplaySource = w.source
+        assert src.total_frames == 8
+
+        # pause: the playback thread stops advancing
+        w.btn_replay_pause.click()
+        _pump(qapp, 10)
+        assert src.paused is True
+        assert w.btn_replay_pause.text() == "▶ Play"
+
+        # resume
+        w.btn_replay_pause.click()
+        _pump(qapp, 10)
+        assert src.paused is False
+        assert w.btn_replay_pause.text() == "‖ Pause"
+
+        # step forward: pauses and advances one frame
+        w.btn_replay_pause.click()  # pause first
+        _pump(qapp, 10)
+        start = src.position
+        w.btn_replay_step_f.click()
+        assert src.paused is True
+        assert src._seek_target == min(start + 1, src.total_frames - 1)
+        assert _wait_for(qapp, lambda: src.position == min(start + 1, src.total_frames - 1))
+
+        # seek via the slider
+        w.replay_seek.setValue(3)
+        w.replay_seek.sliderReleased.emit()
+        assert src._seek_target == 3
+        assert _wait_for(qapp, lambda: src.position == 3)
+
+        # speed
+        w.cmb_replay_speed.setCurrentText("2×")
+        _pump(qapp, 10)
+        assert src.speed == 2.0
+
+        # loop
+        w.chk_replay_loop.setChecked(True)
+        _pump(qapp, 10)
+        assert src.loop is True
+        w.chk_replay_loop.setChecked(False)
+        _pump(qapp, 10)
+        assert src.loop is False
+    finally:
+        w.close()
+        qapp.processEvents()
+
+
+def test_simulated_stage_connect_zero_and_zsweep(window, qapp):
+    w = window
+    assert w.sim_source is not None
+    assert w.cmb_stg.currentText() == "Simulated stage"
+
+    w.btn_stg_connect.click()
+    _pump(qapp)
+    assert isinstance(w.stage_driver, SimulatedStageDriver)
+    assert w.btn_stg_connect.text() == "Disconnect"
+    assert w.btn_stg_zero.isEnabled() and w.btn_stg_zsweep.isEnabled()
+    assert "idle" in w.lbl_stg_pose.text()
+
+    # move away, then zero
+    w.stage_driver.move_to(x_um=3.0, y_um=-1.5, z_um=2.0)
+    _pump(qapp)
+    w.btn_stg_zero.click()
+    _pump(qapp)
+    p = w.stage_driver.pose()
+    assert p.x_um == 0.0 and p.y_um == 0.0 and p.z_um == 0.0
+
+    # z-sweep ends at +5 µm
+    w.btn_stg_zsweep.click()
+    _pump(qapp)
+    p = w.stage_driver.pose()
+    assert p.z_um == 5.0
+
+    # disconnect
+    w.btn_stg_connect.click()
+    _pump(qapp)
+    assert w.stage_driver is None
+    assert w.btn_stg_connect.text() == "Connect"
+    assert "disconnected" in w.lbl_stg_pose.text()
+
+
+def test_mosaic_blend_rotation_and_rgb_toggles(window, qapp):
+    w = window
+    assert w.sim_source is not None
+    w._demo("sweep")
+    assert _wait_result(qapp, w)
+
+    # blending: feather <-> multiband
+    w.cmb_mblend.setCurrentText("multiband")
+    _pump(qapp)
+    assert w.engine.mosaic.blending == "multiband"
+    w.cmb_mblend.setCurrentText("feather")
+    _pump(qapp)
+    assert w.engine.mosaic.blending == "feather"
+
+    # rotation tracking
+    w.chk_rot_track.setChecked(True)
+    _pump(qapp)
+    assert w.track_rotation is True and w.engine.mosaic.track_rotation is True
+    w.chk_rot_track.setChecked(False)
+    _pump(qapp)
+    assert w.track_rotation is False and w.engine.mosaic.track_rotation is False
+
+    # mosaic RGB
+    w.chk_mosaic_rgb.setChecked(True)
+    _pump(qapp)
+    assert w.mosaic_rgb is True
+    w.chk_mosaic_rgb.setChecked(False)
+    _pump(qapp)
+    assert w.mosaic_rgb is False
 
 
 # ---------------------------------------------------------------- negative controls

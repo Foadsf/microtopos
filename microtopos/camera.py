@@ -493,10 +493,17 @@ class ReplaySource(FrameSource):
             self.done = False
 
     def step_frames(self, delta: int = 1) -> None:
-        """Pause and step by `delta` frames."""
+        """Pause and step by `delta` frames from the last committed position.
+
+        The step bases on ``self.position`` (the frame the playback thread has
+        actually published), never on a pending ``_seek_target``: ``resume()`` at
+        EOF may leave ``_seek_target == 0`` until the thread wakes up to consume
+        it, and ``pause()`` can arrive before that consumption. A step must never
+        restart from that stale target.
+        """
         with self._ctrl_lock:
             self.paused = True
-            base = self._seek_target if self._seek_target is not None else self.position
+            base = self.position
             self._seek_target = int(np.clip(base + delta, 0, max(0, len(self.files) - 1)))
             self.done = False
 
@@ -562,7 +569,8 @@ class ReplaySource(FrameSource):
                 f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
                 img = decode(f)
                 if img is not None:
-                    self.position = idx
+                    with self._ctrl_lock:
+                        self.position = idx
                     self._publish(img, ts=ts, step=1)
                     prev_seq = rseq
                 t_anchor = time.perf_counter()
@@ -599,7 +607,8 @@ class ReplaySource(FrameSource):
                 idx += 1
                 continue
             step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
-            self.position = idx
+            with self._ctrl_lock:
+                self.position = idx
             self._publish(img, ts=ts, step=step)
             prev_seq = rseq
             self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd

@@ -16,6 +16,7 @@ import os
 import threading
 import zlib
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 import cv2
@@ -194,7 +195,7 @@ def load_manifest(folder: Path | str) -> Manifest:
         mode = "mjpeg-raw"
     if not files:
         raise ValueError(f"{folder}: the recording contains no usable frames")
-    back = sum(1 for a, b in zip(stamps, stamps[1:]) if b < a)
+    back = sum(1 for a, b in pairwise(stamps) if b < a)
     if back:
         warnings.append(f"timestamps go backwards {back} time(s); playback keeps file order")
     return Manifest(folder, files, stamps, seqs, mode, meta, warnings)
@@ -212,7 +213,7 @@ def decode(path: Path) -> np.ndarray | None:
     if raw is not None and raw.dtype == np.uint16:
         return raw
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    if img is not None and img.shape[0] == 1:
-        if raw is not None and raw.dtype == np.uint8 and raw.ndim == 2 and is_jpeg(raw.tobytes()):
-            return cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
+    if (img is not None and img.shape[0] == 1
+            and raw is not None and raw.dtype == np.uint8 and raw.ndim == 2 and is_jpeg(raw.tobytes())):
+        return cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
     return img

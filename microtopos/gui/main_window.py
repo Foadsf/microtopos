@@ -112,7 +112,7 @@ class Job(QThread):
             self.done.emit(res)
         except zstack.Cancelled:
             self.failed.emit("Cancelled.")
-        except Exception as e:  # surfaced to the user, never silently dropped
+        except Exception as e:  # surfaced to the user, never silently dropped  # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
@@ -584,14 +584,14 @@ class MainWindow(QMainWindow):
                 def initializeGL(self):
                     try:
                         super().initializeGL()
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # any OpenGL/pyqtgraph failure degrades to relief view
                         self.failed = True
 
                 def paintGL(self, *a, **k):
                     if not self.failed:
                         try:
                             super().paintGL(*a, **k)
-                        except Exception:
+                        except Exception:  # noqa: BLE001  # any OpenGL/pyqtgraph failure degrades to relief view
                             self.failed = True
 
             self.gl = SafeGL()
@@ -601,7 +601,7 @@ class MainWindow(QMainWindow):
             self.gl_surf.setVisible(False)  # an empty surface has no mesh: drawing it raises in pyqtgraph
             self.gl.addItem(self.gl_surf)
             lay.addWidget(self.gl, 1)
-        except Exception:
+        except Exception:  # noqa: BLE001  # OpenGL unavailable: fall back to a shaded relief view
             self.gl = None
         self.relief = ImagePanel(self.t, "No height map yet.")
         self.relief.setVisible(self.gl is None)
@@ -1783,7 +1783,7 @@ class MainWindow(QMainWindow):
             self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
             if mode == 2 and parts:
-                key, hz, horig, n = parts[0]
+                key, hz, horig, _ = parts[0]
                 self.p_mosaic.set_image(hz, m_um, unit=self._key_unit(key))
                 self.p_mosaic.set_overlay(None)
                 self.mosaic_origin = horig
@@ -2429,8 +2429,8 @@ class MainWindow(QMainWindow):
             ("Mean region area", "mean_grain_area_um2", "µm²", ""),
             ("Mean max Feret", "mean_max_feret_um", "µm", ""), ("Mean circularity", "mean_circularity", "", "4πA/P²"),
             ("Mean lineal intercept", "mean_intercept_um", "µm", "Heyn intercept on the region boundaries"),
-            ("ASTM E112-style G", "ASTM_E112_G", "", "From the mean intercept; needs calibrated X-Y and a real "
-             "grain structure")])
+            ("ASTM E112-style G", "ASTM_E112_G", "", ("From the mean intercept; needs calibrated X-Y and a real "
+             "grain structure"))])
         if self.chk_topo_grains.isChecked() and r is not None:
             body += table("Topographic grains", [
                 ("Grain count", "topo_grain_count", "", "Summits on the surface (Isaacson, watershed basins)", "{:d}"),
@@ -2586,8 +2586,8 @@ class MainWindow(QMainWindow):
                                       r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
                 kept = [w for w in r.get("warnings", []) if not metrology.is_metrology_warning(w)]
                 r["warnings"] = kept + m.pop("warnings") + [
-                    "Opened from an older session file: the processing image and the filtered surface were "
-                    "recomputed from the stored heights (the original processing image was not stored)."]
+                    ("Opened from an older session file: the processing image and the filtered surface were "
+                     "recomputed from the stored heights (the original processing image was not stored).")]
                 r.update({k: v for k, v in m.items() if k not in r or k in metrology.PARAMETER_KEYS})
             if isinstance(r.get("mosaic_image"), np.ndarray):
                 parts = []

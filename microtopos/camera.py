@@ -49,7 +49,8 @@ def list_cameras() -> list[CameraInfo]:
         for dev in sorted(glob.glob("/dev/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0)):
             idx = int(re.sub(r"\D", "", dev))
             try:
-                name = open(f"/sys/class/video4linux/video{idx}/name").read().strip()
+                with open(f"/sys/class/video4linux/video{idx}/name") as fh:
+                    name = fh.read().strip()
             except OSError:
                 name = dev
             if _v4l2_is_capture(dev):
@@ -67,7 +68,7 @@ def _v4l2_is_capture(dev: str) -> bool:
     if shutil.which("v4l2-ctl"):
         try:
             out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
-                                 timeout=3).stdout
+                                 timeout=3, check=False).stdout
             return "[0]:" in out or "Pixel Format" in out
         except (subprocess.SubprocessError, OSError):
             return False
@@ -90,7 +91,7 @@ class V4L2Controls:
         with self._lock:
             try:
                 out = subprocess.run(["v4l2-ctl", "-d", self.path, "--list-ctrls"], capture_output=True, text=True,
-                                     timeout=3).stdout
+                                     timeout=3, check=False).stdout
                 self.last_error = None
             except (subprocess.SubprocessError, OSError) as e:
                 self.last_error = str(e)
@@ -112,7 +113,7 @@ class V4L2Controls:
             for k, v in values.items():
                 try:
                     subprocess.run(["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"],
-                                   capture_output=True, timeout=3)
+                                   capture_output=True, timeout=3, check=False)
                 except (subprocess.SubprocessError, OSError) as e:
                     self.last_error = str(e)
                     return {}
@@ -340,7 +341,7 @@ class CameraSource(FrameSource):
                 self._apply_pending = False
                 try:
                     self.applied = self._apply_controls(cap)
-                except Exception as e:  # a missing control must not stop the stream
+                except Exception as e:  # a missing control must not stop the stream  # noqa: BLE001
                     self.applied = {"error": str(e)}
             n_total += 1
             if raw.ndim == 3 or raw.dtype == np.uint16:
@@ -410,7 +411,7 @@ class SimulatorSource(FrameSource):
             zs = s.sweep_trajectory(reversal=reversal)
             # move to the start smoothly (as a hand would), pause briefly, then sweep
             approach = np.linspace(s.focus_z_um, zs[0], 25)
-            p = lambda z: (s.stage_x_um, s.stage_y_um, float(z))  # noqa: E731
+            p = lambda z: (s.stage_x_um, s.stage_y_um, float(z))
             back = np.linspace(zs[-1], self._best_focus(), 30)  # refocus afterwards, as a user would
             self.script = [p(z) for z in approach] + [p(zs[0])] * 6 + [p(z) for z in zs] + [p(zs[-1])] * 25 \
                 + [p(z) for z in back]

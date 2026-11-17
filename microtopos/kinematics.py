@@ -85,7 +85,7 @@ class StateMachine:
     def _small(self, luma: np.ndarray) -> np.ndarray:
         h, w = luma.shape
         sw = self.analysis_width
-        return cv2.resize(luma, (sw, max(8, int(round(h * sw / w)))), interpolation=cv2.INTER_AREA)
+        return cv2.resize(luma, (sw, max(8, round(h * sw / w))), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _robust(values, floor):
@@ -236,7 +236,7 @@ def motion_match(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
     ba, bb = _band(a), _band(b)
     win = cv2.createHanningWindow((w, h), cv2.CV_32F)
     dx, dy, _ = phase_shift(ba, bb, win)
-    ix, iy = int(round(dx)), int(round(dy))
+    ix, iy = round(dx), round(dy)
     ow, oh = w - abs(ix), h - abs(iy)
     if ow * oh < 0.4 * w * h:
         return dx, dy, 0.0

@@ -90,7 +90,7 @@ def drizzle(frames: list[np.ndarray], shifts: list[tuple[float, float]], scale: 
         y0, y1 = cy - hx, cy + hx
         jx0 = np.floor(x0 + 0.5).astype(int)
         jy0 = np.floor(y0 + 0.5).astype(int)
-        span = int(math.ceil(2 * hx)) + 1
+        span = math.ceil(2 * hx) + 1
         vals = f.astype(np.float64).ravel()
         for oy in range(span):
             jy = jy0 + oy

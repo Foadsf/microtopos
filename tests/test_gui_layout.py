@@ -10,8 +10,8 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pg = pytest.importorskip("pyqtgraph")
-from PySide6.QtCore import QSettings, QStandardPaths  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QSettings, QStandardPaths
+from PySide6.QtWidgets import QApplication
 
 
 @pytest.fixture(scope="module")
@@ -125,9 +125,9 @@ def test_reopening_a_maximised_window_leaves_no_stray_dock_separators(tmp_path):
     script.write_text(_REOPEN_MAXIMISED)
     env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
     r = subprocess.run(["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "sh", "-c",
-                        f"metacity --replace >/dev/null 2>&1 & sleep 2; '{sys.executable}' '{script}' '{tmp_path}' "
-                        f"{_SAVED_GEOMETRY} {_SAVED_STATE}"],
-                       capture_output=True, text=True, timeout=180, env=env)
+                        (f"metacity --replace >/dev/null 2>&1 & sleep 2; '{sys.executable}' '{script}' '{tmp_path}' "
+                         f"{_SAVED_GEOMETRY} {_SAVED_STATE}")],
+                       capture_output=True, text=True, timeout=180, env=env, check=False)
     report = [line for line in r.stdout.splitlines() if line.startswith("maximised")]
     assert r.returncode != 3, f"the window manager did not maximise the window: {report}"
     assert r.returncode == 0, f"stray dock separators: {report or r.stderr[-1500:]}"

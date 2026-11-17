@@ -83,7 +83,7 @@ class ObjectiveCalibration:
 
 def radiometric_key(shape: tuple[int, int], exposure: float | None) -> str:
     h, w = shape[:2]
-    return f"{w}x{h}@{'auto' if exposure is None else int(round(exposure))}"
+    return f"{w}x{h}@{'auto' if exposure is None else round(exposure)}"
 
 
 def today() -> str:

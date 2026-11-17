@@ -87,7 +87,7 @@ def remove_shading(img: np.ndarray) -> np.ndarray:
     symmetric normalised kernel, it maps a quadratic q to q + const, so quadratic shading is removed exactly."""
     img = img.astype(np.float32)
     s = SHADING_SIGMA_FRACTION * min(img.shape[:2])
-    k = max(1, int(round(math.sqrt(4 * s * s + 1)))) | 1  # (k^2 - 1) / 12 per pass, three passes
+    k = max(1, round(math.sqrt(4 * s * s + 1))) | 1  # (k^2 - 1) / 12 per pass, three passes
     low = img
     for _ in range(3):
         low = cv2.blur(low, (k, k), borderType=cv2.BORDER_REFLECT)

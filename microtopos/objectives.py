@@ -293,6 +293,15 @@ def commit_edit(directory: Path | None, store, old: ObjectiveSet, new_objs: list
                 notes.append(f"{o.name}: magnification changed from {ref_mag:g}x to "
                              f"{o.magnification:g}x, so its lateral calibration was cleared; measure it again.")
             elif c.lateral_magnification is None:
+                if prev is None:
+                    # A calibration stored before magnifications were recorded, returning under a name that was not
+                    # in the list: nothing says which magnification it was measured at, so it cannot be checked.
+                    # It is kept (removal promises that) but never silently: the user is told to verify it.
+                    notes.append(f"{o.name}: its stored lateral calibration ({c.lateral_um_per_px_full:.4g} µm/px, "
+                                 f"{c.lateral_source or 'source not recorded'}) predates magnification tracking and "
+                                 f"could not be checked against {o.magnification:g}x. Verify it with a stage "
+                                 "micrometer, or clear it and measure again.")
+                    store.touch(o.name)
                 c.lateral_magnification = o.magnification
         kept = [n for n in old.names if n not in names and n not in renames and store.has_data(n)]
         for n in kept:

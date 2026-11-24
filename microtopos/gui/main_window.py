@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         self.bridge.sweep.connect(self._on_sweep)
         self.bridge.objective_hint.connect(self._on_objective_hint)
         self.source = None
+        self._readback_seq: int | None = None  # CameraSource.applied_seq shown in the "Device reports" label
         self.sim_source: SimulatorSource | None = None
         self.result: dict | None = None
         self.prev_result: dict | None = None
@@ -1091,19 +1092,27 @@ class MainWindow(QMainWindow):
         self.settings.setValue("exposure", self.sl_exp.value())
         self.engine.exposure = None if auto else float(self.sl_exp.value())
         if isinstance(self.source, CameraSource):
-            got = self.source.set_manual_exposure(None if auto else self.sl_exp.value())
-            self.cam_controls = got
+            # While streaming, the capture thread applies this with its next frame; _tick refreshes the readback
+            # when the device's answer arrives (CameraSource.applied_seq), so the label never shows a stale report.
+            self.source.set_manual_exposure(None if auto else self.sl_exp.value())
             self._show_readback()
         self.engine._corrector_key = None
 
     def _show_readback(self):
         if isinstance(self.source, CameraSource):
             rb = dict(self.source.readback)
-            rb.update(getattr(self, "cam_controls", {}) or {})
+            rb.update(self.source.applied)
+            self._readback_seq = self.source.applied_seq
             err = f"  Error: {self.source.error}" if self.source.error else ""
             self.lbl_readback.setText("Device reports: " + ", ".join(f"{k}={v}" for k, v in rb.items()) + err)
         else:
+            self._readback_seq = None
             self.lbl_readback.setText("Simulator: 640×360, randomised noise, MJPEG, tremor and focus breathing.")
+
+    def _refresh_readback(self):
+        """Show the device's answer as soon as the capture thread has applied a control request."""
+        if isinstance(self.source, CameraSource) and self.source.applied_seq != self._readback_seq:
+            self._show_readback()
 
     def _on_objective(self, name: str):
         obj = self.objset.get(name)
@@ -1451,6 +1460,7 @@ class MainWindow(QMainWindow):
         return ""
 
     def _tick(self):
+        self._refresh_readback()
         s = self.engine.snapshot()
         if s.preview is None:
             return
@@ -1732,7 +1742,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _reconstruct(self, cap: SweepCapture, force: bool = False):
-        if cap.completeness < 0.5 and not cap.manual and self.engine.sm.override != Override.Z and not force:
+        if not cap.usable and self.engine.sm.override != Override.Z and not force:
             # a quick refocus, or refocusing right after a successful sweep: not a failed attempt, stay quiet
             if len(cap.frames) < 45 or time.perf_counter() - self._result_t < 15.0:
                 return

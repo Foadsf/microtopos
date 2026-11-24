@@ -26,6 +26,9 @@ PREVIEW_W = 640
 MAX_SWEEP_FRAMES = 240  # beyond this, the sweep is thinned 2:1 (keeps the full z range)
 PREROLL = 12
 HOLD_FRAMES = 50  # ~4 s at 12.5 fps
+# A focus movement is a usable sweep once at least this fraction of the field went blurry -> sharp -> blurry.
+# The live engine, the GUI and the batch tool all decide through this constant (SweepCapture.usable).
+MIN_COMPLETENESS = 0.5
 
 
 @dataclass
@@ -47,6 +50,14 @@ class SweepCapture:
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
     manual: bool = False  # True when captured under manual Z override (Space)
+
+    @property
+    def usable(self) -> bool:
+        """Whether this capture is a sweep to reconstruct: complete enough, or deliberately marked by the user.
+
+        The engine also emits incomplete parts (a held half-sweep at the end of input, or one that timed out)
+        so that the GUI can tell the user why nothing was reconstructed; consumers must ask here."""
+        return self.manual or self.completeness >= MIN_COMPLETENESS
 
 
 class SweepBuffer:
@@ -328,7 +339,8 @@ class LiveEngine:
             if self._held is not None:
                 held, self._held = self._held, None
                 self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
-            elif self.sm.state == State.Z_SWEEP and len(self._buf) and _completeness(self._buf.tiles) >= 0.5:
+            elif self.sm.state == State.Z_SWEEP and len(self._buf) \
+                    and _completeness(self._buf.tiles) >= MIN_COMPLETENESS:
                 h, w = self._buf.frames[0].shape
                 sim = self._sweep_simulated or any(v is not None for v in self._buf.z)
                 self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape)
@@ -398,7 +410,7 @@ class LiveEngine:
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
         if self.sm.state == State.Z_SWEEP:
-            self.sm.sweep_complete = _completeness(self._buf.tiles + [tiles]) >= 0.5
+            self.sm.sweep_complete = _completeness(self._buf.tiles + [tiles]) >= MIN_COMPLETENESS
         state, feat, events = self.sm.update(prev)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
@@ -431,7 +443,7 @@ class LiveEngine:
                 sim_sweep = self._sweep_simulated or simulated
                 if ev.detail.get("aborted"):
                     self._held = None
-                elif manual or comp >= 0.5:
+                elif manual or comp >= MIN_COMPLETENESS:
                     self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape,
                                manual=manual)
                 else:  # incomplete: hold it for a few seconds in case focusing resumes

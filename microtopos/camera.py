@@ -162,7 +162,13 @@ class CameraSource(FrameSource):
         self.req = (width, height, fps)
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
+        # _ctrl_lock guards only the request (_want, _apply_pending) and the result (applied, applied_seq).
+        # It is never held while talking to the device: v4l2-ctl can take seconds, and the GUI thread asks here.
         self._ctrl_lock = threading.Lock()
+        self._want: tuple[int | None, bool] | None = None
+        self._apply_pending = False
+        self.applied: dict = {}  # what the device reported after the last time the controls were applied
+        self.applied_seq = 0  # incremented every time `applied` is replaced (the GUI refreshes its readback on it)
 
     def open(self) -> cv2.VideoCapture:
         api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
@@ -193,17 +199,34 @@ class CameraSource(FrameSource):
         """exposure in the device's units (UVC: 100 us). None = automatic exposure.
 
         Remembered and re-applied by the capture thread after the first frame and after every reconnect,
-        because many UVC drivers reset or ignore controls set before streaming starts."""
+        because many UVC drivers reset or ignore controls set before streaming starts.
+
+        While streaming this only records the request and returns at once: the capture thread applies it with
+        the next frame, then replaces `applied` and increments `applied_seq`. The value returned in that case is
+        the PREVIOUS device report; read `applied` after `applied_seq` has changed for the new one."""
         with self._ctrl_lock:
             self._want = (exposure, sharpness_off)
             self._apply_pending = True
             if self._running:
-                return dict(getattr(self, "applied", {}))
-            self.applied = self._apply_controls()
-            return dict(self.applied)
+                return dict(self.applied)
+        return self._apply_now()
 
-    def _apply_controls(self, cap=None) -> dict:
-        want = getattr(self, "_want", None)
+    def _apply_now(self, cap=None) -> dict:
+        """Apply the latest request to the device and publish what it reports. The lock is not held during I/O;
+        a request that arrives meanwhile leaves `_apply_pending` set and is applied on the next call."""
+        with self._ctrl_lock:
+            self._apply_pending = False
+            want = self._want
+        try:
+            applied = self._apply_controls(cap, want)
+        except Exception as e:  # noqa: BLE001 - a missing control must not stop the stream
+            applied = {"error": str(e)}
+        with self._ctrl_lock:
+            self.applied = applied
+            self.applied_seq += 1
+        return dict(applied)
+
+    def _apply_controls(self, cap=None, want: tuple[int | None, bool] | None = None) -> dict:
         if want is None:
             return {}
         exposure, sharpness_off = want
@@ -247,7 +270,7 @@ class CameraSource(FrameSource):
         not empty. MJPEG bytes are saved as they came; decoded frames (no raw mode) as lossless PNG."""
         from .recording import RecordingWriter
 
-        self.rec_writer = RecordingWriter(folder, self.info.name, dict(self.readback), dict(getattr(self, "applied", {})))
+        self.rec_writer = RecordingWriter(folder, self.info.name, dict(self.readback), dict(self.applied))
         self.rec_dir = self.rec_writer.folder
         self.rec_t0 = time.perf_counter()
         self.rec_error = None
@@ -297,13 +320,8 @@ class CameraSource(FrameSource):
                 continue
             last_ok = time.perf_counter()
             self.error = None
-            if getattr(self, "_apply_pending", False) or n_total == 0:
-                with self._ctrl_lock:
-                    self._apply_pending = False
-                    try:
-                        self.applied = self._apply_controls(cap)
-                    except Exception as e:  # a missing control must not stop the stream
-                        self.applied = {"error": str(e)}
+            if self._apply_pending or n_total == 0:
+                self._apply_now(cap)
             n_total += 1
             if raw.ndim == 3:  # the backend decoded already: raw MJPEG is not available from this camera
                 frame = raw

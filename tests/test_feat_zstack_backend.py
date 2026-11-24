@@ -522,12 +522,20 @@ def test_memory_guard_refuses_a_job_that_cannot_fit_even_in_strips(monkeypatch):
 def test_windows_available_memory_matches_the_os_report():
     import subprocess
 
+    def os_free_bytes() -> int:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+                             capture_output=True, text=True, timeout=60, check=False).stdout.strip()
+        return int(out) * 1024  # reported in KiB
+
+    # free memory moves while the suite runs (it moved 450 MB between two back-to-back readings under load): the
+    # query must lie between two OS readings taken just before and just after it, so a unit error (KiB vs bytes) or
+    # total-instead-of-available is still caught
+    before = os_free_bytes()
     got = zstack.available_memory_bytes()
-    out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                          "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
-                         capture_output=True, text=True, timeout=60, check=False).stdout.strip()
+    after = os_free_bytes()
     assert got is not None
-    assert got == pytest.approx(int(out) * 1024, rel=0.25)
+    assert 0.75 * min(before, after) <= got <= 1.25 * max(before, after), (before, got, after)
 
 def test_zstack_rgb_edf_is_a_sharp_colour_image():
     sim = SimulatorSource(9, OBJ, 160, 120)

@@ -26,7 +26,7 @@ from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
 from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
 from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
-from ..live import LiveEngine, SweepCapture
+from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
@@ -1667,7 +1667,7 @@ class MainWindow(QMainWindow):
             pct = s.sweep_completeness
             txt = (f"<b>Focus sweep in progress</b> — keep turning slowly <i>past</i> sharp until the image is blurry "
                    f"again, then stop.  {s.sweep_frames} frames · {pct:.0%} of the field has gone sharp and blurry again"
-                   + (" (enough)" if pct >= 0.5 else " (needs 50%)"))
+                   + (" (enough)" if pct >= MIN_COMPLETENESS else f" (needs {MIN_COMPLETENESS:.0%})"))
         elif s.state == State.OBJECTIVE_CHANGE:
             txt = "<b>The view changed abruptly</b> — if you turned the nosepiece, pick the objective in the banner."
         elif s.state == State.PAN and s.shift_px > 0.18 * self.engine.sm.analysis_width and not s.mosaic_lost:

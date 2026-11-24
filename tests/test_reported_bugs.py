@@ -475,6 +475,18 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
         w.p_height.set_image(np.ones((10, 10), np.float32), 1.0, levels=(3.0, 3.0))
         lo, hi = w.p_height.img.getLevels()
         assert hi > lo
+
+        # The coach's "(enough)" is the engine's decision (live.MIN_COMPLETENESS), not a second copy of the number
+        from types import SimpleNamespace
+
+        import microtopos.gui.main_window as mw
+
+        sweeping = SimpleNamespace(state=live.State.Z_SWEEP, sweep_completeness=0.6, sweep_frames=12)
+        w._update_guide(sweeping)
+        assert "60% of the field has gone sharp and blurry again (enough)" in w.guide.text()
+        monkeypatch.setattr(mw, "MIN_COMPLETENESS", 0.8)
+        w._update_guide(sweeping)
+        assert "(needs 80%)" in w.guide.text()
     finally:
         w.close()
         app.processEvents()

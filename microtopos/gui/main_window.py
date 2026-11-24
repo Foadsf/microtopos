@@ -131,6 +131,13 @@ def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
                              resolve_result(r).lateral_cutoff_um, form_order, lam_s, lam_c)
 
 
+def _feature_job(r, progress=None, cancelled=None):
+    """Spd/Spc/S5p/S5v/S10z and the topographic hills of the filtered surface (seconds per megapixel)."""
+    if progress:
+        progress(0.2, "Finding significant peaks and hills...")
+    return metrology.feature_set(r["sl_surface"], r["um_per_px"], r["z_unit"])
+
+
 def _rescale_job(r, factor, unit, progress=None, cancelled=None):
     if progress:
         progress(0.2, "Rescaling heights and recomputing metrology...")
@@ -559,17 +566,32 @@ class MainWindow(QMainWindow):
         h.addWidget(self.lbl_height, 1)
         self.btn_level3 = QPushButton("Level: pick 3 points")
         self.btn_level3.setCheckable(True)
+        self.btn_level3.setToolTip("Click 3 points on the height map; the measured height is levelled through them "
+                                   "and every layer and parameter is recomputed")
         self.btn_level3.toggled.connect(self._level_mode)
         h.addWidget(self.btn_level3)
         self.btn_mask = QPushButton("Exclude ROI")
-        self.btn_mask.setToolTip("Apply apply_exclusion_mask to the current height inside the mask ROI")
-        self.btn_mask.clicked.connect(self._apply_mask_roi)
+        self.btn_mask.setToolTip("First press shows the pink rectangle to place; the next press excludes its pixels "
+                                 "from the measured height and recomputes every parameter")
+        self.btn_mask.clicked.connect(lambda: self._tool_pressed("mask"))
         h.addWidget(self.btn_mask)
         self.btn_step = QPushButton("Step height A→B")
-        self.btn_step.clicked.connect(self._measure_step_roi)
+        self.btn_step.setToolTip("First press shows the two orange rectangles to place on the two terraces; the next "
+                                 "press measures the step between them (common-tilt removed)")
+        self.btn_step.clicked.connect(lambda: self._tool_pressed("step"))
         h.addWidget(self.btn_step)
-        self.chk_topo_grains = QCheckBox("Topographic grains")
-        self.chk_topo_grains.setToolTip("Summit/count parameters from metrology.grains_topographic on the surface")
+        self.btn_tool_cancel = QPushButton("Cancel tool")
+        self.btn_tool_cancel.clicked.connect(self._disarm_tools)
+        self.btn_tool_cancel.hide()
+        h.addWidget(self.btn_tool_cancel)
+        self.btn_tools_reset = QPushButton("Reset height tools")
+        self.btn_tools_reset.setToolTip("Restore the reconstructed height (undo levelling and exclusions)")
+        self.btn_tools_reset.setEnabled(False)
+        self.btn_tools_reset.clicked.connect(self._reset_height_tools)
+        h.addWidget(self.btn_tools_reset)
+        self.chk_topo_grains = QCheckBox("Feature parameters")
+        self.chk_topo_grains.setToolTip("Compute Spd, Spc, S5p, S5v, S10z and the topographic hills (Wolf-pruned peaks, "
+                                        "5 % of Sz) of the filtered surface; takes seconds per megapixel")
         self.chk_topo_grains.toggled.connect(self._show_result)
         h.addWidget(self.chk_topo_grains)
         return h
@@ -1108,7 +1130,10 @@ class MainWindow(QMainWindow):
         self.sp_lc.setDecimals(1)
         self.sp_lc.setSuffix(" µm")
         self.sp_lc.setSpecialValueText("off")
-        self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off")
+        self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off. "
+                              "Also the cut-off of the profile roughness on the Height tab "
+                              "(0 = a fifth of the profile length)")
+        self.sp_lc.valueChanged.connect(lambda _v: self._update_profile())
         f = QFormLayout()
         f.addRow("Mode", self.cmb_override)
         f.addRow("Focus measure", self.cmb_measure)
@@ -2230,11 +2255,12 @@ class MainWindow(QMainWindow):
                   self.sp_lc.value(), label="Metrology")
         self._start_job(job, lambda m, r=r: self._on_recomputed(r, m), main=True)
 
-    def _on_recomputed(self, r, m):
-        new = dict(r)
+    def _on_recomputed(self, r, m, base=None, message="Metrology recomputed with the new filter settings."):
+        """Install the metrology `m` computed from `base` (a height-edited copy of `r`) or from `r` itself."""
+        new = dict(r if base is None else base)
         for k in metrology.PARAMETER_KEYS:
             new.pop(k, None)
-        new["warnings"] = [x for x in r.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
+        new["warnings"] = [x for x in new.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
         new.update(m)
         for i, h in enumerate(self.history):
             if h is r:
@@ -2244,7 +2270,35 @@ class MainWindow(QMainWindow):
         self.prog.setValue(1000)
         self.lbl_job.setText("Metrology recomputed.")
         self._show_result()
-        self.notify("Metrology recomputed with the new filter settings.", "success")
+        self.notify(message, "success")
+
+    def _ensure_features(self):
+        """Start the on-demand feature job for the current result when the box is ticked and they are missing."""
+        r = self.result
+        if (r is None or not self.chk_topo_grains.isChecked() or r.get("features_done")
+                or any(getattr(j, "feature_for", None) is r and j.isRunning() for j in self.jobs)
+                or "sl_surface" not in r):
+            return
+        job = Job(_feature_job, r, label="Feature parameters")
+        job.feature_for = r
+        self._start_job(job, lambda m, r=r: self._on_features(r, m))
+
+    def _on_features(self, r, m):
+        if not any(h is r for h in self.history) and self.result is not r:
+            return  # the result was replaced (height tool, recompute) while this ran: its features are stale
+        new = dict(r)
+        new.update(m)
+        new["features_done"] = True
+        for i, h in enumerate(self.history):
+            if h is r:
+                self.history[i] = new
+        if self.result is r:
+            self.result = new
+        el = dict(new.get("eligibility", {}))
+        el["feature"] = "ok"
+        new["eligibility"] = el
+        self.lbl_job.setText("Feature parameters computed.")
+        self._show_result()
 
     def _run_sr(self):
         if self.sr_job is not None and self.sr_job.isRunning():
@@ -2359,14 +2413,8 @@ class MainWindow(QMainWindow):
             self.prof_roi.show()
         what = ["filtered height", "raw fitted height", "confidence (0–1)"][mode]
         self.lbl_height.setText(f"{what} · {r['valid_fraction']:.0%} reliable · {um:.3f} µm/px · {z_status_text(r)}")
-        if self.chk_topo_grains.isChecked() and mode == 0:
-            try:
-                gt = metrology.grains_topographic(r["sl_surface"], um)
-                r["topo_grain_count"] = int(gt.get("topo_grain_count", 0))
-                r["topo_mean_grain_area_um2"] = float(gt.get("topo_mean_grain_area_um2", 0.0))
-            except Exception:  # noqa: BLE001 - a bad grains estimate must not redraw the view
-                r.pop("topo_grain_count", None)
-                r.pop("topo_mean_grain_area_um2", None)
+        self.btn_tools_reset.setEnabled(bool(r.get("height_tools")))
+        self._ensure_features()
         self._update_profile()
         self._update_3d()
         self._render_report()
@@ -2402,12 +2450,35 @@ class MainWindow(QMainWindow):
             self.prof_label.setText(f"Confidence along {dist[-1]:.1f} µm: mean {np.mean(v):.2f}" if v.size
                                     else "No confidence values along the line.")
         elif v.size > 4:
-            v = v - v.mean()
-            self.prof_label.setText(f"Profile over {dist[-1]:.1f} µm ({v.size} of {n} points valid):  "
-                                    f"Ra {np.mean(np.abs(v)):.4g} {zl}  ·  Rq {np.sqrt(np.mean(v * v)):.4g} {zl}  ·  "
-                                    f"peak-to-valley {np.ptp(v):.4g} {zl}  (unfiltered profile; for orientation only)")
+            self.prof_label.setText(self._roughness_text(r, xs, ys, ok, dist, n))
         else:
             self.prof_label.setText("Too few valid heights along the line for profile values.")
+
+    def _roughness_text(self, r, xs, ys, ok, dist, n) -> str:
+        """ISO 21920 roughness along the profile line, computed by metrology.profile_parameters from the MEASURED
+        height (not the display layer): line levelling, the applied S-filter, and a Gaussian L-filter at λc."""
+        zl = units.label(r["z_unit"])
+        prof = np.full(n, np.nan, np.float32)
+        prof[ok] = cv2.remap(r["height"].astype(np.float32), xs[ok].astype(np.float32).reshape(1, -1),
+                             ys[ok].astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR).ravel()
+        step = float(dist[-1]) / (n - 1)
+        length = float(dist[-1])
+        lam_c = self.sp_lc.value()
+        origin = "L-filter setting"
+        if lam_c <= 0:
+            lam_c, origin = length / metrology.PROFILE_EVAL_CUTOFFS, "default: a fifth of the line"
+        lam_s = float(r.get("lambda_s_um") or 0.0)
+        why = metrology.profile_cutoff_problem(n, step, lam_c)
+        if why is not None:
+            return f"Profile too short for λc = {lam_c:.3g} µm ({origin}): {why}. No roughness reported."
+        p = metrology.profile_parameters(prof, step, lam_s_um=lam_s, lam_c_um=lam_c)
+        if not p:
+            return "Too few valid heights along the line for profile values."
+        s_txt = f"λs {p['lambda_s_applied_um']:.3g} µm" if p["lambda_s_applied_um"] else "no λs"
+        return (f"Roughness over {length:.1f} µm of measured height (ISO 21920 Gaussian filter: {s_txt}, "
+                f"λc {p['lambda_c_applied_um']:.3g} µm [{origin}], line levelled):  "
+                f"Ra {p['Ra']:.4g} {zl}  ·  Rq {p['Rq']:.4g} {zl}  ·  Rz {p['Rz']:.4g} {zl}  ·  "
+                f"Rp {p['Rp']:.4g} {zl}  ·  Rv {p['Rv']:.4g} {zl}")
 
     def _update_3d(self):
         r = self.result
@@ -2515,19 +2586,22 @@ class MainWindow(QMainWindow):
             ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
             ("Sdq", "Sdq", "rad", "Mean surface slope (gradient magnitude)", "{:.4g}", "height"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])
-        body += table("Volume parameters", [
-            ("Vmp", "Vmp", "µm³/µm²", "Material volume of the peaks (above the core plane)", "{:.4g}", "volume"),
-            ("Vmc", "Vmc", "µm³/µm²", "Material volume of the core", "{:.4g}", "volume"),
-            ("Vvc", "Vvc", "µm³/µm²", "Void volume of the core valleys", "{:.4g}", "volume"),
-            ("Vvv", "Vvv", "µm³/µm²", "Total void volume (valleys below the core plane)", "{:.4g}", "volume")])
+        vol_unit = "µm³/µm²" if units.is_um(r["z_unit"]) else f"{zu} (per unit area)"
+        body += table("Volume parameters (per unit area, p = 10 %, q = 80 %)", [
+            ("Vmp", "Vmp", vol_unit, "Material volume of the peaks: Vm(10 %)", "{:.4g}", "functional"),
+            ("Vmc", "Vmc", vol_unit, "Material volume of the core: Vm(80 %) − Vm(10 %)", "{:.4g}", "functional"),
+            ("Vvc", "Vvc", vol_unit, "Void volume of the core: Vv(10 %) − Vv(80 %)", "{:.4g}", "functional"),
+            ("Vvv", "Vvv", vol_unit, "Void volume of the valleys: Vv(80 %)", "{:.4g}", "functional")])
         body += table("Feature / summit parameters", [
-            ("Sds", "Sds_per_mm2", "summits/mm²", "Summit density (Isaacson summit definition)", "{:.4g}", "features"),
-            ("Ssc", "Ssc_per_um", "1/µm", "Mean summit curvature", "{:.4g}", "features"),
-            ("Spd", "Spd_per_mm2", "summits/mm²", "Density of significant (Wolf-pruned) peaks", "{:.4g}", "features"),
-            ("Spc", "Spc_per_um", "1/µm", "Mean curvature of the significant peaks", "{:.4g}", "features"),
-            ("S5p", "S5p", zu, "Mean height of the five highest peaks", "{:.4g}", "features"),
-            ("S5v", "S5v", zu, "Mean depth of the five deepest pits", "{:.4g}", "features"),
-            ("S10z", "S10z", zu, "S5p + S5v: peak-to-valley of the ten extremes", "{:.4g}", "features")])
+            ("Sds", "Sds_per_mm2", "summits/mm²", "Density of ALL 8-neighbour maxima (unpruned, noise-sensitive)",
+             "{:.4g}", "feature"),
+            ("Ssc", "Ssc_per_um", "1/µm", "Mean curvature at those summits", "{:.4g}", "feature"),
+            ("Spd", "Spd_per_mm2", "peaks/mm²", "Density of significant peaks (Wolf pruning, 5 % of Sz)",
+             "{:.4g}", "feature"),
+            ("Spc", "Spc_per_um", "1/µm", "Mean curvature of the significant peaks", "{:.4g}", "feature"),
+            ("S5p", "S5p", zu, "Mean height of the five highest significant peaks", "{:.4g}", "feature"),
+            ("S5v", "S5v", zu, "Mean depth of the five deepest significant pits", "{:.4g}", "feature"),
+            ("S10z", "S10z", zu, "S5p + S5v", "{:.4g}", "feature")])
         body += table("Material ratio (functional)", [
             ("Sk", "Sk", zu, "Core height (40% secant of the material ratio curve)", "{:.4g}", "functional"),
             ("Spk", "Spk", zu, "Reduced peak height", "{:.4g}", "functional"),
@@ -2555,9 +2629,11 @@ class MainWindow(QMainWindow):
             ("ASTM E112-style G", "ASTM_E112_G", "", ("From the mean intercept; needs calibrated X-Y and a real "
              "grain structure"))])
         if self.chk_topo_grains.isChecked() and r is not None:
-            body += table("Topographic grains", [
-                ("Grain count", "topo_grain_count", "", "Summits on the surface (Isaacson, watershed basins)", "{:d}"),
-                ("Mean grain area", "topo_mean_grain_area_um2", "µm²", "Mean watershed basin area")])
+            body += table("Topographic hills", [
+                ("Hill count", "topo_grain_count", "", ("Significant hills (watershed of the pruned peaks) not "
+                 "touching the border"), "{:d}", "feature"),
+                ("Mean hill area", "topo_mean_grain_area_um2", "µm²", "Mean catchment area of those hills", "{:.4g}",
+                 "feature")])
         prov = [("Result", r.get("label", "")), ("Result id", r.get("result_id", "—")), ("Objective", r["objective"]),
                 ("Source", f"{r.get('source_id', '—')} (generation {r.get('source_generation', '—')})"),
                 ("Frames used", f"{r['frames_used']} of {r['frames_in']}"),
@@ -2849,9 +2925,104 @@ class MainWindow(QMainWindow):
         self.notify(f"Inset added: {s.preview.shape[1]}×{s.preview.shape[0]} px")
 
     # ---------------------------------------------------------------- height interactive tools
+    # The tools act on the MEASURED height (result["height"]), whatever layer is displayed, and then the result's
+    # metrology is recomputed through the same job as a filter change (_metrology_job -> _on_recomputed), so the
+    # filtered surface, every displayed layer, every parameter and the report agree. The reconstructed height is
+    # kept in result["height_reconstructed"]; every edit is listed in result["height_tools"] and in the warnings.
+    TOOL_WARNING = "Height edited by the user"
+
+    def _tool_warning(self, rec: dict) -> str:
+        if rec["tool"] == "level3":
+            pts = ", ".join(f"({x:.0f}, {y:.0f})" for x, y in rec["points_px"])
+            return f"{self.TOOL_WARNING}: surface levelled through the 3 points {pts} px (plane subtracted)."
+        x0, y0, x1, y1 = rec["rect_px"]
+        return f"{self.TOOL_WARNING}: pixels x {x0}–{x1}, y {y0}–{y1} excluded (set to no data)."
+
+    def _commit_height_tool(self, new_height: np.ndarray, rec: dict, message: str):
+        """Replace the measured height by `new_height` and recompute all metrology from it (existing job)."""
+        r = self.result
+        base = dict(r)
+        if "height_reconstructed" not in base:
+            base["height_reconstructed"] = r["height"]
+            base["height_raw_at_edit"] = r.get("height_raw")
+        base["height"] = new_height
+        base["height_tools"] = list(r.get("height_tools", [])) + [rec]
+        base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
+        base["warnings"] += [self._tool_warning(x) for x in base["height_tools"]]
+        job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),
+                  label="Metrology")
+        self._start_job(job, lambda m, r=r, base=base: self._on_recomputed(r, m, base=base, message=message),
+                        main=True)
+
+    def _reset_height_tools(self):
+        r = self.result
+        if r is None or "height_reconstructed" not in r:
+            return
+        if r.get("height_raw") is not r.get("height_raw_at_edit"):
+            self.notify("The heights were rescaled after they were edited; reconstruct again to get the original.",
+                        "warning")
+            return
+        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_raw_at_edit", "height_tools")}
+        base["height"] = r["height_reconstructed"]
+        base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
+        job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),
+                  label="Metrology")
+        self._start_job(job, lambda m, r=r, base=base: self._on_recomputed(
+            r, m, base=base, message="Height tools reset: the reconstructed height is restored."), main=True)
+
+    def _disarm_tools(self):
+        """Hide every tool ROI and leave levelling mode."""
+        self._armed_tool = None
+        for roi in (self.mask_roi, self.step_roi_a, self.step_roi_b):
+            roi.hide()
+        self.btn_mask.setText("Exclude ROI")
+        self.btn_step.setText("Step height A→B")
+        self.btn_tool_cancel.hide()
+        if self.btn_level3.isChecked():
+            self.btn_level3.setChecked(False)  # leaves levelling mode through _level_mode
+
+    def _place_roi(self, roi, fx, fy, fw, fh):
+        """Position a tool ROI at a fraction of the height map (in µm group coordinates)."""
+        r = self.result
+        h, w = r["height"].shape
+        um = r["um_per_px"]
+        roi.setPos((fx * w * um, fy * h * um))
+        roi.setSize((fw * w * um, fh * h * um))
+
+    def _tool_pressed(self, which: str):
+        """First press arms the tool (its ROIs appear); the second press applies it."""
+        r = self.result
+        if r is None:
+            self.notify("No height map yet.", "warning")
+            return
+        if getattr(self, "_armed_tool", None) != which:
+            self._disarm_tools()
+            self._armed_tool = which
+            if which == "mask":
+                self._place_roi(self.mask_roi, 0.35, 0.35, 0.3, 0.3)
+                self.mask_roi.show()
+                self.btn_mask.setText("Apply exclusion")
+                self.notify("Move and resize the pink rectangle, then press “Apply exclusion”.")
+            else:
+                self._place_roi(self.step_roi_a, 0.1, 0.4, 0.3, 0.2)
+                self._place_roi(self.step_roi_b, 0.6, 0.4, 0.3, 0.2)
+                self.step_roi_a.show()
+                self.step_roi_b.show()
+                self.btn_step.setText("Measure step")
+                self.notify("Place the two orange rectangles on the two terraces, then press “Measure step”.")
+            self.btn_tool_cancel.show()
+            return
+        (self._apply_mask_roi if which == "mask" else self._measure_step_roi)()
+
     def _level_mode(self, on: bool):
         self.level_picking = bool(on)
         self.level_pts = []
+        if on:
+            for roi in (self.mask_roi, self.step_roi_a, self.step_roi_b):
+                roi.hide()
+            self._armed_tool = None
+            self.btn_mask.setText("Exclude ROI")
+            self.btn_step.setText("Step height A→B")
         self.btn_level3.setText("Finish: click 3 points" if on else "Level: pick 3 points")
         self.notify("Click 3 points on the height map to level it (local plane fit around each)." if on
                     else "3-point levelling cancelled.")
@@ -2866,82 +3037,56 @@ class MainWindow(QMainWindow):
         self.notify(f"Level point {len(self.level_pts)}/3 at ({x_px:.0f}, {y_px:.0f}) px")
         if len(self.level_pts) < 3:
             return
+        pts, self.level_pts = self.level_pts, []
         self.level_picking = False
         self.btn_level3.blockSignals(True)
         self.btn_level3.setChecked(False)
         self.btn_level3.setText("Level: pick 3 points")
         self.btn_level3.blockSignals(False)
-        mode = self.cmb_height.currentIndex()
-        if mode == 1:
-            z = r["height"].copy()
-        elif mode == 2:
-            z = r["confidence"].copy()
-        else:
-            z = r["sl_surface"].copy()
         um = r.get("um_per_px", 1.0)
-        levelled = metrology.level_three_points(z, self.level_pts, radius_px=max(3, round(10 / um)))
-        self.level_pts = []
-        if levelled.size == 0:
-            self.notify("3-point levelling produced nothing usable.", "warning")
+        radius = max(3, round(10 / um))
+        try:
+            levelled = metrology.level_three_points(r["height"], pts, radius_px=radius)
+        except ValueError as e:
+            self.notify(f"3-point levelling failed: {e}", "warning")
             return
-        new = dict(r)
-        new["height"] = levelled
-        self.result = new
-        self._show_result()
-        self.notify("Height map levelled through the 3 picked points.", "success")
+        self._commit_height_tool(levelled, {"tool": "level3", "points_px": [list(p) for p in pts],
+                                            "radius_px": radius},
+                                 "Height map levelled through the 3 picked points; all parameters recomputed.")
 
     def _apply_mask_roi(self):
         r = self.result
         if r is None:
             return
-        mode = self.cmb_height.currentIndex()
-        if mode == 1:
-            z = r["height"]
-        elif mode == 2:
-            z = r["confidence"]
-        else:
-            z = r["sl_surface"]
-        um = r.get("um_per_px", 1.0)
-        rect_px = self._roi_rect_px(self.mask_roi, um)
-        try:
-            masked = metrology.apply_exclusion_mask(z, rect_px)
-        except ValueError as e:
-            self.notify(str(e), "warning")
-            return
-        new = dict(r)
-        new["height"] = masked
-        self.result = new
-        self._show_result()
-        self.notify("Mask ROI excluded from the height map.", "success")
+        rect_px = self._roi_rect_px(self.mask_roi, r.get("um_per_px", 1.0))
+        masked = metrology.apply_exclusion_mask(r["height"], rect_px)
+        self._disarm_tools()
+        self._commit_height_tool(masked, {"tool": "exclude", "rect_px": list(rect_px)},
+                                 "Mask ROI excluded from the height map; all parameters recomputed.")
 
     def _measure_step_roi(self):
         r = self.result
         if r is None:
             return
-        mode = self.cmb_height.currentIndex()
-        if mode == 1:
-            z = r["height"]
-        elif mode == 2:
-            self.notify("Step height needs a height map (not the confidence view).", "warning")
-            return
-        else:
-            z = r["sl_surface"]
         um = r.get("um_per_px", 1.0)
         ra = self._roi_rect_px(self.step_roi_a, um)
         rb = self._roi_rect_px(self.step_roi_b, um)
         try:
-            m = metrology.step_height_regions(z, ra, rb)
+            m = metrology.step_height_regions(r["height"], ra, rb)
         except ValueError as e:
             self.notify(str(e), "warning")
             return
-        self.lbl_height.setText(f"Step A→B: {m['step_height']:+.4g} µm  (SE ±{m['standard_error']:.4g} µm, "
+        zl = units.label(r["z_unit"])
+        self.lbl_height.setText(f"Step A→B: {m['step_height']:+.4g} {zl}  (SE ±{m['standard_error']:.4g} {zl}, "
                                 f"{m['pixels_a']}/{m['pixels_b']} px)")
-        self.notify(f"Step height {m['step_height']:+.4g} µm.", "success")
+        self.notify(f"Step height {m['step_height']:+.4g} {zl}.", "success")
+        self._disarm_tools()
 
     @staticmethod
     def _roi_rect_px(roi, um):
         """ROI item rect (group/µm coords) converted to an integer pixel rect (x0, y0, x1, y1)."""
-        p = roi.pos(); s = roi.size()
+        p = roi.pos()
+        s = roi.size()
         return (round(p.x() / um), round(p.y() / um),
                 round((p.x() + s.x()) / um), round((p.y() + s.y()) / um))
 

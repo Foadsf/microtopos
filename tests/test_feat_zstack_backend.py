@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 import microtopos.optics as _optics  # monkeypatch target for the wavelength sweep
+from conftest import require_opencl
 from microtopos import objectives, zstack
 from microtopos.backend import focus_map_backend, guided_filter_backend, parity
 from microtopos.calibration import CalibrationStore, bgr_to_luma
@@ -127,24 +128,44 @@ def test_register_sweep_observes_breathing_scale_steps():
 # ------------------------------------------------------------------------------------------------ B2
 
 
-@pytest.mark.parametrize("measure", ["DoG band-pass", "Tenengrad", "SML"])
-def test_focus_map_backend_cpu_opencl_parity(measure):
-    img = _texture(3).astype(np.float32)
-    psf = OBJ.psf_sigma_px(1.0)
-    out_cpu, used_cpu = focus_map_backend(img, measure, 9, psf, "cpu")
-    assert used_cpu == "cpu"
-    assert out_cpu.shape == img.shape
-    assert np.isfinite(out_cpu).all()
-    out_req, used_req = focus_map_backend(img, measure, 9, psf, "opencl")
-    assert used_req in ("cpu", "opencl")
-    assert out_req.shape == img.shape and np.isfinite(out_req).all()
-    if used_req == "opencl":
-        rel, _mx = parity(out_cpu, out_req)
-        if rel >= 5e-3:
-            pytest.skip(f"OpenCL device diverges from the CPU reference for {measure} "
-                        f"(rel L2 {rel:.3f}); CPU fallback is used on this device")
-        assert rel < 5e-3
+PARITY_TOL = 1e-5  # relative L2 between the OpenCL result and the CPU reference (float32 arithmetic order only)
 
+
+@pytest.mark.parametrize("measure", ["DoG band-pass", "Tenengrad", "SML"])
+@pytest.mark.parametrize("window", [5, 9, 31])
+@pytest.mark.parametrize("shape", [(120, 160), (97, 211)])
+def test_focus_map_backend_opencl_equals_the_cpu_reference(measure, window, shape):
+    """The OpenCL path must compute the SAME measure as focus.focus_map (same kernels, window, border mode)."""
+    require_opencl()
+    img = _texture(3, shape).astype(np.float32)
+    psf = OBJ.psf_sigma_px(1.0)
+    out_cpu, used_cpu = focus_map_backend(img, measure, window, psf, "cpu")
+    assert used_cpu == "cpu"
+    assert np.array_equal(out_cpu, focus_map(img, measure, window, psf))
+    out_cl, used_cl = focus_map_backend(img, measure, window, psf, "opencl")
+    assert used_cl == "opencl", f"{measure}: OpenCL was available but the CPU ran"
+    assert out_cl.shape == img.shape and np.isfinite(out_cl).all()
+    rel, _mx = parity(out_cpu, out_cl)
+    assert rel <= PARITY_TOL, f"{measure} window {window} {shape}: OpenCL differs from the CPU reference, rel L2 {rel:.3e}"
+
+
+@pytest.mark.parametrize("measure", ["DoG band-pass", "Tenengrad", "SML"])
+def test_focus_map_backend_opencl_honours_the_window(measure):
+    """A window of 9 and 31 must give different maps on OpenCL, as they do on the CPU."""
+    require_opencl()
+    img = _texture(3).astype(np.float32)
+    a, ua = focus_map_backend(img, measure, 9, 1.0, "opencl")
+    b, ub = focus_map_backend(img, measure, 31, 1.0, "opencl")
+    assert ua == ub == "opencl"
+    assert parity(a, b)[0] > 0.05
+
+
+@pytest.mark.parametrize("measure", ["Vollath F4", "Vollath F5"])
+def test_focus_map_backend_reports_cpu_for_measures_without_an_opencl_path(measure):
+    img = _texture(3).astype(np.float32)
+    out, used = focus_map_backend(img, measure, 9, 1.0, "opencl")
+    assert used == "cpu"
+    assert np.array_equal(out, focus_map(img, measure, 9, 1.0))
 
 def test_focus_map_backend_unknown_measure_raises():
     img = _texture(3)
@@ -165,16 +186,28 @@ def test_guided_filter_backend_parity_and_nan():
     out_cpu, used_cpu = guided_filter_backend(p, w, guide, 5, 1e-2, "cpu")
     assert used_cpu == "cpu" and out_cpu.shape == p.shape
     assert np.isfinite(out_cpu).all()  # NaN in p is weighted 0: finite output, no crash
-    out_req, used_req = guided_filter_backend(p, w, guide, 5, 1e-2, "opencl")
-    assert used_req in ("cpu", "opencl")
-    assert out_req.shape == p.shape and np.isfinite(out_req).all()
-    if used_req == "opencl":
-        rel, _mx = parity(out_cpu, out_req)
-        if rel >= 5e-3:
-            pytest.skip(f"OpenCL device diverges from the CPU reference for the guided filter "
-                        f"(rel L2 {rel:.3f}); CPU fallback is used on this device")
-        assert rel < 5e-3
+    require_opencl()
+    out_cl, used_cl = guided_filter_backend(p, w, guide, 5, 1e-2, "opencl")
+    assert used_cl == "opencl"
+    assert out_cl.shape == p.shape and np.isfinite(out_cl).all()
+    rel, _mx = parity(out_cpu, out_cl)
+    assert rel <= 1e-4, f"guided filter: OpenCL differs from the CPU reference, rel L2 {rel:.3e}"
+    assert np.array_equal(np.isnan(out_cpu), np.isnan(out_cl))
 
+def test_benchmark_reports_every_measure_with_parity_and_a_working_negative_control():
+    from microtopos import backend
+
+    r = backend.benchmark(96, 64, reps=2)
+    assert set(r["measures"]) == {"DoG band-pass", "Tenengrad", "SML", "guided filter"}
+    assert all(m["cpu_ms"] > 0 for m in r["measures"].values())
+    require_opencl()
+    for name, m in r["measures"].items():
+        assert m["opencl_with_transfer_ms"] > 0, name
+        assert m["parity"]["ok"] and m["parity"]["negative_control_detected"], (name, m["parity"])
+    # the control is a real control: a 1 % corrupted output must fail the very comparison the bench uses
+    a = focus_map(_texture(3).astype(np.float32), "SML", 9, 1.0)
+    assert backend._parity_entry(a, a)["ok"] and backend._parity_entry(a, a)["negative_control_detected"]
+    assert not backend._parity_entry(a, a * 1.01)["ok"]
 
 def test_guided_filter_backend_shape_mismatch_and_all_nan():
     p = np.zeros((10, 10), np.float32)
@@ -479,3 +512,52 @@ def test_live_engine_load_mosaic_state_rejects_bad_state():
                                "angle_deg": 0.0, "yields": [], "has_rgb": False}]}
     with pytest.raises(KeyError):
         eng.load_mosaic_state(bad_meta, {})
+
+
+# ------------------------------------------------------------------------------------------ skip policy (conftest)
+
+
+def _run_policy_pytest(tmp_path, test_src: str, **env):
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    (tmp_path / "conftest.py").write_text((pathlib.Path(__file__).parent / "conftest.py").read_text(encoding="utf-8"),
+                                          encoding="utf-8")
+    (tmp_path / "test_x.py").write_text(test_src, encoding="utf-8")
+    e = {k: v for k, v in os.environ.items() if not k.startswith(("MICROTOPOS_", "PYTEST_"))}
+    e.update(env)
+    p = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rsf", "test_x.py"],
+                       cwd=tmp_path, env=e, capture_output=True, text=True, timeout=120)
+    return p.stdout + p.stderr
+
+
+def test_strict_skips_keep_allowlisted_skips_and_fail_wrong_result_skips(tmp_path):
+    src = ("import pytest\n"
+           "def test_absent():\n    pytest.skip('no OpenCL device')\n"
+           "def test_wrong():\n    pytest.skip('OpenCL device diverges from the CPU reference for SML (rel L2 0.77)')\n")
+    out = _run_policy_pytest(tmp_path, src, MICROTOPOS_STRICT_SKIPS="1")
+    assert "1 failed, 1 skipped" in out, out
+    assert "diverges from the CPU reference" in out and "not an absent capability" in out
+    lenient = _run_policy_pytest(tmp_path, src)  # without the switch nothing changes
+    assert "2 skipped" in lenient and "failed" not in lenient, lenient
+
+
+def test_strict_skips_also_judge_collection_time_skips(tmp_path):
+    out = _run_policy_pytest(tmp_path, "import pytest\npytest.importorskip('no_such_module_xyz')\n",
+                             MICROTOPOS_STRICT_SKIPS="1")
+    assert "not an absent capability" in out and "no_such_module_xyz" in out, out
+
+
+def test_require_opencl_skips_or_fails_per_environment(tmp_path, monkeypatch):
+    src = ("import conftest\nimport pytest\n"
+           "def test_a(monkeypatch):\n"
+           "    monkeypatch.setattr(conftest, 'opencl_device_available', lambda: False)\n"
+           "    conftest.require_opencl()\n")
+    skipped = _run_policy_pytest(tmp_path, src)
+    assert "1 skipped" in skipped and "no OpenCL device" in skipped, skipped
+    required = _run_policy_pytest(tmp_path, src, MICROTOPOS_REQUIRE_OPENCL="1")
+    assert "1 failed" in required and "MICROTOPOS_REQUIRE_OPENCL=1" in required, required
+    strict = _run_policy_pytest(tmp_path, src, MICROTOPOS_STRICT_SKIPS="1")
+    assert "1 skipped" in strict, strict  # the one allowed reason stays a skip even in strict mode

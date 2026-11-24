@@ -568,6 +568,12 @@ def test_mosaic_session_save_and_load_roundtrip(window, qapp, tmp_path):
         qapp.processEvents()
         time.sleep(0.02)
     assert len(w.engine.mosaic.keyframes) >= 1, "the simulator pan produced no mosaic keyframes"
+    # Stop the pan and let the engine catch up on a still view: the session is saved from, and loaded into, an
+    # engine that is no longer adding keyframes, so the counts below compare the same mosaic.
+    with w.sim_source.lock:
+        w.sim_source.script = []
+    still_from = w.sim_source.latest()[2] + 2  # the first frames rendered after the stage stopped
+    assert _wait_for(qapp, lambda: w.sim_source.consumed_seq >= still_from + 5, timeout=20.0)
     kf_before = len(w.engine.mosaic.keyframes)
 
     path = tmp_path / "session.npz"
@@ -665,38 +671,41 @@ def test_replay_ui_transport_bar(tmp_path, qapp):
         qapp.processEvents()
 
 
-def test_simulated_stage_connect_zero_and_zsweep(window, qapp):
+def _stage_idle(w) -> bool:
+    return w.stage_job is None or not w.stage_job.isRunning()
+
+
+def test_simulated_stage_connect_jog_zero_and_disconnect(window, qapp):
+    """The stage panel with the simulated drive. Stage operations run on a worker, so each step waits for it.
+    (The Z sweep itself is tested end to end in tests/test_feat_hardware.py.)"""
     w = window
     assert w.sim_source is not None
     assert w.cmb_stg.currentText() == "Simulated stage"
+    assert not w.btn_stg_zero.isEnabled() and not w.btn_stg_zsweep.isEnabled()  # nothing connected yet
 
     w.btn_stg_connect.click()
-    _pump(qapp)
-    assert isinstance(w.stage_driver, SimulatedStageDriver)
+    assert _wait_for(qapp, lambda: isinstance(w.stage_driver, SimulatedStageDriver) and _stage_idle(w), timeout=20.0)
     assert w.btn_stg_connect.text() == "Disconnect"
     assert w.btn_stg_zero.isEnabled() and w.btn_stg_zsweep.isEnabled()
-    assert "idle" in w.lbl_stg_pose.text()
+    assert w.source.stage_driver is w.stage_driver  # attached to the active source
+    sim = w.sim_source.sim
+    x0 = sim.stage_x_um
 
-    # move away, then zero
+    w.stage_jog_buttons[1].click()  # "X +10 µm"
+    assert _wait_for(qapp, lambda: _stage_idle(w) and f"X {x0 + 10.0:+.2f} µm" in w.lbl_stg_pose.text(), timeout=20.0)
+    assert sim.stage_x_um == pytest.approx(x0 + 10.0)  # the simulated specimen moved, not only the label
+
     w.stage_driver.move_to(x_um=3.0, y_um=-1.5, z_um=2.0)
-    _pump(qapp)
-    w.btn_stg_zero.click()
-    _pump(qapp)
-    p = w.stage_driver.pose()
-    assert p.x_um == 0.0 and p.y_um == 0.0 and p.z_um == 0.0
+    w.btn_stg_zero.click()  # the simulated drive returns to the simulator's origin
+    assert _wait_for(qapp, lambda: _stage_idle(w) and "X +0.00 µm  Y +0.00 µm  Z +0.00 µm" in w.lbl_stg_pose.text(), timeout=20.0)
+    assert (sim.stage_x_um, sim.stage_y_um, sim.focus_z_um) == (0.0, 0.0, 0.0)
 
-    # z-sweep ends at +5 µm
-    w.btn_stg_zsweep.click()
-    _pump(qapp)
-    p = w.stage_driver.pose()
-    assert p.z_um == 5.0
-
-    # disconnect
     w.btn_stg_connect.click()
-    _pump(qapp)
-    assert w.stage_driver is None
+    assert _wait_for(qapp, lambda: w.stage_driver is None and _stage_idle(w), timeout=20.0)
     assert w.btn_stg_connect.text() == "Connect"
     assert "disconnected" in w.lbl_stg_pose.text()
+    assert w.source.stage_driver is None
+    assert not w.btn_stg_zero.isEnabled() and not w.btn_stg_zsweep.isEnabled()
 
 
 def test_mosaic_blend_toggle_changes_what_the_renderer_reads(window, qapp, monkeypatch):

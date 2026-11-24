@@ -149,6 +149,9 @@ class SimulatedStageDriver(StageDriver):
             return StagePose(self._x, self._y, self._z, False, self._connected)
 
     def zero(self) -> StagePose:
+        """Move back to the simulator's origin. This drive has no frame of its own: its coordinates are the
+        simulator's (the frames carry them as simulation truth), so unlike `GrblStageDriver.zero` it cannot
+        re-define where zero is."""
         return self.move_to(0.0, 0.0, 0.0)
 
 

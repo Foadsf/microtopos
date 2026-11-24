@@ -829,7 +829,8 @@ class MainWindow(QMainWindow):
         jog = QHBoxLayout()
         for name, dx, dy in (("X −10 µm", -10.0, 0.0), ("X +10 µm", 10.0, 0.0),
                              ("Y −10 µm", 0.0, -10.0), ("Y +10 µm", 0.0, 10.0)):
-            b = self._btn(name, lambda dx=dx, dy=dy: self._stage_jog(dx, dy))
+            # clicked(bool) passes `checked` as the first positional argument: it must not land in dx
+            b = self._btn(name, lambda _checked=False, dx=dx, dy=dy: self._stage_jog(dx, dy))
             b.setEnabled(False)
             self.stage_jog_buttons.append(b)
             jog.addWidget(b)
@@ -864,7 +865,9 @@ class MainWindow(QMainWindow):
         stg.addLayout(sweep, 4, 0, 1, 2)
         self.stage_box = section("Stage", stg,
                                  hint="Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
-                                      "reported pose; Zero re-defines the origin. Z sweep: the stage runs through the "
+                                      "reported pose. Zero makes the current position the origin of a GRBL stage; the "
+                                      "simulated stage keeps the simulator's coordinates, so Zero moves it back to "
+                                      "their origin. Z sweep: the stage runs through the "
                                       "Z range while the camera frames, labelled with the stage's Z, are captured "
                                       "and reconstructed (the simulated stage drives the simulator's focus; the GRBL "
                                       "path is verified against a simulated controller only).")

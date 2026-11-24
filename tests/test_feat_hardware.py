@@ -613,8 +613,8 @@ def test_camera_open_requests_mjpg_and_the_manual_exposure_fallback_leaves_gain_
     assert (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")) in cap.sets
     cap.sets.clear()
     src.controls.available = False  # no v4l2-ctl: the OpenCV property fallback is the path under test
-    src.set_manual_exposure(100)
-    src._apply_controls(cap)
+    src.set_manual_exposure(100)  # not streaming: recorded as the request
+    src._apply_now(cap)  # what the capture thread does with its open device on the next frame
     props = [p for p, _ in cap.sets]
     assert cv2.CAP_PROP_EXPOSURE in props and cv2.CAP_PROP_AUTO_WB in props
     assert cv2.CAP_PROP_GAIN not in props  # the user's gain is not overwritten behind their back
@@ -1215,6 +1215,13 @@ def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, 
     w.btn_stg_connect.click()
     assert _wait(qapp, lambda: w.stage_driver is not None and _stage_idle(w))
     assert "+5000.00" in w.lbl_stg_pose.text() and "+2500.00" in w.lbl_stg_pose.text()
+    jog = {b.text(): b for b in w.stage_jog_buttons}
+    jog["X +10 µm"].click()
+    assert _wait(qapp, lambda: _stage_idle(w) and "X +5010.00" in w.lbl_stg_pose.text())
+    assert fake.mpos == pytest.approx([5.010, 0.0, 2.5])  # the controller moved 10 um in X and nothing else
+    jog["Y −10 µm"].click()
+    assert _wait(qapp, lambda: _stage_idle(w) and "Y -10.00" in w.lbl_stg_pose.text())
+    assert fake.mpos == pytest.approx([5.010, -0.010, 2.5])
     w.btn_stg_zero.click()
     assert _wait(qapp, lambda: _stage_idle(w) and "X +0.00" in w.lbl_stg_pose.text())  # the label follows zero()
     assert "Z +0.00" in w.lbl_stg_pose.text()

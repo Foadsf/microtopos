@@ -932,24 +932,38 @@ def gui_window(tmp_path_factory):
     app.processEvents()
 
 
-def _wait_until(app, cond, timeout=60.0):
+def _wait_until(app, cond, timeout=60.0, what=None):
     import time
 
     t0 = time.time()
     while time.time() - t0 < timeout and not cond():
         app.processEvents()
         time.sleep(0.02)
-    assert cond(), "timed out"
+    assert cond(), f"timed out after {timeout:.0f} s: {what() if what else ''}"
 
 
 def _gui_sweep_result(app, w):
+    """Run the simulator's focus sweep and return the reconstruction. The demo sweep is random: when it passes through
+    focus over less than half of the field the window (rightly) does not reconstruct it by itself, so the same
+    "Reconstruct last sweep" button the user has is pressed instead."""
+    prev = getattr(w, "last_cap", None)
     w.result = None
     w._demo("sweep")
-    _wait_until(app, lambda: w.result is not None)
+    _wait_until(app, lambda: getattr(w, "last_cap", None) is not prev, what=lambda: (
+        f"state={w.engine.sm.state}, sweep frames={len(w.engine._buf)}, fps={w.engine._snap.fps_in:.1f}"))
+    _wait_until(app, lambda: w.job is None or not w.job.isRunning(), timeout=120)  # an automatic reconstruction
+    cap = w.last_cap
+
+    def mine():
+        return w.result is not None and w.result.get("sweep_seq_range") == [cap.seqs[0], cap.seqs[-1]]
+
+    if not mine():  # nothing yet, or a late result of an earlier capture: reconstruct THIS capture
+        w.result = None
+        w._reconstruct_last()
+        _wait_until(app, mine, timeout=120)
     for _ in range(10):
         app.processEvents()
-    return w.result
-
+    return w.result, cap
 
 def test_gui_colour_toggle_yields_a_displayed_colour_all_in_focus(gui_window):
     app, w = gui_window
@@ -957,7 +971,8 @@ def test_gui_colour_toggle_yields_a_displayed_colour_all_in_focus(gui_window):
     w.chk_rgb.setChecked(True)
     assert w.engine.color_mode is True  # the toggle used to set only the window's flag; the engine never kept colour
     _wait_until(app, lambda: len(w.engine._preroll) > 0 and all(item[5] is not None for item in w.engine._preroll))
-    r = _gui_sweep_result(app, w)
+    r, cap = _gui_sweep_result(app, w)
+    assert cap.color_frames is not None and len(cap.color_frames) == len(cap.frames)
     assert r["edf_rgb"].ndim == 3 and r["edf_rgb"].shape[2] == 3 and r["edf_rgb"].dtype == np.uint8
     assert r["edf_rgb"].shape[:2] == r["edf"].shape[:2]
     shown = w.p_edf.data
@@ -966,5 +981,6 @@ def test_gui_colour_toggle_yields_a_displayed_colour_all_in_focus(gui_window):
     w.chk_rgb.setChecked(False)
     assert w.engine.color_mode is False
     _wait_until(app, lambda: len(w.engine._preroll) > 0 and all(item[5] is None for item in w.engine._preroll))
-    r2 = _gui_sweep_result(app, w)
+    r2, cap2 = _gui_sweep_result(app, w)
+    assert cap2.color_frames is None
     assert r2.get("edf_rgb") is None and w.p_edf.data.ndim == 2  # colour off: the grey EDF, no colour claim

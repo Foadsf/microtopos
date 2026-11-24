@@ -8,6 +8,13 @@ import numpy as np
 MEASURES = ("DoG band-pass", "Tenengrad", "SML", "Vollath F4", "Vollath F5")
 
 
+def _as_float(img: np.ndarray) -> np.ndarray:
+    """Float working copy of a frame. Integer frames (uint8, uint16) must be converted BEFORE any differencing or
+    squaring: on uint8 a - b wraps modulo 256 and d * d overflows. Intensity scale is preserved (a uint16 frame
+    stored as 257 x its uint8 equivalent scores 257 x higher in amplitude, 257^2 x in energy)."""
+    return np.asarray(img, dtype=np.float32)
+
+
 def _box(a: np.ndarray, win: int) -> np.ndarray:
     return cv2.boxFilter(a, cv2.CV_32F, (win, win), borderType=cv2.BORDER_REFLECT)
 
@@ -20,7 +27,7 @@ def _shift_left(img: np.ndarray, k: int) -> np.ndarray:
 
 def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, psf_sigma_px: float = 1.0) -> np.ndarray:
     """Local focus energy, averaged over a window x window box (no subsampling, no spatial offset)."""
-    img = img.astype(np.float32, copy=False)
+    img = _as_float(img)
     if measure == "DoG band-pass":
         s1 = max(0.8, 0.8 * psf_sigma_px)
         bp = cv2.GaussianBlur(img, (0, 0), s1) - cv2.GaussianBlur(img, (0, 0), 2.5 * s1)
@@ -48,12 +55,14 @@ def focus_map(img: np.ndarray, measure: str = "DoG band-pass", window: int = 9, 
 
 def brenner(img: np.ndarray) -> float:
     """Mean squared 2-pixel horizontal difference (Brenner), a fast global sharpness score."""
+    img = _as_float(img)
     d = img[:, 2:] - img[:, :-2]
-    return float(np.mean(d * d))
+    return float(np.mean(d * d, dtype=np.float64))
 
 
 def tile_scores(img: np.ndarray, grid: int = 4, measure_sigma: float = 1.0) -> np.ndarray:
     """Band-pass energy per tile of a grid x grid layout (used for sweep segmentation and coverage)."""
+    img = _as_float(img)
     bp = cv2.GaussianBlur(img, (0, 0), measure_sigma) - cv2.GaussianBlur(img, (0, 0), 2.5 * measure_sigma)
     e = bp * bp
     h, w = e.shape

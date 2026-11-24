@@ -81,8 +81,10 @@ pattern projected through the field diaphragm.</p>
 spherical aberration and lack of light; an oil objective also needs oil on the specimen. Objectives engraved 0 or
 ∞/0 are made for uncovered specimens in reflected light; "-" means either. Deconvolution cannot replace missing
 illumination.</p>
-<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected: it could not be measured
-reliably from defocused frames. Its effect is limited to the far-defocused frames at the image edges.</p>
+<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected by default. An experimental
+correction (3D tab, "Correct focus breathing") measures it from the frame pairs and improves the lateral alignment of
+the frames; on simulated sweeps it did not change the height error measurably. A drift larger than 1.5 % over the
+sweep is limited to 1.5 % and reported as a warning.</p>
 """
 
 STEPS = ["Camera", "Objective", "Dark && flat", "Lateral scale", "Z scale", "Inspect"]
@@ -626,10 +628,15 @@ class MainWindow(QMainWindow):
         self.cmb_3d_backend.addItems(["CPU", "OpenCL"])
         self.cmb_3d_backend.currentTextChanged.connect(lambda t: setattr(self.zst, "backend", t.lower()))
         bar.addWidget(self.cmb_3d_backend)
-        self.chk_3d_breathing = QCheckBox("Correct focus breathing")
+        self.chk_3d_breathing = QCheckBox("Correct focus breathing (experimental)")
+        self.chk_3d_breathing.setToolTip("Estimates the magnification change with focus from the frame pairs and folds it "
+                                         "into the frame alignment. Experimental: it improves the lateral alignment, but "
+                                         "did not change the simulated height error measurably.")
         self.chk_3d_breathing.toggled.connect(lambda on: setattr(self.zst, "correct_breathing", on))
         bar.addWidget(self.chk_3d_breathing)
-        self.chk_3d_tiling = QCheckBox("Allow tiling")
+        self.chk_3d_tiling = QCheckBox("Strip-wise reconstruction")
+        self.chk_3d_tiling.setToolTip("Reconstruct in horizontal strips when the whole stack would not fit in free "
+                                      "memory: bounds peak memory, gives the same result.")
         self.chk_3d_tiling.setChecked(True)
         self.chk_3d_tiling.toggled.connect(lambda on: setattr(self.zst, "allow_tiling", on))
         bar.addWidget(self.chk_3d_tiling)
@@ -2030,7 +2037,7 @@ class MainWindow(QMainWindow):
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
         job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
-                  sample_pos=sample_pos, z_sign=sign if z is None else None)
+                  sample_pos=sample_pos, z_sign=sign if z is None else None, color_frames=cap.color_frames)
         if self._start_job(job, lambda r: self._on_result({**r, **meta}), main=True):
             self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
 
@@ -2214,7 +2221,11 @@ class MainWindow(QMainWindow):
                                  "image, not a measured resolution gain")
         elif r is not None:
             um_cap = r["um_per_px_capture"]
-            self.p_edf.set_image(r["edf"], um_cap, levels=(0, 255), unit="DN")
+            edf_rgb = r.get("edf_rgb")  # colour all-in-focus (fused with the grey weights) when the sweep was colour
+            if edf_rgb is not None:
+                self.p_edf.set_image(edf_rgb, um_cap, unit="DN", rgb=True)
+            else:
+                self.p_edf.set_image(r["edf"], um_cap, levels=(0, 255), unit="DN")
             if self.chk_grains.isChecked() and "watershed_labels" in r:
                 lab = r["watershed_labels"]
                 edges = (np.diff(lab, axis=0, prepend=lab[:1]) != 0) | (np.diff(lab, axis=1, prepend=lab[:, :1]) != 0)
@@ -2226,7 +2237,7 @@ class MainWindow(QMainWindow):
             else:
                 self.p_edf.set_overlay(None)
             self.lbl_edf.setText(f"{r['frames_used']} of {r['frames_in']} frames fused · {r.get('grain_count', 0)} "
-                                 "watershed regions (image-based)")
+                                 "watershed regions (image-based)" + (" · colour" if edf_rgb is not None else ""))
         if r is None:
             self._render_report()
             return
@@ -2649,6 +2660,7 @@ class MainWindow(QMainWindow):
     # ================================================================== Slice 5: capability wiring
     def _set_color_mode(self, on: bool):
         self.color_mode = bool(on)
+        self.engine.color_mode = bool(on)  # without this the engine never kept colour frames and the colour EDF was unreachable
 
     # ---------------------------------------------------------------- replay transport bar
     def _replay_bar(self):

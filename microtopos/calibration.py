@@ -39,7 +39,11 @@ class ObjectiveCalibration:
     lateral_source: str = ""
     lateral_date: str = ""
     lateral_magnification: float | None = None
-    calibrated_magnification: float | None = None  # magnification when lateral_um_per_px_full was measured
+    # (width, height) of the frame the lateral scale was measured on. A mode with the same aspect ratio is covered
+    # (scaled by width); one with another aspect ratio is not: a camera cannot say whether a 4:3 mode is a crop or
+    # a rescale of its 16:9 sensor, so no scale is guessed for it. None (files written before this was recorded):
+    # width scaling for every mode, as before.
+    lateral_frame: tuple[int, int] | list[int] | None = None
     z_um_per_frame: float | None = None
     z_source: str = ""
     z_date: str = ""
@@ -63,22 +67,37 @@ class ObjectiveCalibration:
         """Anything measured or recorded (a revision alone, e.g. after clearing, does not count)."""
         return bool(self.lateral_um_per_px_full or self.z_um_per_frame or self.darks or self.flats)
 
+    ASPECT_TOL = 0.01  # relative aspect-ratio difference below which two frame sizes are the same camera mode shape
+
+    def covers(self, frame_width: int, frame_height: int | None = None) -> bool:
+        """Whether the stored lateral calibration applies to a frame of this size: a lateral scale exists and the
+        frame has the aspect ratio it was measured at (or no frame size was recorded, or no height is given)."""
+        if not self.lateral_um_per_px_full:
+            return False
+        if not self.lateral_frame or not frame_height or len(self.lateral_frame) != 2:
+            return True
+        cw, ch = self.lateral_frame
+        return abs(frame_width * ch - frame_height * cw) <= self.ASPECT_TOL * frame_height * cw
+
+    def lateral_for(self, frame_width: int, frame_height: int | None = None,
+                    objective: Objective | None = None) -> tuple[float, CalStatus]:
+        """THE decision of micrometres per pixel for a frame, shared by every call site (live, GUI, batch).
+
+        CALIBRATED: the stored scale, converted by width. NOMINAL: the objective's nameplate scale by width,
+        when nothing is calibrated or the calibration does not cover this camera mode (different aspect ratio)."""
+        obj = objective or resolve(self.objective)
+        if self.covers(frame_width, frame_height):
+            return (self.lateral_um_per_px_full * SENSOR_FULL_WIDTH_PX / float(frame_width), CalStatus.CALIBRATED)
+        return obj.nominal_um_per_px(frame_width), CalStatus.NOMINAL
+
     def um_per_px(self, frame_width: int, objective: Objective | None = None,
                   frame_height: int | None = None) -> float:
-        """Calibrated scale, else the nominal one of `objective` (default: this calibration's name, resolved).
+        """Calibrated scale, else the nominal one of `objective` (default: this calibration's name, resolved)."""
+        return self.lateral_for(frame_width, frame_height, objective)[0]
 
-        Supports both full-width scaling (same aspect ratio) and centre-cropped aspect ratios (e.g. 1:1 or 4:3
-        cropped from a 1080p sensor) when `frame_height` is provided and the aspect ratio is narrower than 16:9
-        at native vertical resolution.
-        """
-        obj = objective or resolve(self.objective)
-        full = self.lateral_um_per_px_full or obj.nominal_um_per_px(SENSOR_FULL_WIDTH_PX)
-        if frame_height is not None and frame_width > 0 and frame_height > 0:
-            aspect = frame_width / float(frame_height)
-            if aspect < 1.6 and frame_height in (1080, 720, 2160):
-                ref_h = SENSOR_FULL_WIDTH_PX * 9.0 / 16.0
-                return full * ref_h / float(frame_height)
-        return full * SENSOR_FULL_WIDTH_PX / float(frame_width)
+    def lateral_status_for(self, frame_width: int, frame_height: int | None = None) -> CalStatus:
+        """CALIBRATED only where the calibration covers this camera mode, else NOMINAL."""
+        return CalStatus.CALIBRATED if self.covers(frame_width, frame_height) else CalStatus.NOMINAL
 
 
 def radiometric_key(shape: tuple[int, int], exposure: float | None) -> str:
@@ -110,8 +129,6 @@ class CalibrationStore:
             c = self.cals.get(name)
             if c is None:
                 c = self.cals[name] = ObjectiveCalibration(name)
-            if isinstance(objective, Objective) and c.lateral_um_per_px_full and c.calibrated_magnification is None:
-                c.calibrated_magnification = objective.magnification
             return c
 
     def has_data(self, name: str) -> bool:
@@ -153,7 +170,7 @@ class CalibrationStore:
                 meta[name] = {
                     k: getattr(c, k)
                     for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date",
-                              "lateral_magnification", "calibrated_magnification",
+                              "lateral_magnification", "lateral_frame",
                               "z_um_per_frame", "z_source", "z_date", "z_uncertainty_pct", "revision")
                 }
                 for kind, d in (("dark", c.darks), ("flat", c.flats)):

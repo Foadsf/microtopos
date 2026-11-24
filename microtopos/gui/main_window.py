@@ -1490,10 +1490,11 @@ class MainWindow(QMainWindow):
                                          f"The line spans {px:.1f} preview pixels.\nTrue distance (µm):", 100.0, 0.1, 1e5, 2)
         if not ok:
             return
-        prev_w = self.p_live.data.shape[1]
+        prev_h, prev_w = self.p_live.data.shape[:2]
         full = (val / px) * prev_w / 1920.0
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = full
+        c.lateral_frame = (int(prev_w), int(prev_h))  # the camera mode this scale covers (same aspect ratio)
         c.lateral_source = f"stage micrometer: {val:g} µm over {px:.1f} px"
         c.lateral_date = today()
         c.lateral_magnification = self.obj.magnification
@@ -1508,6 +1509,7 @@ class MainWindow(QMainWindow):
             return
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = None
+        c.lateral_frame = None
         c.lateral_magnification = None
         self.store.touch(self.obj)
         self.store.save()
@@ -1637,12 +1639,15 @@ class MainWindow(QMainWindow):
         sim = self.sim_source is not None
         rkey = radiometric_key(live.frame_shape, self.engine.exposure) if live.frame_shape[0] else None
         rad = rkey is not None and rkey in c.darks and rkey in c.flats
+        fh, fw = (live.frame_shape[0], live.frame_shape[1]) if live.frame_shape[0] else (None, 1920)
+        lat_status = c.lateral_status_for(fw, fh)  # CALIBRATED only where it covers the current camera mode
+        lat_ok = lat_status is CalStatus.CALIBRATED
         states = [
             ("Simulator" if sim else ("Live" if cam_ok else "No frames"), "info" if sim else ("success" if cam_ok else "danger")),
             (f"{self.obj.magnification:g}×", "success"),
             ("Done" if rad else ("Partial" if rkey in c.darks or rkey in c.flats else "Optional"),
              "success" if rad else "warning"),
-            ("Calibrated" if c.lateral_um_per_px_full else "Nominal", "success" if c.lateral_um_per_px_full else "warning"),
+            ("Calibrated" if lat_ok else "Nominal", "success" if lat_ok else "warning"),
             ("Estimate" if c.z_um_per_frame else "Frames", "warning"),
             ("Ready" if cam_ok else "Waiting", "success" if cam_ok else "neutral"),
         ]
@@ -1651,10 +1656,16 @@ class MainWindow(QMainWindow):
         nxt = next((i for i, (_, k) in enumerate(states) if k in ("danger",)), None)
         for i, b in enumerate(self.step_btns):
             b.setToolTip("Next step" if i == nxt else "")
-        um_full = c.um_per_px(1920, self.obj)
-        self.chip_xy.set(f"XY {'CAL' if c.lateral_um_per_px_full else 'NOMINAL'} {um_full:.3f} µm/px",
-                         "success" if c.lateral_um_per_px_full else "warning",
-                         c.lateral_source or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
+        um_full = c.um_per_px(fw, self.obj, fh) * fw / 1920.0  # per pixel at 1920 px width, for this camera mode
+        mode_note = ""
+        if c.lateral_um_per_px_full and not lat_ok:
+            mode_note = (f"Not calibrated for this camera mode ({fw}x{fh}): the calibration was measured at "
+                         f"{c.lateral_frame[0]}x{c.lateral_frame[1]}, a different aspect ratio. The nominal scale "
+                         "is used; calibrate again in this mode.")
+        self.chip_xy.set(f"XY {'CAL' if lat_ok else 'NOMINAL'} {um_full:.3f} µm/px",
+                         "success" if lat_ok else "warning",
+                         mode_note or c.lateral_source
+                         or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
         self.chip_z.set(f"Z {'EST ' + format(c.z_um_per_frame, '.3f') + ' µm/f' if c.z_um_per_frame else 'FRAMES'}",
                         "warning", (c.z_source + " — an estimate for new sweeps (same knob speed assumed); state "
                                     "each sweep's travel for CALIBRATED heights") if c.z_um_per_frame
@@ -1667,12 +1678,13 @@ class MainWindow(QMainWindow):
             + f"{o.magnification:g}×  NA {o.na:.2f}{f'  immersion n={o.immersion_n:g}' if o.is_oil else '  dry'}"
             + (f"  cover {o.cover}" if o.cover else "") + f"\nRayleigh {o.rayleigh_um:.2f} µm\n"
             f"Optical cutoff λ/2NA {o.lateral_cutoff_um:.2f} µm\nDepth of field {o.dof_um:.2f} µm\n"
-            f"Pixel {um_full:.3f} µm at 1920 px ({c.lateral_status.value.lower()})")
+            f"Pixel {um_full:.3f} µm at 1920 px ({lat_status.value.lower()})")
         lines = [f"{k}: dark {'✓' if k in c.darks else '—'}, flat {'✓' if k in c.flats else '—'}"
                  for k in sorted(set(c.darks) | set(c.flats))]
         self.lbl_rad.setText("\n".join(lines) or "Nothing recorded for this objective.")
-        self.lbl_lat.setText(f"{c.lateral_status.value}: {c.lateral_source or 'nominal'}"
-                             + (f" ({c.lateral_date})" if c.lateral_date else ""))
+        self.lbl_lat.setText(f"{lat_status.value}: {c.lateral_source or 'nominal'}"
+                             + (f" ({c.lateral_date})" if c.lateral_date else "")
+                             + (f"\n{mode_note}" if mode_note else ""))
         self.lbl_z.setText(f"Stored for {self.obj.name}: {c.z_status.value}"
                            + (f", {c.z_um_per_frame:.4f} µm per frame — {c.z_source}" if c.z_um_per_frame else
                               " (new sweeps in camera frames)") + (f" ({c.z_date})" if c.z_date else ""))
@@ -1695,7 +1707,8 @@ class MainWindow(QMainWindow):
         cal = self.store.get(self.obj)
         # the preview covers the full field of view; the simulator's truth scale is the nominal one
         pw = s.preview.shape[1]
-        um_prev = self.obj.nominal_um_per_px(pw) if self.sim_source is not None else cal.um_per_px(pw)
+        um_prev = (self.obj.nominal_um_per_px(pw) if self.sim_source is not None
+                   else cal.um_per_px(pw, self.obj, s.preview.shape[0]))
         self.um_preview = um_prev
         if self.chk_stretch.isChecked():
             self._stretch = stretch_levels(s.preview, self._stretch)
@@ -1995,7 +2008,7 @@ class MainWindow(QMainWindow):
         obj = cap.optics or resolve(cap.objective)  # the optics at capture, even if the list was edited since
         cal = self.store.get(obj)
         w = cap.shape[1]
-        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj)
+        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj, cap.shape[0])
         sign = DIRECTIONS.get(self.cmb_dir.currentText())
         if cap.z is not None and cap.simulated:
             z, unit, zstat, zcal = cap.z, units.UM, CalStatus.SIMULATED.value, None
@@ -2008,7 +2021,7 @@ class MainWindow(QMainWindow):
                               workers=max(1, (os.cpu_count() or 2) - 1),
                               backend=self.zst.backend, correct_breathing=self.zst.correct_breathing,
                               allow_tiling=self.zst.allow_tiling)
-        meta = {"z_status": zstat, "lateral_status": cal.lateral_status.value if not cap.simulated else "SIMULATED",
+        meta = {"z_status": zstat, "lateral_status": cal.lateral_status_for(w, cap.shape[0]).value if not cap.simulated else "SIMULATED",
                 "pose": cap.pose, "capture_shape": cap.shape, "result_id": uuid.uuid4().hex[:12],
                 "source_id": cap.source_id, "source_generation": cap.source_generation,
                 "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
@@ -2151,7 +2164,8 @@ class MainWindow(QMainWindow):
         y0, x0 = (h - c) // 2, (w - c) // 2
         crops = [f[y0:y0 + c, x0:x0 + c].astype(np.float32) for f in frames]
         cal = self.store.get(self.obj)
-        um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w)
+        um = (self.obj.nominal_um_per_px(w) if self.sim_source is not None
+              else cal.um_per_px(w, self.obj, h))
         job = Job(_sr_job, crops, self.obj.psf_sigma_px(um),
                   scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve,
                   label="Super-resolution")
@@ -2550,7 +2564,7 @@ class MainWindow(QMainWindow):
             return
         extra = {"um_preview": getattr(self, "um_preview", None)}
         if len(self.engine.mosaic.keyframes) >= 1:
-            extra["mosaic"] = self.engine.mosaic
+            extra["mosaic"] = self.engine.mosaic_state()  # under the engine lock: the engine thread mutates it
         if mosaic_ok:
             extra.update(mosaic_image=img, mosaic_origin=list(origin))
             if parts:
@@ -2579,11 +2593,7 @@ class MainWindow(QMainWindow):
             return
         try:
             r, _s = export.load_session(p)  # validated before anything in the window changes
-            mosaic = r.pop("mosaic", None)  # restore the full pose graph into the live engine
-            if mosaic is not None:
-                mmeta, marrays = mosaic.to_state_arrays()
-                self.engine.load_mosaic_state(mmeta, marrays)
-                self.last_mosaic_version = -1
+            mosaic = r.pop("mosaic", None)  # the saved pose graph; applied to the live engine only at the end
             has = "height" in r
             if has:  # pin the optics it was made with; an unknown objective fails here with a clear message
                 r["objective_spec"] = resolve_result(r).to_dict()
@@ -2609,12 +2619,23 @@ class MainWindow(QMainWindow):
                     um_loaded = None
                     if has and isinstance(r.get("preview_shape"), (list, tuple)) and len(r["preview_shape"]) == 2 and r["preview_shape"][1]:
                         um_loaded = float(r["um_per_px"]) * float(r["height"].shape[1]) / float(r["preview_shape"][1])
-                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
-                self.last_mosaic_version = -1
+                loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
+            else:
+                loaded_mosaic = None
             if has:
                 r.setdefault("result_id", uuid.uuid4().hex[:12])
                 r["mosaic_generation"] = -1  # never pinned into the live mosaic
                 r["label"] = f"{Path(p).name}: {r.get('label', '')}".strip(": ")
+            # everything is validated: apply. The live mosaic is replaced under the engine lock, in one step
+            # (load_mosaic_state is all-or-nothing); the saved mosaic is the loader's private copy.
+            if mosaic is not None:
+                mmeta, marrays = mosaic.to_state_arrays()
+                self.engine.load_mosaic_state(mmeta, marrays)
+                self.last_mosaic_version = -1
+            if loaded_mosaic is not None:
+                self.loaded_mosaic = loaded_mosaic
+                self.last_mosaic_version = -1
+            if has:
                 self.result = r
                 self._remember(r)
                 self._show_result()

@@ -185,7 +185,7 @@ class LiveEngine:
                 if np.isfinite(img).any():
                     cal = self.store.get(old_obj)
                     pw = self._snap.preview_shape[1] or PREVIEW_W
-                    um_old = cal.um_per_px(pw, old_obj)
+                    um_old = cal.um_per_px(pw, old_obj, self._snap.preview_shape[0] or None)
                     self.mosaic.add_inset(old_obj.name, um_old, origin[0] * um_old, origin[1] * um_old, img)
             self.objective = obj
             self._corrector_key = None
@@ -203,6 +203,12 @@ class LiveEngine:
             self._pending_patches.clear()
             self.mosaic_generation += 1
             self.mosaic_version += 1
+
+    def mosaic_state(self) -> tuple[dict, dict[str, np.ndarray]]:
+        """Serialized pose graph of the live mosaic, taken under the engine lock (the engine thread mutates the
+        mosaic); safe to write to disk afterwards, the arrays are never modified in place."""
+        with self._lock:
+            return self.mosaic.to_state_arrays()
 
     def load_mosaic_state(self, meta: dict, arrays: dict[str, np.ndarray]):
         """Replace the mosaic with a serialized pose graph (keyframes, edges, patches, insets) and re-render."""

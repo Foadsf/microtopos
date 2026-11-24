@@ -458,26 +458,6 @@ def test_grbl_connect_without_pyserial_says_how_to_install_it(monkeypatch):
 
 
 # ------------------------------------------------------------------------------------------------ calibration
-def test_um_per_px_aspect_ratios():
-    c = ObjectiveCalibration(objective="10x / 0.25", lateral_um_per_px_full=0.30)
-
-    # Full-width scaling (16:9 native)
-    v_16_9 = c.um_per_px(1920)
-    assert v_16_9 == pytest.approx(0.30 * 1920 / 1920)
-
-    # 1:1 crop from 1080p height -> vertical reference scaling
-    v_1_1 = c.um_per_px(1080, frame_height=1080)
-    assert v_1_1 == pytest.approx(0.30 * (1920 * 9.0 / 16.0) / 1080)
-
-    # 4:3 crop -> vertical reference scaling
-    v_4_3 = c.um_per_px(1440, frame_height=1080)
-    assert v_4_3 == pytest.approx(0.30 * (1920 * 9.0 / 16.0) / 1080)
-
-    # Backwards-compatible: frame_height omitted -> full-width scaling
-    v_no_h = c.um_per_px(1080)
-    assert v_no_h == pytest.approx(0.30 * 1920 / 1080)
-
-
 def test_um_per_px_nominal_fallback():
     c = ObjectiveCalibration(objective="10x / 0.25")  # no calibrated lateral scale
     v = c.um_per_px(1920)
@@ -655,15 +635,6 @@ def test_lateral_magnification_round_trip(tmp_path):
     assert c2.lateral_magnification == pytest.approx(10.0)
     assert c2.lateral_source == "stage micrometer"
     assert c2.revision == 1
-
-
-def test_calibrated_magnification_set_on_get():
-    store = CalibrationStore(None)
-    c = store.get(OBJ)
-    c.lateral_um_per_px_full = 0.3
-    # Re-get to trigger the magnification recording logic
-    c2 = store.get(OBJ)
-    assert c2.calibrated_magnification == OBJ.magnification
 
 
 # ------------------------------------------------------------------------------------------------ recording

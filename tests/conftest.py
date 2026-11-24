@@ -24,7 +24,7 @@ ALLOWED_SKIP_REASONS = (
     r"^no OpenCL device$",
     r"needs Xvfb and a window manager",
     r"could not import 'pyqtgraph'",  # optional GUI dependency not installed
-    r"^Windows memory query ",  # a Windows-only API test on another platform`n    r"could not import 'serial'",  # optional pyserial not installed (hardware-protocol tests need it)
+    r"^Windows memory query ",  # a Windows-only API test on another platform
 )
 
 

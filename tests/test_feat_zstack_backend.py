@@ -13,9 +13,9 @@ import math
 import cv2
 import numpy as np
 import pytest
+from conftest import require_opencl
 
 import microtopos.optics as _optics  # monkeypatch target for the wavelength sweep
-from conftest import require_opencl
 from microtopos import objectives, zstack
 from microtopos.backend import focus_map_backend, guided_filter_backend, parity
 from microtopos.calibration import CalibrationStore, bgr_to_luma
@@ -529,7 +529,7 @@ def _run_policy_pytest(tmp_path, test_src: str, **env):
     e = {k: v for k, v in os.environ.items() if not k.startswith(("MICROTOPOS_", "PYTEST_"))}
     e.update(env)
     p = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rsf", "test_x.py"],
-                       cwd=tmp_path, env=e, capture_output=True, text=True, timeout=120)
+                       cwd=tmp_path, env=e, capture_output=True, text=True, timeout=120, check=False)
     return p.stdout + p.stderr
 
 

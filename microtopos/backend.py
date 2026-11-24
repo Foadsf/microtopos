@@ -241,7 +241,7 @@ def benchmark(w: int = 960, h: int = 540, reps: int = 20, window: int = 9, psf: 
             t0 = time.perf_counter()
             fns[name](cv2.UMat(img)).get()
             ent["opencl_cold_ms"] = round(1e3 * (time.perf_counter() - t0), 3)
-            ent["opencl_resident_ms"] = _median_ms(lambda f=fns[name]: f(u), reps, sync=True)
+            ent["opencl_resident_ms"] = _median_ms(lambda f=fns[name], u=u: f(u), reps, sync=True)
             ent["opencl_with_transfer_ms"] = _median_ms(lambda f=fns[name]: f(cv2.UMat(img)).get(), reps)
             out = fns[name](cv2.UMat(img)).get()
             ent["parity"] = _parity_entry(ref, out)

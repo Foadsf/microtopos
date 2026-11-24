@@ -289,6 +289,34 @@ def test_rotation_tracking_reads_the_signed_angle_over_many_keyframes(sign):
     assert m.keyframes[-1].angle_deg * sign > 15.0
 
 
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_a_lost_track_is_reacquired_on_a_keyframe_while_the_view_is_rotated(sign):
+    """Keyframes are stored upright, so a frame can only be matched against them after it has been turned back by
+    the current angle. The frame-to-frame tests above never need that (dead reckoning carries them); re-acquiring a
+    lost track does: the view turns to 12 deg, the track is lost on an unrelated moving view, and the camera comes
+    back over the first keyframes, more than a frame width from the last good frame and still turned by 12 deg.
+    (Turning the frame the wrong way leaves the track lost for all eight frames.)"""
+    world, elsewhere = _smooth_world(7), _smooth_world(99)
+    m = Mosaic(track_rotation=True)
+    theta = 0.0
+    for i in range(24):  # 2 deg per frame up to 12 deg, then on at 12 deg; the stage moves 25 px per frame
+        theta = sign * min(2.0 * i, 12.0)
+        m.track(_rview(world, 400 + 25.0 * i, 500, theta))
+        assert not m.lost
+    assert len(m.keyframes) >= 4
+    for i in range(4):
+        m.track(_rview(elsewhere, 300 + 150.0 * i, 600, theta))
+    assert m.lost
+    back = []
+    for i in range(8):
+        m.track(_rview(world, 450 + 3.0 * i, 500, theta))  # stage x = 50 + 3 i in mosaic coordinates
+        back.append((m.lost, m.x - (50 + 3.0 * i), m.y, m.angle_deg))
+    assert [lost for lost, *_ in back[3:]] == [False] * 5  # re-acquisition is attempted every third lost frame
+    for _lost, ex, ey, angle in back[3:]:
+        assert abs(ex) < 0.5 and abs(ey) < 0.5
+        assert angle == pytest.approx(sign * 12.0, abs=0.4)
+
+
 @pytest.mark.characterization("with rotation tracking off the angle never moved; guards the default path across the derotation fix")
 def test_without_rotation_tracking_the_angle_stays_flat():
     world = _smooth_world(7)

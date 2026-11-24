@@ -39,7 +39,7 @@ PARAMETER_KEYS = (
     "Vmp", "Vmc", "Vvc", "Vvv",
     "Sds_per_mm2", "Ssc_per_um", "Spd_per_mm2", "Spc_per_um", "S5p", "S5v", "S10z",
     "Sal_um", "Str", "Std_deg",
-    "topo_grain_count", "topo_mean_grain_area_um2", "topo_watershed_labels",
+    "topo_grain_count", "topo_mean_grain_area_um2", "topo_watershed_labels", "features_done",
     "eligibility", "sl_surface", "valid_fraction", "filter_notes",
     "lambda_s_requested_um", "lambda_c_requested_um",
 )

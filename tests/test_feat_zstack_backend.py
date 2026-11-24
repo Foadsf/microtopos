@@ -378,6 +378,23 @@ def test_theoretical_fwhm_is_of_order_dof(monkeypatch):
         assert 0.5 * obj.dof_um < f < 4.0 * obj.dof_um, (f, obj.dof_um)
 
 
+@pytest.mark.parametrize(("name", "um_per_px", "cycles_per_px", "hand_fwhm_um"), [
+    # hand values: FWHM = 2 sqrt(2 ln 2) * um_per_px / (pi * f * tan(theta)), tan(theta) = tan(asin(NA)) for air
+    #   10x / 0.25: tan = 0.25 / sqrt(1 - 0.25^2) = 0.258199  ->  2.354820 * 1.00 / (pi / 16 * 0.258199) = 46.449 um
+    #   40x / 0.85: tan = 0.85 / sqrt(1 - 0.85^2) = 1.613570  ->  2.354820 * 0.25 / (pi / 32 * 1.613570) =  3.716 um
+    ("10x / 0.25", 1.0, 1 / 16, 46.449),
+    ("40x / 0.85", 0.25, 1 / 32, 3.716),
+])
+def test_theoretical_fwhm_matches_the_hand_computed_gaussian_response(name, um_per_px, cycles_per_px, hand_fwhm_um):
+    """A pure sinusoid and a peak-to-peak measure respond as exp(-2 pi^2 f^2 s^2) to a blur s = |dz| tan(theta) / 2:
+    a Gaussian in defocus whose FWHM is known in closed form, independent of the code under test."""
+    obj = objectives.resolve(name, objset=objectives.default_set())
+    x = np.arange(256)
+    tex = np.tile((128 + 60 * np.cos(2 * np.pi * cycles_per_px * x)).astype(np.float32), (256, 1))
+    got = theoretical_fwhm_um(obj, um_per_px, lambda im: np.full(im.shape, float(im.max() - im.min()), np.float32), tex)
+    assert got is not None
+    assert got == pytest.approx(hand_fwhm_um, rel=0.01), (got, hand_fwhm_um)
+
 def test_theoretical_fwhm_negative_controls_return_none():
     tex = _texture(5)
     m = _measure_fn(_make_obj(0.5), 1.0)

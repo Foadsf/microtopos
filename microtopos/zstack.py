@@ -443,7 +443,8 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     warnings += m.pop("warnings")
     done("metrology")
 
-    # DOF ruler (only meaningful for an uncalibrated hand sweep): theoretical FWHM / measured FWHM in frames
+    # DOF ruler (only meaningful for an uncalibrated hand sweep): theoretical FWHM / measured FWHM in frames. The
+    # numerator is a model estimate (sff.theoretical_fwhm_um), so the result is an ESTIMATE of um/frame, never a calibration.
     dof_ruler = None
     if z_labels is None and np.isfinite(fit.fwhm_z_median) and fit.fwhm_z_median > 0:
         fw_um = sff.theoretical_fwhm_um(objective, um_proc, lambda im: focus_map(im, st.measure, window, psf_px),

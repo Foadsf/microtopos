@@ -295,13 +295,26 @@ def softmax_weights_inplace(fv: np.ndarray, temperature: float = 0.25) -> np.nda
 
 
 def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.ndarray) -> float | None:
-    """FWHM (in um of defocus) of the focus measure's response for this objective and this specimen.
+    """A THEORETICAL ESTIMATE of the FWHM (um of defocus) of the focus measure's response curve for this
+    objective and this specimen. It is a model prediction, not a calibration: nothing is measured against a
+    reference, and it carries the model's own error (the DOF ruler built on it was off by -34 % to +13 % on
+    simulated sweeps).
 
-    The all-in-focus image is blurred with the optical defocus model at known defocus steps (one third of
-    the depth of field), so the ruler has no hand-tuned factor. Assumes the all-in-focus image is close to
-    the true in-focus texture. Returns None when the response carries no focus information (objective not
-    usable, zero or non-finite energy, or a half-maximum that is not bracketed inside the search range): a
-    blank crop must not yield the search width.
+    Method: the (already in-focus-ish) all-in-focus texture is blurred with the objective's defocus model at
+    defocus steps of dof/3 over +-4 dof, `measure_fn` is applied to every blurred copy, and the width at half of
+    the maximum is read off by linear interpolation. Hand-checkable limit: for a pure sinusoid of spatial
+    frequency f (cycles/px) and a measure that is its peak-to-peak amplitude, the response is the Gaussian
+    exp(-2 pi^2 f^2 s^2) with s = |dz| tan(theta) / (2 um_per_px), so FWHM = 2 sqrt(2 ln 2) um_per_px /
+    (pi f tan(theta)) (tests/test_feat_zstack_backend.py checks this to 1 % for two objectives).
+
+    Heuristics (not derived from the optics, and each moves the answer): the defocused PSF is a Gaussian
+    (Airy sigma = 0.21 lambda / NA; geometric blur disc of radius |dz| tan(theta) approximated by a Gaussian of
+    sigma = R / 2, added in quadrature); the texture is taken as the true in-focus image (its own PSF blur is
+    only subtracted in quadrature); the centre 256 x 256 px is used and 20 px are cut from each border of the
+    response; the 75th percentile of the response map stands for the field; the sampling step is dof/3 and the
+    range +-4 dof; NA below 0.24 is refused (flat response). Returns None when the response carries no focus
+    information (objective not usable, zero or non-finite energy, or a half-maximum not bracketed inside the
+    search range): a blank crop must not yield the search width.
     """
     if objective is None or not np.isfinite(objective.na) or objective.na <= 0:
         return None

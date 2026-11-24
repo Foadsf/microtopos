@@ -55,7 +55,7 @@ from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
-from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, list_serial_ports
+from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, capture_z_sweep, list_serial_ports
 from ..superres import dwell_superres
 from .objectives_dialog import ObjectivesDialog
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
@@ -193,7 +193,8 @@ class MainWindow(QMainWindow):
         self.mosaic_rgb = False          # render the mosaic tab in colour from tiles_rgb
         self.track_rotation = False      # mosaic tracks small in-plane rotations between keyframes
         self.stage_driver: StageDriver | None = None
-        self._stage_tick = 0
+        self.stage_job: Job | None = None  # the running stage operation (serial I/O never blocks the GUI thread)
+        self.stage_jog_buttons: list = []
         self.level_picking = False       # 3-point level mode armed on the height view
         self.level_pts: list[tuple[float, float]] = []
         self.zst = zstack.ZSettings()    # 3D reconstruction settings edited from the 3D page
@@ -808,18 +809,43 @@ class MainWindow(QMainWindow):
                              ("Y −10 µm", 0.0, -10.0), ("Y +10 µm", 0.0, 10.0)):
             b = self._btn(name, lambda dx=dx, dy=dy: self._stage_jog(dx, dy))
             b.setEnabled(False)
+            self.stage_jog_buttons.append(b)
             jog.addWidget(b)
         self.btn_stg_zero = self._btn("Zero X/Y/Z", self._stage_zero)
         self.btn_stg_zero.setEnabled(False)
         jog.addWidget(self.btn_stg_zero)
-        self.btn_stg_zsweep = self._btn("Z sweep −5…+5 µm", self._stage_zsweep)
-        self.btn_stg_zsweep.setEnabled(False)
-        jog.addWidget(self.btn_stg_zsweep)
         stg.addLayout(jog, 3, 0, 1, 2)
+        sweep = QHBoxLayout()
+        self.sp_stg_z0, self.sp_stg_z1 = QDoubleSpinBox(), QDoubleSpinBox()
+        for sp, tip in ((self.sp_stg_z0, "Z where the sweep starts (µm, stage frame)"),
+                        (self.sp_stg_z1, "Z where the sweep ends (µm, stage frame)")):
+            sp.setRange(-50000.0, 50000.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(1.0)
+            sp.setSuffix(" µm")
+            sp.setToolTip(tip)
+            sweep.addWidget(sp)
+        self.sp_stg_z0.setValue(-5.0)
+        self.sp_stg_z1.setValue(5.0)
+        self.sp_stg_n = QSpinBox()
+        self.sp_stg_n.setRange(16, 240)
+        self.sp_stg_n.setValue(48)
+        self.sp_stg_n.setSuffix(" steps")
+        self.sp_stg_n.setToolTip("Stage positions in the sweep: one processed frame is captured at each")
+        sweep.addWidget(self.sp_stg_n)
+        self.btn_stg_zsweep = self._btn("Z sweep", self._stage_zsweep,
+                                        "Drive the stage Z from the first to the second height while the live engine "
+                                        "captures the sweep; every frame is labelled with the stage's Z (µm) and the "
+                                        "height map is reconstructed with those labels")
+        self.btn_stg_zsweep.setEnabled(False)
+        sweep.addWidget(self.btn_stg_zsweep)
+        stg.addLayout(sweep, 4, 0, 1, 2)
         self.stage_box = section("Stage", stg,
                                  hint="Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
-                                      "reported pose; Zero re-defines the origin; the Z sweep drives the Z axis "
-                                      "through three heights and reports each pose.")
+                                      "reported pose; Zero re-defines the origin. Z sweep: the stage runs through the "
+                                      "Z range while the camera frames, labelled with the stage's Z, are captured "
+                                      "and reconstructed (the simulated stage drives the simulator's focus; the GRBL "
+                                      "path is verified against a simulated controller only).")
         return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
                        self.lbl_readback, self.demo_box, self.stage_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
@@ -830,70 +856,121 @@ class MainWindow(QMainWindow):
         if text.startswith("None") and self.stage_driver is not None:
             self._stage_disconnect()
 
+    def _stage_async(self, label: str, fn, on_done) -> bool:
+        """Run stage I/O (serial, waiting for motion) off the GUI thread. One stage operation at a time."""
+        if self.stage_job is not None and self.stage_job.isRunning():
+            self.notify("The stage is still busy; try again when it has finished.", "warning")
+            return False
+        job = Job(fn, label=label)
+        self.stage_job = job
+        self._stage_enable()
+        job.finished.connect(self._stage_enable)
+        return self._start_job(job, on_done)
+
+    def _stage_enable(self):
+        """Stage controls follow the connection and whether an operation is running."""
+        busy = self.stage_job is not None and self.stage_job.isRunning()
+        ready = self.stage_driver is not None and not busy
+        self.btn_stg_connect.setEnabled(not busy)
+        self.btn_stg_zero.setEnabled(ready)
+        self.btn_stg_zsweep.setEnabled(self.stage_driver is not None)  # doubles as Cancel while a sweep runs
+        for b in self.stage_jog_buttons:
+            b.setEnabled(ready)
+
+    def _stage_attach(self):
+        """Label the active source's frames with the stage's pose (None detaches)."""
+        if self.source is not None:
+            self.source.stage_driver = self.stage_driver
+
     def _stage_connect(self):
         if self.stage_driver is not None:
             self._stage_disconnect()
             return
         text = self.cmb_stg.currentText()
-        try:
-            if text.startswith("Simulated"):
-                if self.sim_source is None:
-                    self.notify("The stage simulator needs the simulator source (pick it in Camera).", "warning")
-                    return
-                self.stage_driver = SimulatedStageDriver(self.sim_source)
-            elif text.startswith("GRBL"):
-                self.stage_driver = GrblStageDriver(self.cmb_stg_port.currentText())
-            else:
+        if text.startswith("Simulated"):
+            if self.sim_source is None:
+                self.notify("The stage simulator needs the simulator source (pick it in Camera).", "warning")
                 return
-            self.stage_driver.connect()
-        except OSError as exc:  # SerialException, port busy, missing simulator
-            self.notify(f"Stage connect failed: {exc}", "danger")
-            self.stage_driver = None
+            drv: StageDriver = SimulatedStageDriver(self.sim_source)
+        elif text.startswith("GRBL"):
+            drv = GrblStageDriver(self.cmb_stg_port.currentText())
+        else:
             return
+        # connect() can raise StageError (no answer, alarm), OSError (port busy or missing) or ImportError
+        # (pyserial not installed: its message says to pip install microtopos[serial]); the job reports any of
+        # them to the user through _on_failed instead of crashing the slot
+        self._stage_async("Stage connect", lambda **_: (drv.connect(), drv.pose())[1],
+                          lambda pose, d=drv: self._stage_connected(d, pose))
+
+    def _stage_connected(self, drv: StageDriver, pose):
+        self.stage_driver = drv
+        self._stage_attach()
         self.btn_stg_connect.setText("Disconnect")
-        self.btn_stg_zero.setEnabled(True)
-        self.btn_stg_zsweep.setEnabled(True)
-        self._stage_read_pose()
+        if isinstance(drv, SimulatedStageDriver) and self.sim_source is not None:
+            lo, hi = self.sim_source.relief_range_um()  # a sweep that passes the whole visible relief through focus
+            self.sp_stg_z0.setValue(math.floor(lo * 100) / 100)
+            self.sp_stg_z1.setValue(math.ceil(hi * 100) / 100)
+        else:
+            self.sp_stg_z0.setValue(round(pose.z_um - 5.0, 2))
+            self.sp_stg_z1.setValue(round(pose.z_um + 5.0, 2))
+        self._stage_show(pose)
+        self._stage_enable()
 
     def _stage_disconnect(self):
-        if self.stage_driver is not None:
-            try:
-                self.stage_driver.close()
-            except OSError:
-                pass
-            self.stage_driver = None
-        self.btn_stg_connect.setText("Connect")
-        self.btn_stg_zero.setEnabled(False)
-        self.btn_stg_zsweep.setEnabled(False)
-        self.lbl_stg_pose.setText("stage: disconnected")
-
-    def _stage_read_pose(self):
-        if self.stage_driver is None:
+        if self.stage_job is not None and self.stage_job.isRunning():
+            self.stage_job.cancel = True  # a running sweep stops at its next position; disconnect afterwards
+            self.notify("The stage is still busy; try again when it has finished.", "warning")
             return
-        p = self.stage_driver.pose()
+        drv, self.stage_driver = self.stage_driver, None
+        self._stage_attach()
+        if drv is not None:
+            self._stage_async("Stage disconnect", lambda **_: drv.close(), lambda _r: None)
+        self.btn_stg_connect.setText("Connect")
+        self.lbl_stg_pose.setText("stage: disconnected")
+        self._stage_enable()
+
+    def _stage_show(self, p):
         self.lbl_stg_pose.setText(f"stage: X {p.x_um:+.2f} µm  Y {p.y_um:+.2f} µm  Z {p.z_um:+.2f} µm  "
                                   f"({'busy' if p.moving else 'idle'})")
 
     def _stage_jog(self, dx_um: float, dy_um: float):
-        if self.stage_driver is None:
-            return
-        p = self.stage_driver.pose()
-        self.stage_driver.move_to(x_um=p.x_um + dx_um, y_um=p.y_um + dy_um)
-        self._stage_read_pose()
+        drv = self.stage_driver
+        if drv is not None:
+            self._stage_async("Stage jog", lambda **_: drv.move_rel(dx_um=dx_um, dy_um=dy_um), self._stage_show)
 
     def _stage_zero(self):
-        if self.stage_driver is None:
-            return
-        self.stage_driver.zero()
-        self._stage_read_pose()
+        drv = self.stage_driver
+        if drv is not None:
+            self._stage_async("Stage zero", lambda **_: drv.zero(), self._stage_show)
 
     def _stage_zsweep(self):
-        if self.stage_driver is None:
+        drv = self.stage_driver
+        if drv is None:
             return
-        poses = self.stage_driver.z_sweep([-5.0, 0.0, 5.0])
-        self._stage_read_pose()
-        self.notify("Z sweep: " + ", ".join(f"{p.z_um:+.2f} µm" for p in poses))
+        if self.stage_job is not None and self.stage_job.isRunning():
+            if getattr(self.stage_job, "is_sweep", False):
+                self.stage_job.cancel = True  # the second click on 'Cancel sweep'
+            return
+        if self.source is None or self.source.stage_driver is not drv:
+            self.notify("Attach the stage to the active source first (disconnect and connect again).", "warning")
+            return
+        zs = [float(z) for z in np.linspace(self.sp_stg_z0.value(), self.sp_stg_z1.value(), self.sp_stg_n.value())]
+        src = self.source
 
+        def run(progress=None, cancelled=None):
+            return capture_z_sweep(drv, src, self.engine, zs, cancelled=cancelled, progress=progress)
+
+        def done(poses):
+            self.btn_stg_zsweep.setText("Z sweep")
+            if poses:
+                self._stage_show(poses[-1])
+            self.notify(f"Z sweep done: {len(poses)} stage positions, {poses[0].z_um:+.2f} to "
+                        f"{poses[-1].z_um:+.2f} µm. The capture is reconstructed when the engine has finished it.")
+
+        if self._stage_async("Stage Z sweep", run, done):
+            self.stage_job.is_sweep = True
+            self.btn_stg_zsweep.setText("Cancel sweep")
+            self.stage_job.finished.connect(lambda: self.btn_stg_zsweep.setText("Z sweep"))
     def _page_objective(self):
         self.cmb_obj = QComboBox()
         self.cmb_obj.addItems(self.objset.names)
@@ -1214,6 +1291,9 @@ class MainWindow(QMainWindow):
             self.source = CameraSource(info, w, h, 25)
         self.source.start()
         self.engine.set_source(self.source)
+        if isinstance(self.stage_driver, SimulatedStageDriver) and self.stage_driver.sim_source is not self.sim_source:
+            self._stage_disconnect()  # the simulated stage moves the simulator it was created for
+        self._stage_attach()
         if isinstance(self.source, CameraSource):
             rng = self.source.exposure_range()
             if rng:  # use the device's own limits (the defaults are the Bresser's)
@@ -1229,6 +1309,7 @@ class MainWindow(QMainWindow):
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
             self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
+            self._set_replay_transport_enabled(self.source.transport_supported)
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()
@@ -2017,8 +2098,12 @@ class MainWindow(QMainWindow):
         w = cap.shape[1]
         um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj, cap.shape[0])
         sign = DIRECTIONS.get(self.cmb_dir.currentText())
+        zsrc = ""
         if cap.z is not None and cap.simulated:
             z, unit, zstat, zcal = cap.z, units.UM, CalStatus.SIMULATED.value, None
+        elif cap.z is not None:  # labelled by a motorised stage (capture_z_sweep): um, but only as good as its steps/mm
+            z, unit, zstat, zcal = cap.z, units.UM, CalStatus.ESTIMATED.value, None
+            zsrc = "stage driver readout (not checked against a reference)"
         elif cal.z_um_per_frame:
             z, unit, zstat, zcal = None, units.UM, CalStatus.ESTIMATED.value, cal.z_um_per_frame
         else:
@@ -2033,7 +2118,7 @@ class MainWindow(QMainWindow):
                 "source_id": cap.source_id, "source_generation": cap.source_generation,
                 "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
                 "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
-                "z_source": cal.z_source if zstat == CalStatus.ESTIMATED.value else "",
+                "z_source": zsrc or (cal.z_source if zstat == CalStatus.ESTIMATED.value else ""),
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
         job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
@@ -2690,6 +2775,13 @@ class MainWindow(QMainWindow):
         self.chk_replay_loop.toggled.connect(self._replay_loop)
         h.addWidget(self.chk_replay_loop)
         return h
+
+    def _set_replay_transport_enabled(self, on: bool):
+        """Pause/step/seek/speed act only on a paced replay; an exhaustive (consumer-paced) one refuses them."""
+        for wdg in (self.btn_replay_pause, self.btn_replay_step_b, self.btn_replay_step_f, self.replay_seek,
+                    self.cmb_replay_speed):
+            wdg.setEnabled(on)
+            wdg.setToolTip("" if on else "Not available: this recording is replayed frame by frame as fast as it is processed")
 
     def _replay_toggle(self, checked: bool):
         s = self.source

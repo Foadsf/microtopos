@@ -21,6 +21,7 @@ from .focus import focus_map
 from .kinematics import Override, State, StateMachine
 from .mosaic import Mosaic, height_partitions, preview_factor, render_tiles, render_tiles_rgb
 from .optics import Objective
+from .stage import StageReadout
 
 PREVIEW_W = 640
 MAX_SWEEP_FRAMES = 240  # beyond this, the sweep is thinned 2:1 (keeps the full z range)
@@ -29,6 +30,11 @@ HOLD_FRAMES = 50  # ~4 s at 12.5 fps
 # A focus movement is a usable sweep once at least this fraction of the field went blurry -> sharp -> blurry.
 # The live engine, the GUI and the batch tool all decide through this constant (SweepCapture.usable).
 MIN_COMPLETENESS = 0.5
+
+
+def _is_simulated(truth) -> bool:
+    """Simulator ground truth is simulated; a stage readout (`StageReadout`) is a measurement, not a simulation."""
+    return truth is not None and not isinstance(truth, StageReadout)
 
 
 @dataclass
@@ -387,7 +393,7 @@ class LiveEngine:
             elif self.sm.state == State.Z_SWEEP and len(self._buf) \
                     and _completeness(self._buf.tiles) >= MIN_COMPLETENESS:
                 h, w = self._buf.frames[0].shape
-                sim = self._sweep_simulated or any(v is not None for v in self._buf.z)
+                sim = self._sweep_simulated
                 self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape,
                            manual=self.sm.override == Override.Z)
                 self._buf = SweepBuffer()
@@ -420,7 +426,7 @@ class LiveEngine:
                     or req["exposure"] != self.exposure or req["linearize"] != self.linearize
                     or req["shape"] != raw.shape):
                 self._cancel_calibration("the camera mode, exposure or objective changed while recording")
-            elif truth is not None and self.store.directory is not None:
+            elif _is_simulated(truth) and self.store.directory is not None:
                 self._cancel_calibration("the simulator never writes to disk")
             else:
                 req["frames"].append(raw)
@@ -472,7 +478,7 @@ class LiveEngine:
             self._last_state = state
         self._bhist.append(feat.brenner)
         z_true = getattr(truth, "focus_z_um", None)
-        simulated = truth is not None
+        simulated = _is_simulated(truth)
         for ev in events:
             if ev.kind == "sweep_started":
                 if self._held is not None:  # focusing resumed soon after an incomplete sweep: continue it

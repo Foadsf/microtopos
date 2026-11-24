@@ -28,7 +28,7 @@ microtopos-batch = "microtopos.batch:main"
 microtopos-bench = "microtopos.backend:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "hypothesis>=6.100"]
 
 [build-system]
 requires = ["hatchling>=1.24"]

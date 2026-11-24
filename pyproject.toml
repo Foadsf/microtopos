@@ -28,7 +28,7 @@ microtopos-batch = "microtopos.batch:main"
 microtopos-bench = "microtopos.backend:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "hypothesis>=6.100"]
+dev = ["pytest>=8", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling>=1.24"]
@@ -41,5 +41,5 @@ line-length = 120
 testpaths = ["tests"]
 # The full generalisation matrix (tests/test_gen_*.py) is marked slow and deselected by default; the default run
 # keeps a representative subset. Run it with `pytest -m slow`, or everything with `pytest -m "slow or not slow"`.
-addopts = "-m 'not slow and not pending_patch'"
-markers = ["slow: full generalisation matrix (several minutes); run with -m slow", "pending_patch: failing test for a defect whose fix lives in another slice's file; deselected until the patch is applied, then remove the marker"]
+addopts = "-m 'not slow'"
+markers = ["slow: full generalisation matrix (several minutes); run with -m slow"]

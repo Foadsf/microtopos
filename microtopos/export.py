@@ -283,20 +283,22 @@ _LIMIT_PX = 400_000_000  # refuse absurd arrays from a damaged or foreign file b
 def save_session(path: Path | str, result: dict | None, settings: dict, extra: dict | None = None) -> None:
     """Schema-2 session: the result's original arrays (incl. the processing EDF and filtered surface), all scalars
     and warnings, settings, and optionally a mosaic (keyframes, edges, patches, insets). `result` may be None for
-    a mosaic-only session; a Mosaic instance is passed via result["mosaic"] (or extra["mosaic"])."""
+    a mosaic-only session; a Mosaic instance is passed via result["mosaic"] (or extra["mosaic"]). A mosaic that
+    another thread is still tracking is passed as the (meta, arrays) snapshot taken under its lock
+    (LiveEngine.mosaic_state()): a Mosaic instance is serialized here, on the calling thread."""
     from .mosaic import Mosaic
 
     result = dict(result or {})
     result.update(extra or {})
     mosaic = result.pop("mosaic", None)
-    if mosaic is not None and not isinstance(mosaic, Mosaic):
-        raise ExportError("result['mosaic'] must be a Mosaic instance")
+    if mosaic is not None and not isinstance(mosaic, (Mosaic, tuple)):
+        raise ExportError("result['mosaic'] must be a Mosaic instance or its (meta, arrays) state")
     arrays = {k: result[k] for k in SESSION_ARRAYS if isinstance(result.get(k), np.ndarray)}
     meta = {k: _jsonable(v) for k, v in result.items() if not isinstance(v, np.ndarray)}
     blob = {"schema": SESSION_SCHEMA, "result": meta, "settings": _jsonable(settings),
             "has_result": "height" in arrays}
     if mosaic is not None:
-        mmeta, marrays = mosaic.to_state_arrays()
+        mmeta, marrays = mosaic if isinstance(mosaic, tuple) else mosaic.to_state_arrays()
         blob[MOSAIC_META_KEY] = mmeta
         blob[MOSAIC_ARRAYS_KEY] = sorted(marrays)
         arrays.update({MOSAIC_ARRAY_PREFIX + k: v for k, v in marrays.items()})

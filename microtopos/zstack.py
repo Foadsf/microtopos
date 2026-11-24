@@ -27,6 +27,7 @@ import numpy as np
 
 from . import metrology, sff, units
 from .backend import focus_map_backend
+from .calibration import bgr_to_rgb_u8
 from .focus import focus_map, tile_scores
 from .optics import Objective
 from .registration import RegistrationCancelled, register_sweep, warp_scale_shift, warp_support, warp_to_reference
@@ -185,8 +186,9 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     z_um_per_frame: µm per source frame for this sweep; used only when z_labels is None.
     sample_pos: source frame number of each frame (default 0, 1, 2, ...); used only when z_labels is None.
     z_sign: +1 / -1 when the sweep direction is known (hand sweep); None = orientation unknown.
-    color_frames: full-resolution colour (BGR or grey) image per frame, aligned with `frames`; when given an
-    all-in-focus colour fusion is fused with the same warps and weights and returned as `edf_rgb`.
+    color_frames: full-resolution colour (BGR or grey; uint8, uint16 or float on the 0..255 scale) image per frame,
+    aligned with `frames`; when given, an all-in-focus colour image is fused with the same warps and weights and
+    returned as `edf_rgb` (uint8 RGB).
     """
     st = settings or ZSettings()
     z_unit = units.canon(z_unit)
@@ -422,16 +424,14 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         acc_rgb = sff.EDFAccumulator((H, W, 3))
         for j, i in enumerate(idx):
             check_cancel()
-            c_fr = color_frames[i]
-            if c_fr.ndim == 2:
-                c_fr = cv2.cvtColor(c_fr, cv2.COLOR_GRAY2BGR)
-            c_fr = np.clip(c_fr + 0.5, 0, 255).astype(np.uint8).astype(np.float32)
+            # one conversion to 0..255 RGB (uint16 / 257, grey -> 3 channels): calibration.bgr_to_rgb_u8
+            c_fr = bgr_to_rgb_u8(color_frames[i]).astype(np.float32)
             Wf = rescale_warp(warps[j], f)
             acc_rgb.add(warp_to_reference(c_fr, Wf),
                         cv2.resize(wts_of(j), (W, H), interpolation=cv2.INTER_LINEAR))
             if progress and j % 8 == 0:
                 progress(0.84 + 0.04 * j / n, "Fusing the colour all-in-focus image...")
-        edf_rgb = cv2.cvtColor(np.clip(acc_rgb.result(), 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+        edf_rgb = np.clip(np.rint(acc_rgb.result()), 0, 255).astype(np.uint8)
         del acc_rgb
     del acc
     done("edf")

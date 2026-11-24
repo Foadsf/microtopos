@@ -47,7 +47,7 @@ class SweepCapture:
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
     manual: bool = False  # True when captured under manual Z override (Space)
-    color_frames: list | None = None  # corrected colour frames matching `frames`, when the engine runs in colour mode
+    color_frames: list | None = None  # raw colour (BGR) frames matching `frames`, when the engine runs in colour mode
 
 
 class SweepBuffer:

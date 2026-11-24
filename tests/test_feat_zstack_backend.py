@@ -416,6 +416,61 @@ def test_zstack_rejects_mismatched_colour_frames():
         zstack.reconstruct(frames, zs, OBJ, 1.0, "um", color_frames=frames[:2])
 
 
+def _banded_colour_stack(dtype):
+    """9 frames, 3 vertical bands; band r is sharpest in frame SHARP[r] and blurred in proportion to the distance
+    from it. Colour frame k = luma * tint[k] (BGR), the tints of the sharpest frames being strongly different, so
+    the fused colour of a band identifies which frame it came from and the channel order."""
+    sharp = (2, 4, 6)
+    h, w, n = 96, 180, 9
+    rng = np.random.default_rng(5)
+    base = [cv2.GaussianBlur(rng.uniform(40, 215, (h, w)).astype(np.float32), (0, 0), 1.0) for _ in range(3)]
+    tint = rng.uniform(0.35, 1.0, (n, 3)).astype(np.float32)  # BGR
+    tint[2], tint[4], tint[6] = (0.2, 0.5, 1.0), (1.0, 0.3, 0.3), (0.3, 1.0, 0.4)  # red-ish, blue-ish, green-ish
+    band = np.minimum(np.arange(w) * 3 // w, 2)
+    lum, bgr = [], []
+    for k in range(n):
+        y = np.empty((h, w), np.float32)
+        for r in range(3):
+            s = 2.5 * abs(k - sharp[r])
+            img = base[r] if s == 0 else cv2.GaussianBlur(base[r], (0, 0), s)
+            y[:, band == r] = img[:, band == r]
+        lum.append(y)
+        bgr.append(y[..., None] * tint[k][None, None, :])
+    expected = np.empty((h, w, 3), np.float32)  # RGB
+    for r in range(3):
+        expected[:, band == r] = (bgr[sharp[r]][:, band == r])[..., ::-1]
+    frames = [np.clip(b, 0, 255) for b in bgr]
+    colour = [np.rint(f).astype(np.uint8) if dtype == np.uint8 else np.rint(f * 257.0).astype(np.uint16) for f in frames]
+    return lum, colour, np.arange(float(n)), expected, band
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16])
+def test_colour_edf_reproduces_the_colours_of_the_sharpest_frames(dtype):
+    lum, colour, zs, expected, band = _banded_colour_stack(dtype)
+    r = zstack.reconstruct(lum, zs, OBJ, 1.0, "um", color_frames=colour)
+    rgb = r["edf_rgb"]
+    assert rgb.dtype == np.uint8 and rgb.shape == expected.shape
+    inner = np.zeros(band.shape, bool)
+    for b in range(3):  # interior of each band: away from the seams between the bands and from the image border
+        cols = np.nonzero(band == b)[0]
+        inner[cols[25:-25] if b == 1 else (cols[8:-25] if b == 0 else cols[25:-8])] = True
+    diff = np.abs(rgb[8:-8][:, inner].astype(np.float32) - expected[8:-8][:, inner])
+    assert float(diff.mean()) < 2.0, float(diff.mean())
+    assert float(np.percentile(diff, 99)) < 12.0, float(np.percentile(diff, 99))
+    # the three bands really are three different colours (channel order: band 0 red-dominant, 1 blue, 2 green)
+    means = [rgb[8:-8][:, np.nonzero(inner & (band == b))[0]].reshape(-1, 3).mean(0) for b in range(3)]
+    assert means[0].argmax() == 0 and means[1].argmax() == 2 and means[2].argmax() == 1, means
+    assert float(rgb.std()) > 20  # a 16-bit input must not saturate (it did: mean 254.9, std 0.35)
+
+
+def test_colour_edf_grey_colour_frames_are_accepted():
+    lum, _colour, zs, expected, _band = _banded_colour_stack(np.uint8)
+    grey = [np.rint(l_).astype(np.uint8) for l_ in lum]
+    r = zstack.reconstruct(lum, zs, OBJ, 1.0, "um", color_frames=grey)
+    assert r["edf_rgb"].shape == expected.shape
+    assert int(np.abs(r["edf_rgb"][..., 0].astype(int) - r["edf_rgb"][..., 2]).max()) == 0  # R == B for grey input
+
+
 def test_rescale_heights_full_invariants():
     h = np.random.default_rng(0).normal(0, 1, (32, 32)).astype(np.float32)
     edf = np.full((32, 32), 128, np.float32)
@@ -663,3 +718,71 @@ def test_require_opencl_skips_or_fails_per_environment(tmp_path, monkeypatch):
     assert "1 failed" in required and "MICROTOPOS_REQUIRE_OPENCL=1" in required, required
     strict = _run_policy_pytest(tmp_path, src, MICROTOPOS_STRICT_SKIPS="1")
     assert "1 skipped" in strict, strict  # the one allowed reason stays a skip even in strict mode
+
+
+# ---------------------------------------------------------------- colour all-in-focus is reachable from the GUI
+
+@pytest.fixture
+def gui_window(tmp_path_factory):
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    pg = pytest.importorskip("pyqtgraph")
+    from PySide6.QtCore import QSettings, QStandardPaths
+    from PySide6.QtWidgets import QApplication
+
+    from microtopos.gui.main_window import MainWindow
+
+    QStandardPaths.setTestModeEnabled(True)
+    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
+    app = QApplication.instance() or QApplication([])
+    pg.setConfigOptions(imageAxisOrder="row-major")
+    base = tmp_path_factory.mktemp("gui_data")
+    os.environ["XDG_DATA_HOME"] = str(base / "data")
+    os.environ["XDG_CONFIG_HOME"] = str(base / "config")
+    w = MainWindow(simulator_only=True)
+    w.show()
+    for _ in range(20):
+        app.processEvents()
+    w.timer.stop()
+    yield app, w
+    w.close()
+    app.processEvents()
+
+
+def _wait_until(app, cond, timeout=60.0):
+    import time
+
+    t0 = time.time()
+    while time.time() - t0 < timeout and not cond():
+        app.processEvents()
+        time.sleep(0.02)
+    assert cond(), "timed out"
+
+
+def _gui_sweep_result(app, w):
+    w.result = None
+    w._demo("sweep")
+    _wait_until(app, lambda: w.result is not None)
+    for _ in range(10):
+        app.processEvents()
+    return w.result
+
+
+def test_gui_colour_toggle_yields_a_displayed_colour_all_in_focus(gui_window):
+    app, w = gui_window
+    assert w.engine.color_mode is False
+    w.chk_rgb.setChecked(True)
+    assert w.engine.color_mode is True  # the toggle used to set only the window's flag; the engine never kept colour
+    _wait_until(app, lambda: len(w.engine._preroll) > 0 and all(item[5] is not None for item in w.engine._preroll))
+    r = _gui_sweep_result(app, w)
+    assert r["edf_rgb"].ndim == 3 and r["edf_rgb"].shape[2] == 3 and r["edf_rgb"].dtype == np.uint8
+    assert r["edf_rgb"].shape[:2] == r["edf"].shape[:2]
+    shown = w.p_edf.data
+    assert shown.ndim == 3 and shown.shape[2] == 3  # the colour image, not the grey one, is on the All-in-focus panel
+    assert "colour" in w.lbl_edf.text()
+    w.chk_rgb.setChecked(False)
+    assert w.engine.color_mode is False
+    _wait_until(app, lambda: len(w.engine._preroll) > 0 and all(item[5] is None for item in w.engine._preroll))
+    r2 = _gui_sweep_result(app, w)
+    assert r2.get("edf_rgb") is None and w.p_edf.data.ndim == 2  # colour off: the grey EDF, no colour claim

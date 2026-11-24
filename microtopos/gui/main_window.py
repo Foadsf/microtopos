@@ -962,8 +962,10 @@ class MainWindow(QMainWindow):
 
         def done(poses):
             self.btn_stg_zsweep.setText("Z sweep")
-            if poses:
-                self._stage_show(poses[-1])
+            if not poses:
+                self.notify("Z sweep cancelled before the first stage position; nothing was captured.", "warning")
+                return
+            self._stage_show(poses[-1])
             self.notify(f"Z sweep done: {len(poses)} stage positions, {poses[0].z_um:+.2f} to "
                         f"{poses[-1].z_um:+.2f} µm. The capture is reconstructed when the engine has finished it.")
 
@@ -971,6 +973,7 @@ class MainWindow(QMainWindow):
             self.stage_job.is_sweep = True
             self.btn_stg_zsweep.setText("Cancel sweep")
             self.stage_job.finished.connect(lambda: self.btn_stg_zsweep.setText("Z sweep"))
+
     def _page_objective(self):
         self.cmb_obj = QComboBox()
         self.cmb_obj.addItems(self.objset.names)
@@ -2962,4 +2965,7 @@ class MainWindow(QMainWindow):
         self.engine.stop()
         if self.source is not None:
             self.source.stop()
+        if self.stage_driver is not None:  # after the source: its thread reads the stage for every frame
+            self.stage_driver.close()
+            self.stage_driver = None
         super().closeEvent(ev)

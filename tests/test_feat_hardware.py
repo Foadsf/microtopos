@@ -1249,6 +1249,47 @@ def test_gui_stage_z_sweep_captures_stage_z_and_reconstructs_in_um(window, qapp)
     _check_height_matches_relief(w.result["height"], w.sim_source.sim)
     assert w.stage_driver.pose().z_um == pytest.approx(z1)  # the stage ends where the sweep ended
 
+
+def test_gui_z_sweep_cancelled_before_the_first_position_says_so(window, qapp, monkeypatch):
+    """A sweep that returns no stage positions (cancelled at once) is reported, not indexed into."""
+    w = window
+    import microtopos.gui.main_window as mw
+
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: w.stage_driver is not None and _stage_idle(w))
+    monkeypatch.setattr(mw, "capture_z_sweep", lambda *a, **k: [])
+    seen: list[str] = []
+    real_notify = w.notify
+    monkeypatch.setattr(w, "notify", lambda text, kind="info": (seen.append(text), real_notify(text, kind))[1])
+    crashed: list = []
+    monkeypatch.setattr(sys, "excepthook", lambda *a: crashed.append(a))
+    w.btn_stg_zsweep.click()
+    assert _wait(qapp, lambda: _stage_idle(w) and any("cancelled before the first stage position" in s for s in seen))
+    assert not crashed
+    assert w.btn_stg_zsweep.text() == "Z sweep"
+
+
+def test_gui_closing_the_window_closes_the_stage_port(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    import microtopos.gui.main_window as mw
+
+    fake = FakeGrbl()
+    monkeypatch.setattr(mw, "GrblStageDriver", lambda port: GrblStageDriver(port, serial_factory=lambda *a, **k: fake,
+                                                                          timeout=0.3, feedrate_mm_min=6000.0))
+    w = MainWindow(simulator_only=True)
+    w.show()
+    _pump(qapp, 20)
+    w.timer.stop()
+    w.cmb_stg.setCurrentText("GRBL serial port")
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: w.stage_driver is not None and _stage_idle(w))
+    assert fake.is_open
+    w.close()
+    _pump(qapp, 5)
+    assert not fake.is_open and w.stage_driver is None
+
+
 def _open_replay_window(qapp, tmp_path, monkeypatch, exhaustive):
     import microtopos.gui.main_window as mw
 

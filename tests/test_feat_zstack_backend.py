@@ -656,8 +656,32 @@ def test_stage_coupled_live_engine_z_sweep_populates_z_flags_and_z_labels():
     cap = caps[0]
     assert cap.manual is True  # sweep captured under manual Z override
     assert cap.simulated is True  # frames came from a simulator source
-    assert cap.z is not None and len(cap.z) == len(cap.frames)
-    assert all(v is not None for v in cap.z)  # z labels populated from stage/simulator truth
+    assert cap.z is not None and len(cap.z) == len(cap.frames) == len(trajectory)
+    # the label VALUES are the stage Z that was commanded for each frame, in order (not merely "not None")
+    assert np.allclose(cap.z, trajectory, atol=1e-9), (list(cap.z), list(trajectory))
+    assert cap.seqs == list(range(1, len(trajectory) + 1))  # one label per source frame, none dropped or reordered
+    # and they are usable: reconstruction with them reports a known orientation and the commanded z range
+    r = zstack.reconstruct(cap.frames, cap.z, OBJ, sim.sim.um_per_px, "um")
+    assert r["z_orientation"] == "known"
+    assert (r["z_first"], r["z_last"]) == pytest.approx((trajectory[0], trajectory[-1]))
+
+
+def test_stage_coupled_negative_control_without_truth_there_are_no_z_labels_and_no_simulated_flag():
+    sim = SimulatorSource(4, OBJ, 160, 120)
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.sync_callbacks = True
+    caps: list = []
+    eng.on_sweep = caps.append
+    eng.set_source(sim)
+    eng.sm.override = Override.Z
+    for i, _z in enumerate(sim.sim.sweep_trajectory(n_frames=14)):
+        sim.sim.focus_z_um = float(_z)
+        bgr, _truth = sim.sim.render()
+        eng.process_frame(bgr, i * 0.04, i + 1, truth=None)  # a real camera: no ground truth
+    eng.flush()
+    assert len(caps) == 1
+    assert caps[0].manual is True  # the override still marks it manual
+    assert caps[0].simulated is False and caps[0].z is None  # but nothing may invent z labels or a simulator flag
 
 
 def test_live_sweep_ended_event_carries_the_manual_flag_from_override():
@@ -676,6 +700,24 @@ def test_live_sweep_ended_event_carries_the_manual_flag_from_override():
     assert len(caps) == 1
     assert caps[0].manual is True
 
+
+def test_live_manual_z_sweep_ended_by_switching_to_another_override_is_flagged_manual():
+    sim = SimulatorSource(5, OBJ, 160, 120)
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.sync_callbacks = True
+    caps: list = []
+    eng.on_sweep = caps.append
+    eng.sm.override = Override.Z
+    for i, z_um in enumerate(sim.sim.sweep_trajectory(n_frames=12)):
+        sim.sim.focus_z_um = float(z_um)
+        bgr, truth = sim.sim.render()
+        eng.process_frame(bgr, i * 0.04, i + 1, truth=truth)
+    eng.sm.override = Override.PAN  # leaving manual Z for a forced mode ends the sweep through the other branch
+    bgr, truth = sim.sim.render()
+    eng.process_frame(bgr, 12 * 0.04, 13, truth=truth)
+    assert len(caps) == 1
+    assert caps[0].manual is True
+    assert caps[0].z is not None and len(caps[0].z) == 12
 
 def test_live_request_calibration_refuses_simulator_against_disk_store(tmp_path):
     sim = SimulatorSource(6, OBJ, 120, 90)

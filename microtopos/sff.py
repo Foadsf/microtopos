@@ -107,6 +107,7 @@ class DepthFit:
     confidence: np.ndarray  # 0..1
     peak_index: np.ndarray
     fwhm_z_median: float  # median focus-curve FWHM in z units (from the Gaussian fit)
+    fwhm_z_samples: np.ndarray | None = None  # the per-pixel FWHMs that median is taken over (strip-wise stitching)
 
 
 def _gather(fv, idx):
@@ -169,9 +170,10 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
     conf = (conf * peak_ok).astype(np.float32)
 
     sig = np.sqrt(-1.0 / (2 * a[peak_ok & (conf > 0.5)])) if np.any(peak_ok & (conf > 0.5)) else np.array([np.nan])
-    fwhm = float(np.nanmedian(2.3548 * sig)) if sig.size else float("nan")
+    fwhm_samples = (2.3548 * sig).astype(np.float64)
+    fwhm = float(np.nanmedian(fwhm_samples)) if sig.size else float("nan")
     zm = np.where(conf >= conf_threshold, z_raw, np.nan).astype(np.float32)
-    return DepthFit(zm, z_raw, conf, k.astype(np.int32), fwhm)
+    return DepthFit(zm, z_raw, conf, k.astype(np.int32), fwhm, fwhm_samples)
 
 
 # ---------------------------------------------------------------------------------------------- refinement

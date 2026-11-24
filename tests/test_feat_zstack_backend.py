@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import sys
 
 import cv2
 import numpy as np
@@ -268,24 +269,125 @@ def test_theoretical_fwhm_negative_controls_return_none():
 # ------------------------------------------------------------------------------------------------ B4
 
 
-def test_zstack_tiled_and_untiled_reconstructions_agree():
-    frames, zs = _sim_sweep(11, n_frames=9, size=(240, 320))
-    r_untiled = zstack.reconstruct(frames, zs, OBJ, 1.0, "um",
-                                   settings=ZSettings(allow_tiling=False))
-    r_tiled = zstack.reconstruct(frames, zs, OBJ, 1.0, "um",
-                                 settings=ZSettings(allow_tiling=True, memory_fraction=1e-5))
-    assert r_tiled["frames_used"] == r_untiled["frames_used"] == len(frames)
-    valid = (r_untiled["support"] & r_tiled["support"]
-             & np.isfinite(r_untiled["height"]) & np.isfinite(r_tiled["height"]))
-    assert valid.sum() > 0.5 * valid.size
-    diff = np.abs(r_untiled["height"][valid] - r_tiled["height"][valid])
-    assert float(np.median(diff)) < 0.6, float(np.median(diff))
-    assert float(np.percentile(diff, 95)) < 2.5, float(np.percentile(diff, 95))
-    for r in (r_untiled, r_tiled):
-        assert np.isfinite(r["fwhm_z"]) and r["fwhm_z"] > 0
-        assert r["ecc_mean"] is not None and r["ecc_mean"] > 0.5
-        assert r["support_fraction"] > 0.3
+_SKIP_KEYS = ("timings", "timestamp", "n_strips")  # run-dependent bookkeeping, not results
 
+
+def _strip_context(r_one_piece: dict, width: int):
+    n, (ph, pw) = r_one_piece["frames_used"], r_one_piece["edf_proc"].shape
+    halo = zstack.strip_halo_rows("DoG band-pass", r_one_piece["focus_window_px"], OBJ.psf_sigma_px(1.0 * width / pw))
+    return n, ph, pw, halo
+
+
+def _force_strips(monkeypatch, r_one_piece: dict, width: int, n_strips: int) -> None:
+    """Make the memory query report just enough memory for `n_strips` strips and not for fewer."""
+    n, ph, pw, halo = _strip_context(r_one_piece, width)
+    avail = int(zstack.estimate_tiled_peak_bytes(n, ph, pw, n_strips, halo) / 0.8) + 1
+    assert zstack.plan_strips(n, ph, pw, halo, avail, 0.8, True) == n_strips
+    monkeypatch.setattr(zstack, "available_memory_bytes", lambda: avail)
+
+
+def _colour_sweep(seed: int, size: tuple[int, int], n_frames: int):
+    sim = SpecimenSimulator(seed, OBJ, out_w=size[1], out_h=size[0])
+    frames, colours, zs = [], [], []
+    for z_k in sim.sweep_trajectory(n_frames=n_frames):
+        sim.focus_z_um = float(z_k)
+        bgr, truth = sim.render()
+        frames.append(bgr_to_luma(bgr))
+        colours.append(bgr)
+        zs.append(truth.focus_z_um)
+    return frames, colours, np.array(zs, dtype=np.float64)
+
+
+@pytest.mark.parametrize(("size", "n_frames", "n_strips"), [((240, 320), 9, 3), ((360, 480), 13, 12)])
+def test_strip_wise_reconstruction_equals_the_one_piece_reconstruction(monkeypatch, size, n_frames, n_strips):
+    """Strip-wise (tiled) reconstruction to bound peak memory must give the same result as one piece, output by
+    output. Exact equality is expected (every strip carries its focus halo, the global steps run on the stitched
+    maps); the only intended difference is the capture-resolution fusion, which reads the weights as uint16 (EDF
+    within 1 grey level). The numeric tolerance 1e-4 um (~1e-5 of the height spread) only absorbs float32 order of
+    operations on another CPU."""
+    frames, colours, zs = _colour_sweep(11, size, n_frames)
+    one = zstack.reconstruct(frames, zs, OBJ, 1.0, "um", color_frames=colours,
+                             settings=ZSettings(allow_tiling=False))
+    assert one["n_strips"] == 1
+    _force_strips(monkeypatch, one, size[1], n_strips)
+    tiled = zstack.reconstruct(frames, zs, OBJ, 1.0, "um", color_frames=colours, settings=ZSettings(allow_tiling=True))
+    assert tiled["n_strips"] == n_strips
+    assert set(tiled) == set(one)
+    for k in one:
+        if k in _SKIP_KEYS or k in ("edf", "edf_rgb"):
+            continue
+        a, b = one[k], tiled[k]
+        if isinstance(a, np.ndarray) and a.dtype.kind == "f":
+            assert a.shape == b.shape, k
+            assert np.array_equal(np.isnan(a), np.isnan(b)), f"{k}: NaN/support masks differ"
+            np.testing.assert_allclose(b, a, rtol=1e-6, atol=1e-4, equal_nan=True, err_msg=k)
+        elif isinstance(a, np.ndarray):
+            assert np.array_equal(a, b), k
+        elif isinstance(a, float):
+            assert b == pytest.approx(a, rel=1e-6, abs=1e-6, nan_ok=True), k
+        else:
+            assert a == b, k
+    assert tiled["support_fraction"] == one["support_fraction"] and one["support_fraction"] > 0.6
+    assert float(np.nanmax(np.abs(tiled["height"] - one["height"]))) <= 1e-4
+    assert not np.array_equal(tiled["height_raw"], tiled["height"], equal_nan=True)  # raw fit is not the refined map
+    assert float(np.abs(tiled["edf"] - one["edf"]).max()) <= 1.0
+    assert int(np.abs(tiled["edf_rgb"].astype(int) - one["edf_rgb"].astype(int)).max()) <= 1
+
+
+def test_strip_wise_reconstruction_lowers_peak_memory(monkeypatch):
+    import gc
+    import tracemalloc
+
+    frames, zs = _sim_sweep(11, n_frames=25, size=(480, 640))
+
+    def peak(settings):
+        gc.collect()
+        tracemalloc.start()
+        try:
+            r = zstack.reconstruct(frames, zs, OBJ, 1.0, "um", settings=settings)
+            return tracemalloc.get_traced_memory()[1], r
+        finally:
+            tracemalloc.stop()
+
+    p_one, one = peak(ZSettings(allow_tiling=False))
+    _force_strips(monkeypatch, one, 640, 16)
+    p_tiled, tiled = peak(ZSettings(allow_tiling=True))
+    assert tiled["n_strips"] == 16
+    assert np.array_equal(tiled["height"], one["height"], equal_nan=True)
+    assert p_tiled < 0.6 * p_one, (p_tiled / 2**20, p_one / 2**20)
+
+
+def test_memory_guard_refuses_a_job_that_cannot_fit_even_in_strips(monkeypatch):
+    frames, zs = _sim_sweep(11, n_frames=9, size=(240, 320))
+    one = zstack.reconstruct(frames, zs, OBJ, 1.0, "um", settings=ZSettings(allow_tiling=False))
+    n, ph, pw, halo = _strip_context(one, 320)
+    floor = zstack.estimate_tiled_peak_bytes(n, ph, pw, ph, halo)
+    # budget below even the one-row strip: refused although tiling is allowed (the default)
+    monkeypatch.setattr(zstack, "available_memory_bytes", lambda: int(0.5 * floor / 0.8))
+    with pytest.raises(MemoryError, match="in strips"):
+        zstack.reconstruct(frames, zs, OBJ, 1.0, "um", settings=ZSettings(allow_tiling=True))
+    # fits in strips but not in one piece: refused when tiling is switched off (the base-branch refusal)
+    _force_strips(monkeypatch, one, 320, 4)
+    with pytest.raises(MemoryError, match="lower the processing width"):
+        zstack.reconstruct(frames, zs, OBJ, 1.0, "um", settings=ZSettings(allow_tiling=False))
+    # a job that needs many strips (more than 16, the base branch's cap) is processed, not refused
+    need40 = int(zstack.estimate_tiled_peak_bytes(25, 480, 640, 40, 14) / 0.8) + 1
+    assert zstack.plan_strips(25, 480, 640, 14, need40, 0.8, True) == 40
+    # plenty of memory: one piece, no strips
+    monkeypatch.setattr(zstack, "available_memory_bytes", lambda: 64 * 2**30)
+    assert zstack.reconstruct(frames, zs, OBJ, 1.0, "um")["n_strips"] == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows memory query (ctypes GlobalMemoryStatusEx)")
+def test_windows_available_memory_matches_the_os_report():
+    import subprocess
+
+    got = zstack.available_memory_bytes()
+    out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                          "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+                         capture_output=True, text=True, timeout=60, check=False).stdout.strip()
+    assert got is not None
+    assert got == pytest.approx(int(out) * 1024, rel=0.25)
 
 def test_zstack_rgb_edf_is_a_sharp_colour_image():
     sim = SimulatorSource(9, OBJ, 160, 120)

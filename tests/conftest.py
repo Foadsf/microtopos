@@ -24,7 +24,7 @@ ALLOWED_SKIP_REASONS = (
     r"^no OpenCL device$",
     r"needs Xvfb and a window manager",
     r"could not import 'pyqtgraph'",  # optional GUI dependency not installed
-    r"could not import 'serial'",  # optional pyserial not installed (hardware-protocol tests need it)
+    r"^Windows memory query ",  # a Windows-only API test on another platform`n    r"could not import 'serial'",  # optional pyserial not installed (hardware-protocol tests need it)
 )
 
 
@@ -83,3 +83,4 @@ def pytest_runtest_makereport(item, call):
 def pytest_make_collect_report(collector):
     outcome = yield
     _strict_outcome(outcome.get_result(), "collection")
+

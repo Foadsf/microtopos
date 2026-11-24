@@ -71,7 +71,7 @@ class StateMachine:
         self.quiet_db = collections.deque(maxlen=120)
         self.quiet_resp = collections.deque(maxlen=120)
         self.cut_before = None
-        self.sweep_complete = True  # set by the caller each frame during a sweep (live completeness >= 0.5)
+        self.sweep_complete = True  # set by the caller each frame during a sweep (live.MIN_COMPLETENESS)
         self.trend = collections.deque(maxlen=6)
         self.enter_count = 0
         self.exit_count = 0

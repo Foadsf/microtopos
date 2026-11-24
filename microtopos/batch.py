@@ -56,7 +56,7 @@ def run_batch(recording: str | Path, outdir: str | Path, objective: str = "10x /
     sweeps = []
     k = 0
     for cap in caps:
-        if cap.completeness < 0.5 and not cap.manual:
+        if not cap.usable:
             log(f"ignored incomplete focus movement ({len(cap.frames)} frames, {cap.completeness:.0%} completeness)")
             continue
         k += 1

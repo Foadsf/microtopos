@@ -365,6 +365,24 @@ def test_grbl_move_waits_for_idle_and_nowait_reports_run():
     assert fake.mpos[0] == pytest.approx(2.0)
 
 
+def test_grbl_pose_is_answered_while_another_thread_waits_for_a_move():
+    """The camera thread reads the stage for every frame it publishes: a waiting move must not keep the port for
+    its whole duration, or the live view freezes until the stage arrives."""
+    fake = FakeGrbl()
+    drv = _grbl(fake, feedrate_mm_min=600.0)  # 10 mm/s: the 20 mm move below takes 2 s
+    drv.connect()
+    done = {}
+    mover = threading.Thread(target=lambda: done.update(pose=drv.move_to(x_um=20000.0, wait=True)))
+    mover.start()
+    try:
+        assert _until(lambda: any("X20.00000" in w for w in fake.written), 5.0)
+        seen = drv.pose()  # from this thread, while the other one waits for Idle
+    finally:
+        mover.join(15.0)
+    assert seen.moving is True and seen.x_um < 20000.0
+    assert done["pose"].moving is False and done["pose"].x_um == pytest.approx(20000.0)
+
+
 def test_grbl_error_reply_raises_and_pose_stays_truthful():
     fake = FakeGrbl(start=(1.0, 0.0, 0.0))
     drv = _grbl(fake, feedrate_mm_min=0.0)  # F0 -> the controller answers error:22

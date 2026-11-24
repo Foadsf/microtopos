@@ -368,17 +368,21 @@ class GrblStageDriver(StageDriver):
             self._cmd("G90 G53 G1 " + " ".join(f"{a}{t:.5f}" for a, t in target.items()) + f" F{self.feedrate:.1f}")
             if not wait:
                 return self._pose_locked()
-            # generous bound: twice the travel time at the commanded feed rate, plus one reply timeout
-            deadline = time.perf_counter() + self.timeout
-            if self.feedrate > 0:
-                deadline += 2.0 * dist / self.feedrate * 60.0
-            while True:
+        # The port is taken per status poll, not for the whole move: the camera thread reads the pose for every
+        # frame it publishes and must not stall until the stage arrives.
+        # generous bound: twice the travel time at the commanded feed rate, plus one reply timeout
+        deadline = time.perf_counter() + self.timeout
+        if self.feedrate > 0:
+            deadline += 2.0 * dist / self.feedrate * 60.0
+        while True:
+            with self._lock:
+                self._require_port()  # closed from another thread while waiting
                 pose = self._pose_locked()
-                if not pose.moving:
-                    return pose
-                if time.perf_counter() > deadline:
-                    raise StageError("the stage did not finish the move in time")
-                time.sleep(0.01)
+            if not pose.moving:
+                return pose
+            if time.perf_counter() > deadline:
+                raise StageError("the stage did not finish the move in time")
+            time.sleep(0.01)
 
     def zero(self) -> StagePose:
         """Make the current position this driver's (0, 0, 0). The controller's own offsets are left alone."""

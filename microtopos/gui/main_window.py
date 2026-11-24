@@ -81,8 +81,10 @@ pattern projected through the field diaphragm.</p>
 spherical aberration and lack of light; an oil objective also needs oil on the specimen. Objectives engraved 0 or
 ∞/0 are made for uncovered specimens in reflected light; "-" means either. Deconvolution cannot replace missing
 illumination.</p>
-<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected: it could not be measured
-reliably from defocused frames. Its effect is limited to the far-defocused frames at the image edges.</p>
+<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected by default. An experimental
+correction (3D tab, "Correct focus breathing") measures it from the frame pairs and improves the lateral alignment of
+the frames; on simulated sweeps it did not change the height error measurably. A drift larger than 1.5 % over the
+sweep is limited to 1.5 % and reported as a warning.</p>
 """
 
 STEPS = ["Camera", "Objective", "Dark && flat", "Lateral scale", "Z scale", "Inspect"]
@@ -625,10 +627,15 @@ class MainWindow(QMainWindow):
         self.cmb_3d_backend.addItems(["CPU", "OpenCL"])
         self.cmb_3d_backend.currentTextChanged.connect(lambda t: setattr(self.zst, "backend", t.lower()))
         bar.addWidget(self.cmb_3d_backend)
-        self.chk_3d_breathing = QCheckBox("Correct focus breathing")
+        self.chk_3d_breathing = QCheckBox("Correct focus breathing (experimental)")
+        self.chk_3d_breathing.setToolTip("Estimates the magnification change with focus from the frame pairs and folds it "
+                                         "into the frame alignment. Experimental: it improves the lateral alignment, but "
+                                         "did not change the simulated height error measurably.")
         self.chk_3d_breathing.toggled.connect(lambda on: setattr(self.zst, "correct_breathing", on))
         bar.addWidget(self.chk_3d_breathing)
-        self.chk_3d_tiling = QCheckBox("Allow tiling")
+        self.chk_3d_tiling = QCheckBox("Strip-wise reconstruction")
+        self.chk_3d_tiling.setToolTip("Reconstruct in horizontal strips when the whole stack would not fit in free "
+                                      "memory: bounds peak memory, gives the same result.")
         self.chk_3d_tiling.setChecked(True)
         self.chk_3d_tiling.toggled.connect(lambda on: setattr(self.zst, "allow_tiling", on))
         bar.addWidget(self.chk_3d_tiling)

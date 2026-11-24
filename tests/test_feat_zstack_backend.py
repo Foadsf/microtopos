@@ -28,6 +28,8 @@ from microtopos.registration import (
     PairRegistration,
     estimate_breathing_scales,
     register_sweep,
+    warp_scale_shift,
+    warp_to_reference,
 )
 from microtopos.sff import theoretical_fwhm_um
 from microtopos.simulator import SpecimenSimulator
@@ -55,22 +57,25 @@ def _sim_sweep(seed: int, n_frames: int = 9, size: tuple[int, int] = (240, 320))
     return frames, np.array(truths, dtype=np.float64)
 
 
-def _zoom_frames(texture: np.ndarray, n: int, beta: float, ref: int) -> list[np.ndarray]:
-    """Fixed-size frames whose content is zoomed by exp(beta * (k - ref))."""
-    h, w = texture.shape
-    out = np.empty((n, h, w), np.float32)
+def _zoom_frames(texture: np.ndarray, n: int, beta: float, ref: int, shape: tuple[int, int]) -> list[np.ndarray]:
+    """Frames of `shape` showing the (larger) texture magnified by exp(beta * (k - ref)) about the frame centre:
+    an exact focus-breathing model with no empty borders."""
+    h, w = shape
+    c = np.array([(w - 1) / 2.0, (h - 1) / 2.0])
+    out = []
     for k in range(n):
-        s = float(math.exp(beta * (k - ref)))
-        nh, nw = max(4, round(h * s)), max(4, round(w * s))
-        big = cv2.resize(texture, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        canvas = np.zeros((h, w), np.float32)
-        oh, ow = min(h, nh), min(w, nw)
-        canvas[h // 2 - oh // 2:h // 2 - oh // 2 + oh,
-               w // 2 - ow // 2:w // 2 - ow // 2 + ow] = big[nh // 2 - oh // 2:nh // 2 - oh // 2 + oh,
-                                                             nw // 2 - ow // 2:nw // 2 - ow // 2 + ow]
-        out[k] = canvas
-    return [out[k] for k in range(n)]
+        s = math.exp(beta * (k - ref))
+        A = np.eye(2) / s  # frame pixel -> texture pixel
+        t = np.array([texture.shape[1] / 2.0, texture.shape[0] / 2.0]) - A @ c
+        M = np.hstack([A, t[:, None]]).astype(np.float32)
+        out.append(cv2.warpAffine(texture, M, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                  borderMode=cv2.BORDER_REFLECT))
+    return out
 
+
+def _smooth_texture(seed: int, shape: tuple[int, int]) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return cv2.GaussianBlur(rng.normal(128, 40, shape).astype(np.float32), (0, 0), 1.5)
 
 # ------------------------------------------------------------------------------------------------ B1
 
@@ -111,19 +116,137 @@ def test_breathing_scales_negative_controls_return_unity():
 
 
 def test_register_sweep_observes_breathing_scale_steps():
-    texture = _texture(2, (96, 96)).astype(np.float32)
-    frames = _zoom_frames(texture, 11, 0.01, 5)
+    texture = _smooth_texture(2, (480, 640))
+    frames = _zoom_frames(texture, 11, 0.01, 5, (240, 320))
     z = [0.5 * k for k in range(len(frames))]
     warps, pairs = register_sweep(frames, ref=5, factor=1, workers=1,
                                   correct_breathing=True, z=z)
     assert len(warps) == len(frames)  # identity warp at the reference frame plus one per pair
     assert len(pairs) == len(frames) - 1
     expected = math.exp(0.01)
-    assert all(abs(p.scale_step - expected) < 0.009 for p in pairs if p.ok)  # breathing is observed
+    assert sum(p.ok for p in pairs) == len(pairs)
+    assert all(abs((p.scale_step - 1) - (expected - 1)) <= 0.2 * (expected - 1) for p in pairs)  # within 20 % of the zoom step
     # without breathing correction the per-frame scale model is not folded into the warps,
     # but ECC still sees the magnification change between consecutive frames
     _warps2, pairs2 = register_sweep(frames, ref=5, factor=1, workers=1, correct_breathing=False, z=z)
-    assert all(abs(p.scale_step - expected) < 0.02 for p in pairs2 if p.ok)
+    assert all(abs((p.scale_step - 1) - (expected - 1)) <= 0.3 * (expected - 1) for p in pairs2 if p.ok)
+
+
+# ---------------------------------------------------------------- breathing: scale against known zoom, warning, end to end
+
+def test_breathing_warps_reproduce_a_known_zoom_and_realign_the_frames():
+    n, ref, beta = 15, 7, 0.001
+    frames = _zoom_frames(_smooth_texture(3, (480, 640)), n, beta, ref, (240, 320))
+    z = [float(k) for k in range(n)]
+    true = np.exp(beta * (np.arange(n) - ref))
+    res = {}
+    for on in (False, True):
+        warps, _pairs = register_sweep(frames, ref=ref, factor=1, workers=1, correct_breathing=on, z=z)
+        scale = np.array([warp_scale_shift(W, (240, 320))[0] for W in warps])
+        aligned = [warp_to_reference(frames[k], warps[k]) for k in range(n)]
+        sl = (slice(20, -20), slice(30, -30))
+        res[on] = (scale, float(np.mean([np.abs(aligned[k][sl] - frames[ref][sl]).mean() for k in range(n)])))
+    signal = float(np.max(np.abs(true - 1)))  # 0.7 %
+    assert float(np.max(np.abs(res[True][0] - true))) <= 0.2 * signal, (res[True][0] - 1, true - 1)
+    assert np.all(res[False][0] == 1.0)  # off: the warps carry no magnification at all
+    assert res[True][1] < 0.5 * res[False][1], (res[True][1], res[False][1])  # the frames really line up better
+
+
+def test_breathing_beyond_the_validated_range_is_reported_not_silently_clamped():
+    n, ref = 15, 7
+    z = [float(k) for k in range(n)]
+    big = _zoom_frames(_smooth_texture(3, (480, 640)), n, 0.004, ref, (240, 320))  # 5.6 % over the sweep
+    notes: list[str] = []
+    warps, _ = register_sweep(big, ref=ref, factor=1, workers=1, correct_breathing=True, z=z, notes=notes)
+    assert any("exceeds" in m and "limited to 1.5%" in m for m in notes), notes
+    span = max(warp_scale_shift(W, (240, 320))[0] for W in warps) - min(warp_scale_shift(W, (240, 320))[0] for W in warps)
+    assert span == pytest.approx(0.015, abs=1e-4)  # what is applied is exactly the stated limit
+    small = _zoom_frames(_smooth_texture(3, (480, 640)), n, 0.001, ref, (240, 320))  # 1.4 %: inside the range
+    notes = []
+    register_sweep(small, ref=ref, factor=1, workers=1, correct_breathing=True, z=z, notes=notes)
+    assert notes == []
+    # unusable evidence is reported too: flat frames cannot be measured
+    flat = [np.full((240, 320), 100.0, np.float32) for _ in range(n)]
+    notes = []
+    register_sweep(flat, ref=ref, factor=1, workers=1, correct_breathing=True, z=z, notes=notes)
+    assert any("no correction applied" in m for m in notes), notes
+
+
+def _breathing_sweep(seed: int, per_um: float, blur: bool, n: int = 24):
+    sim = SpecimenSimulator(seed, OBJ, out_w=320, out_h=240)
+    sim.breathing_per_um = per_um / OBJ.dof_um
+    zs = sim.sweep_trajectory(n_frames=n)
+    frames, truths = [], []
+    for z_k in zs:
+        sim.focus_z_um = float(z_k)
+        bgr, truth = sim.render(blur=blur)
+        frames.append(bgr_to_luma(bgr))
+        truths.append(truth)
+    return sim, frames, truths
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_breathing_correction_in_the_simulator_recovers_the_true_drift_and_improves_alignment(seed):
+    _sim, frames, truths = _breathing_sweep(seed, 1.0e-3, blur=False)  # 1.1 % drift, geometry only (no defocus)
+    n, ref = len(frames), len(frames) // 2
+    z = [t.focus_z_um for t in truths]
+    true = np.array([t.breathing_scale / truths[ref].breathing_scale for t in truths])
+    res = {}
+    for on in (False, True):
+        warps, _ = register_sweep(frames, ref=ref, factor=1, workers=1, correct_breathing=on, z=z)
+        aligned = [warp_to_reference(frames[k], warps[k]) for k in range(n)]
+        sl = (slice(20, -20), slice(20, -20))
+        res[on] = (np.array([warp_scale_shift(W, (240, 320))[0] for W in warps]),
+                   float(np.mean([np.abs(aligned[k][sl] - frames[ref][sl]).mean() for k in range(n)])))
+    assert float(np.max(np.abs(res[True][0] - true))) <= 0.2 * float(np.max(np.abs(true - 1)))
+    assert res[True][1] < 0.9 * res[False][1], (res[True][1], res[False][1])
+
+
+def test_reconstruct_applies_and_reports_breathing_correction():
+    _sim, frames, truths = _breathing_sweep(2, 1.0e-3, blur=True, n=24)
+    z = np.array([t.focus_z_um for t in truths])
+    ref = len(frames) // 2
+    true = np.array([t.breathing_scale / truths[ref].breathing_scale for t in truths])
+    on = zstack.reconstruct(frames, z, OBJ, 1.0, "um", settings=ZSettings(correct_breathing=True, allow_tiling=False))
+    off = zstack.reconstruct(frames, z, OBJ, 1.0, "um", settings=ZSettings(correct_breathing=False, allow_tiling=False))
+    assert off["breathing_scale_range"] == 0.0
+    assert on["breathing_scale_range"] == pytest.approx(float(np.ptp(true)), rel=0.2)  # kills correct_breathing=False
+    # the same sweep with a drift beyond the limit: reported in the result's warnings
+    _sim, frames, truths = _breathing_sweep(2, 2.5e-3, blur=True, n=24)
+    z = np.array([t.focus_z_um for t in truths])
+    r = zstack.reconstruct(frames, z, OBJ, 1.0, "um", settings=ZSettings(correct_breathing=True, allow_tiling=False))
+    assert any("Focus breathing" in m and "exceeds" in m for m in r["warnings"]), r["warnings"]
+    assert not any("Focus breathing" in m for m in on["warnings"])
+
+
+def _height_error(sim, truths, r, ref) -> float:
+    """RMS height error (um) against the simulator's ground truth in the reference frame's geometry, away from the
+    border, after removing the global offset."""
+    M = sim._matrix(truths[ref].breathing_scale, truths[ref].content_shift_px, 0.0, 0.0)
+    truth = sim._sample(sim.world_height_pf, M)
+    h = r["height"]
+    ok = np.isfinite(h)
+    ok[:12], ok[-12:], ok[:, :12], ok[:, -12:] = False, False, False, False
+    d = (h - truth)[ok]
+    d = d - np.median(d)
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def test_breathing_correction_height_error_end_to_end_with_and_without():
+    """Measured, not assumed: on simulated sweeps with 1.1 % breathing the height error is the same with and
+    without the correction, because it is set by the focus-peak fit (about 0.15 DOF), not by the 1-2 px edge
+    misalignment. The correction therefore stays experimental and default-off; it must at least not hurt."""
+    errs = {False: [], True: []}
+    for seed in (1, 2, 3):
+        sim, frames, truths = _breathing_sweep(seed, 1.0e-3, blur=True, n=24)
+        z = np.array([t.focus_z_um for t in truths])
+        for on in (False, True):
+            r = zstack.reconstruct(frames, z, OBJ, 1.0, "um", settings=ZSettings(correct_breathing=on, allow_tiling=False))
+            errs[on].append(_height_error(sim, truths, r, len(frames) // 2))
+    off, on = float(np.mean(errs[False])), float(np.mean(errs[True]))
+    assert off < 0.25 * OBJ.dof_um and on < 0.25 * OBJ.dof_um, (off, on)  # both are accurate: far below one DOF
+    assert on <= off * 1.1, (off, on)  # the experimental correction must not make heights worse
+    print(f"height RMS error vs ground truth (um): off {off:.3f}  on {on:.3f}  (DOF {OBJ.dof_um} um)")
 
 
 # ------------------------------------------------------------------------------------------------ B2

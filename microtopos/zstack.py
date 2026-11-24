@@ -61,7 +61,7 @@ class ZSettings:
     conf_threshold: float = 0.25
     memory_fraction: float = 0.8  # refuse a job whose estimated peak exceeds this share of available memory
     backend: str = "cpu"  # "cpu" (reference) or "opencl" (focus measure + guided filter; CPU fallback; see backend.py)
-    correct_breathing: bool = False  # estimate per-frame magnification drift with focus and compensate it
+    correct_breathing: bool = False  # EXPERIMENTAL: per-frame magnification drift from the pair scales, folded into the warps
     allow_tiling: bool = True  # strip-wise (tiled) reconstruction to bound peak memory when RAM is tight
 
 
@@ -301,7 +301,7 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
                                       progress=(lambda q: progress(0.08 + 0.3 * q, "Registering frames..."))
                                       if progress else None,
                                       correct_breathing=st.correct_breathing,
-                                      z=None if not st.correct_breathing else [float(v) for v in z])
+                                      z=None if not st.correct_breathing else [float(v) for v in z], notes=warnings)
     except RegistrationCancelled:
         raise Cancelled() from None
     eccs = np.array([p.ecc for p in pairs if p.ok])

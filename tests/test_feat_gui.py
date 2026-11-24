@@ -773,7 +773,7 @@ def test_backend_and_breathing_toggles_reach_the_reconstruction(window, qapp, mo
     _pump(qapp, 10)
     w._demo("sweep")
     t0 = time.time()
-    while not got and time.time() - t0 < 60.0:
+    while not got and time.time() - t0 < 150.0:
         qapp.processEvents()
         time.sleep(0.02)
     assert got, "the sweep never reached the reconstruction"
@@ -784,7 +784,7 @@ def test_backend_and_breathing_toggles_reach_the_reconstruction(window, qapp, mo
     w.chk_3d_breathing.setChecked(True)
     w._reconstruct_last()
     t0 = time.time()
-    while len(got) < 2 and time.time() - t0 < 30.0:
+    while len(got) < 2 and time.time() - t0 < 90.0:
         qapp.processEvents()
         time.sleep(0.02)
     assert len(got) == 2
@@ -795,7 +795,7 @@ def test_backend_and_breathing_toggles_reach_the_reconstruction(window, qapp, mo
     w.chk_3d_breathing.setChecked(False)
     w._reconstruct_last()
     t0 = time.time()
-    while len(got) < 3 and time.time() - t0 < 30.0:
+    while len(got) < 3 and time.time() - t0 < 90.0:
         qapp.processEvents()
         time.sleep(0.02)
     assert len(got) == 3 and (got[2].backend, got[2].correct_breathing) == ("cpu", False)

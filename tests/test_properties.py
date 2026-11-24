@@ -40,5 +40,8 @@ def test_brenner_and_tiles_ignore_a_dc_offset(img, offset):
 @settings(max_examples=40, deadline=None)
 def test_tile_scores_storage_dtype_invariant(img):
     ref = tile_scores(img.astype(np.float64), 2)
-    np.testing.assert_allclose(tile_scores(img, 2), ref, rtol=1e-4, atol=1e-3)
-    np.testing.assert_allclose(tile_scores(img.astype(np.uint16) * 257, 2), ref * 257.0**2, rtol=1e-4, atol=1e-2)
+    # float32 working precision: a near-constant image has tiny band-pass energy next to a large DC level, so the
+    # absolute tolerance is relative to the largest tile energy (a wrapped integer difference is off by orders more)
+    atol = 1e-4 * max(float(ref.max()), 1.0)
+    np.testing.assert_allclose(tile_scores(img, 2), ref, rtol=1e-3, atol=atol)
+    np.testing.assert_allclose(tile_scores(img.astype(np.uint16) * 257, 2), ref * 257.0**2, rtol=1e-3, atol=atol * 257.0**2)

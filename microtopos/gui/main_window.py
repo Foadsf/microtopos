@@ -1301,6 +1301,7 @@ class MainWindow(QMainWindow):
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
             self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
+            self._set_replay_transport_enabled(self.source.transport_supported)
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()
@@ -2731,6 +2732,13 @@ class MainWindow(QMainWindow):
         self.chk_replay_loop.toggled.connect(self._replay_loop)
         h.addWidget(self.chk_replay_loop)
         return h
+
+    def _set_replay_transport_enabled(self, on: bool):
+        """Pause/step/seek/speed act only on a paced replay; an exhaustive (consumer-paced) one refuses them."""
+        for wdg in (self.btn_replay_pause, self.btn_replay_step_b, self.btn_replay_step_f, self.replay_seek,
+                    self.cmb_replay_speed):
+            wdg.setEnabled(on)
+            wdg.setToolTip("" if on else "Not available: this recording is replayed frame by frame as fast as it is processed")
 
     def _replay_toggle(self, checked: bool):
         s = self.source

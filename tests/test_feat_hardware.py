@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 
 import cv2
@@ -582,16 +583,17 @@ def test_non_jpeg_1d_bytes_marks_incomplete(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------------ replay transport
-def _make_replay_recording(tmp_path, n=10):
+def _make_replay_recording(tmp_path, n=10, dt=0.1):
+    """n lossless PNG frames; frame i is a flat image of grey level i (so the pixel value names the frame), t = i*dt."""
     d = tmp_path / "rec"
     d.mkdir()
     w = RecordingWriter(d, "sim")
     for i in range(n):
-        img = np.full((24, 32, 3), fill_value=10 * i, dtype=np.uint8)
+        img = np.full((24, 32, 3), fill_value=i, dtype=np.uint8)
         ok, buf = cv2.imencode(".png", img)
         assert ok
         (d / f"{i:06d}.png").write_bytes(buf.tobytes())
-        w.entries.append({"file": f"{i:06d}.png", "seq": i + 1, "t": 0.1 * i, "bytes": len(buf.tobytes()),
+        w.entries.append({"file": f"{i:06d}.png", "seq": i + 1, "t": dt * i, "bytes": len(buf.tobytes()),
                           "crc32": 0})
         w.bytes += len(buf.tobytes())
     w.meta["mode"] = "decoded-png"
@@ -600,63 +602,255 @@ def _make_replay_recording(tmp_path, n=10):
     return d
 
 
-def test_replay_transport_pause_resume_toggle(tmp_path):
-    d = _make_replay_recording(tmp_path)
-    rs = ReplaySource(str(d), speed=10.0)
-    rs.start()
-    try:
-        rs.pause()
-        assert rs.paused is True
-        rs.resume()
-        assert rs.paused is False
-        assert rs.toggle_pause() is True
-        assert rs.toggle_pause() is False
-    finally:
+class _Tap(ReplaySource):
+    """A ReplaySource that logs what reaches the consumer: (recording frame index, perf_counter) per published
+    frame. Everything the tests assert is read from this output, never from the source's internal state."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self._log: list[tuple[int, float]] = []
+        self._log_lock = threading.Lock()
+
+    def _publish(self, frame, truth=None, ts=None, step=1):
+        with self._log_lock:
+            self._log.append((int(frame[0, 0, 0]), time.perf_counter()))
+        super()._publish(frame, truth, ts, step)
+
+    def idx(self) -> list[int]:
+        with self._log_lock:
+            return [i for i, _ in self._log]
+
+    def times(self) -> list[float]:
+        with self._log_lock:
+            return [t for _, t in self._log]
+
+
+class _DecodeGate:
+    """Holds the playback thread inside decode() of the next frame it decodes once armed, so a test can issue a
+    transport command at a precisely known point of the thread's loop (an in-flight frame, nothing committed)."""
+
+    def __init__(self, monkeypatch):
+        import microtopos.recording as rec
+
+        self._real = rec.decode
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._armed = False
+        monkeypatch.setattr(rec, "decode", self)
+
+    def arm(self):
+        self.entered.clear()
+        self.release.clear()
+        self._armed = True
+
+    def __call__(self, path):
+        if self._armed and not self.entered.is_set():
+            self.entered.set()
+            self.release.wait(10)
+            self._armed = False
+        return self._real(path)
+
+
+@pytest.fixture
+def gate(monkeypatch):
+    return _DecodeGate(monkeypatch)
+
+
+@pytest.fixture
+def replay(tmp_path):
+    made: list[_Tap] = []
+
+    def make(n=60, dt=0.02, **kw) -> _Tap:
+        base = tmp_path / f"case{len(made)}"
+        base.mkdir()
+        rs = _Tap(str(_make_replay_recording(base, n, dt)), **kw)
+        made.append(rs)
+        return rs
+
+    yield make
+    for rs in made:
         rs.stop()
 
 
-def test_replay_seek_clamps_out_of_range(tmp_path):
-    d = _make_replay_recording(tmp_path)
-    rs = ReplaySource(str(d))
-    # out-of-range high
+def _until(cond, timeout=10.0) -> bool:
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < timeout:
+        if cond():
+            return True
+        time.sleep(0.002)
+    return False
+
+
+def _stays_silent(rs: _Tap, window: float) -> None:
+    """Nothing is published for `window` seconds (an absence can only be observed over a bounded window)."""
+    n = len(rs.idx())
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < window:
+        assert len(rs.idx()) == n, "a frame was published while the source was paused"
+        time.sleep(0.005)
+
+
+def test_replay_plays_every_frame_in_order_then_stops_and_resume_restarts(replay):
+    rs = replay(n=12, dt=0.01)
+    rs.start()
+    assert _until(lambda: rs.done)
+    assert rs.idx() == list(range(12))
+    rs.resume()  # at the end, resume restarts from the first frame
+    assert _until(lambda: len(rs.idx()) >= 14)
+    assert rs.idx()[12:14] == [0, 1]
+
+
+def test_replay_seek_lands_on_the_requested_frame_and_clamps(replay):
+    rs = replay(n=40, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 3)
+    rs.pause()
+    rs.seek(30)
+    assert _until(lambda: rs.idx()[-1] == 30)
+    _stays_silent(rs, 0.15)  # a seek while paused shows that frame and nothing else
     rs.seek(999)
-    assert rs._seek_target == rs.total_frames - 1
-    # out-of-range low
+    assert _until(lambda: rs.idx()[-1] == 39)
     rs.seek(-5)
-    assert rs._seek_target == 0
+    assert _until(lambda: rs.idx()[-1] == 0)
 
 
-def test_replay_step_frames(tmp_path):
-    d = _make_replay_recording(tmp_path)
-    rs = ReplaySource(str(d))
-    rs.step_frames(3)
-    assert rs.paused is True
-    assert rs._seek_target == 3
+def test_replay_seek_while_playing_continues_with_the_next_frame(replay):
+    rs = replay(n=80, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 2)
+    rs.seek(50)
+    assert _until(lambda: 51 in rs.idx())
+    got = rs.idx()
+    assert got[got.index(50) + 1] == 51
+    assert max(got[:got.index(50)]) < 50  # nothing from beyond the target was published before it
 
 
-def test_replay_set_speed_and_loop(tmp_path):
-    d = _make_replay_recording(tmp_path)
-    rs = ReplaySource(str(d))
-    rs.set_speed(2.5)
-    assert rs.speed == pytest.approx(2.5)
-    rs.set_loop(True)
-    assert rs.loop is True
+def test_replay_pause_stops_publication_and_resume_continues_from_the_same_place(replay):
+    rs = replay(n=200, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 5)
+    assert rs.toggle_pause() is True
+    n, last = len(rs.idx()), rs.idx()[-1]
+    _stays_silent(rs, 0.3)  # 15 frame intervals
+    assert rs.toggle_pause() is False
+    assert _until(lambda: len(rs.idx()) >= n + 3)
+    assert rs.idx()[n:n + 3] == [last + 1, last + 2, last + 3]  # no repeat, no skip
+
+
+def test_replay_resume_after_a_paused_seek_continues_with_the_next_frame(replay):
+    rs = replay(n=200, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 2)
+    rs.pause()
+    rs.seek(40)
+    assert _until(lambda: rs.idx()[-1] == 40)
+    n = len(rs.idx())
+    rs.resume()
+    assert _until(lambda: len(rs.idx()) >= n + 2)
+    assert rs.idx()[n:n + 2] == [41, 42]  # frame 40 is on screen already; it is not published a second time
+
+
+@pytest.mark.parametrize("before, after", [(1.0, 4.0), (4.0, 0.5)])
+def test_replay_speed_change_takes_effect_without_stall_or_burst(replay, before, after):
+    dt = 0.02
+    rs = replay(n=240, dt=dt, speed=before)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 12)
+    n0 = len(rs.idx())
+    t_change = time.perf_counter()
+    rs.set_speed(after)
+    assert _until(lambda: len(rs.idx()) >= n0 + 14)
+    t = rs.times()
+    expected = dt / after
+    longest_gap = max(b - a for a, b in zip(t[n0 - 1:n0 + 14], t[n0:n0 + 15]))
+    assert longest_gap <= 3 * max(dt / before, expected) + 0.1, f"playback stalled {longest_gap:.2f} s after the speed change"
+    assert t[n0] >= t_change
+    span = t[n0 + 12] - t[n0 + 2]  # ten intervals, clear of the frame that was already in flight
+    assert 0.7 * 10 * expected <= span <= 3 * 10 * expected + 0.1, f"{span / 10 * 1000:.1f} ms/frame, wanted {expected * 1000:.1f}"
+
+
+def test_replay_loop_wraps_without_skipping_or_repeating_a_frame(replay):
+    rs = replay(n=7, dt=0.005, loop=True)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 30)
+    assert rs.idx()[:30] == [i % 7 for i in range(30)]
     rs.set_loop(False)
-    assert rs.loop is False
+    assert _until(lambda: rs.done)  # without loop it ends at the last frame
+    assert rs.idx()[-1] == 6
+
+
+def test_replay_two_steps_before_the_thread_publishes_coalesce_into_one(replay, gate):
+    """step_frames bases on the last *published* position (documented): two +1 steps issued before the thread
+    has published the first one are one step, never a skip; a later step starts from the new position."""
+    rs = replay(n=60, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 2)
+    rs.pause()
+    rs.seek(20)
+    assert _until(lambda: rs.idx()[-1] == 20)
+    gate.arm()
+    rs.step_frames(1)
+    assert gate.entered.wait(5)  # the thread is decoding frame 21; nothing is committed yet
+    rs.step_frames(1)
+    gate.release.set()
+    assert _until(lambda: rs.idx()[-1] == 21)
+    _stays_silent(rs, 0.2)
+    assert rs.idx().count(21) == 1 and rs.idx()[-2:] == [20, 21]
+    rs.step_frames(1)
+    assert _until(lambda: rs.idx()[-1] == 22)
+    rs.step_frames(-2)
+    assert _until(lambda: rs.idx()[-1] == 20)
+
+
+def test_replay_step_racing_playback_never_publishes_a_stale_frame(replay, gate):
+    rs = replay(n=100, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 3)
+    gate.arm()
+    assert gate.entered.wait(5)  # playing: the thread holds an in-flight frame decoded before the step
+    n, last = len(rs.idx()), rs.idx()[-1]
+    rs.step_frames(3)
+    gate.release.set()
+    assert _until(lambda: len(rs.idx()) > n)
+    _stays_silent(rs, 0.2)
+    assert rs.idx()[n:] == [last + 3]  # the in-flight frame (last + 1) was dropped, not shown after the step
+
+
+def test_replay_pause_racing_playback_drops_the_in_flight_frame(replay, gate):
+    rs = replay(n=100, dt=0.02)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 3)
+    gate.arm()
+    assert gate.entered.wait(5)
+    n, last = len(rs.idx()), rs.idx()[-1]
+    rs.pause()
+    gate.release.set()
+    _stays_silent(rs, 0.2)
+    assert len(rs.idx()) == n
+    rs.resume()
+    assert _until(lambda: len(rs.idx()) > n)
+    assert rs.idx()[n] == last + 1  # the dropped frame is shown on resume: nothing lost
+
+
+def test_exhaustive_replay_refuses_transport_controls_instead_of_ignoring_them(tmp_path):
+    """Lossless (back-pressured) replay is driven by the consumer; pause/seek/step/speed have no meaning there and
+    must say so rather than silently do nothing."""
+    rs = ReplaySource(str(_make_replay_recording(tmp_path)), exhaustive=True)
+    assert rs.transport_supported is False
+    for call in (rs.pause, rs.resume, rs.toggle_pause, lambda: rs.seek(3), lambda: rs.step_frames(1),
+                 lambda: rs.set_speed(2.0)):
+        with pytest.raises(RuntimeError, match="exhaustive"):
+            call()
+    rs.set_loop(True)  # looping does work in this mode
+    assert rs.loop is True
+    other = tmp_path / "second"
+    other.mkdir()
+    assert ReplaySource(str(_make_replay_recording(other))).transport_supported is True
 
 
 def test_replay_total_frames(tmp_path):
     d = _make_replay_recording(tmp_path, n=7)
-    rs = ReplaySource(str(d))
-    assert rs.total_frames == 7
-
-
-def test_replay_seek_publishes_immediately(tmp_path):
-    d = _make_replay_recording(tmp_path)
-    rs = ReplaySource(str(d))
-    rs.seek(5)
-    frames = list(rs.frames())
-    assert len(frames) == 10  # frames() iterates all, independent of seek
+    assert ReplaySource(str(d)).total_frames == 7
 
 
 # ------------------------------------------------------------------------------------------------ stage -> frames -> height map
@@ -890,3 +1084,31 @@ def test_gui_stage_z_sweep_captures_stage_z_and_reconstructs_in_um(window, qapp)
     assert w.result["z_unit"] == "um" and w.result["z_status"] == "SIMULATED"
     _check_height_matches_relief(w.result["height"], w.sim_source.sim)
     assert w.stage_driver.pose().z_um == pytest.approx(z1)  # the stage ends where the sweep ended
+
+def _open_replay_window(qapp, tmp_path, monkeypatch, exhaustive):
+    import microtopos.gui.main_window as mw
+
+    class _Replay(ReplaySource):
+        def __init__(self, folder):
+            super().__init__(folder, exhaustive=exhaustive)
+
+    monkeypatch.setattr(mw, "ReplaySource", _Replay)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    w = MainWindow(simulator_only=True, replay=str(_make_replay_recording(tmp_path, n=6)))
+    w.show()
+    _pump(qapp, 20)
+    return w
+
+
+@pytest.mark.parametrize("exhaustive", [False, True])
+def test_gui_replay_transport_controls_follow_what_the_source_supports(qapp, tmp_path, monkeypatch, exhaustive):
+    w = _open_replay_window(qapp, tmp_path, monkeypatch, exhaustive)
+    try:
+        assert w.replay_widget.isVisibleTo(w)
+        controls = (w.btn_replay_pause, w.btn_replay_step_b, w.btn_replay_step_f, w.replay_seek, w.cmb_replay_speed)
+        assert all(c.isEnabled() is (not exhaustive) for c in controls)
+        assert w.chk_replay_loop.isEnabled()  # looping works in both modes
+    finally:
+        w.close()
+        _pump(qapp, 5)

@@ -197,6 +197,7 @@ class CameraSource(FrameSource):
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
         self._ctrl_lock = threading.Lock()
+        self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
         self.applied: dict = {}
 
     def open(self) -> cv2.VideoCapture:
@@ -483,16 +484,29 @@ class ReplaySource(FrameSource):
         self.position = 0
         self._seek_target: int | None = None
         self._ctrl_lock = threading.Lock()
+        self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
 
     @property
     def total_frames(self) -> int:
         return len(self.files)
 
+    @property
+    def transport_supported(self) -> bool:
+        """False in exhaustive (lossless) mode: the consumer paces that playback, so pause, seek, step and speed
+        have no meaning and are refused (RuntimeError) instead of being silently ignored."""
+        return not self.exhaustive
+
+    def _need_transport(self, what: str) -> None:
+        if self.exhaustive:
+            raise RuntimeError(f"{what} is not available in exhaustive replay mode (the consumer paces the playback)")
+
     def pause(self) -> None:
+        self._need_transport("pause")
         with self._ctrl_lock:
             self.paused = True
 
     def resume(self) -> None:
+        self._need_transport("resume")
         with self._ctrl_lock:
             self.paused = False
             if self.done:
@@ -508,19 +522,24 @@ class ReplaySource(FrameSource):
 
     def seek(self, index: int) -> None:
         """Jump to frame `index` (0 .. total_frames - 1) and publish it immediately."""
+        self._need_transport("seek")
         with self._ctrl_lock:
             self._seek_target = int(np.clip(index, 0, max(0, len(self.files) - 1)))
             self.done = False
 
     def step_frames(self, delta: int = 1) -> None:
-        """Pause and step by `delta` frames from the last committed position.
+        """Pause and step by `delta` frames from the last published position.
 
         The step bases on ``self.position`` (the frame the playback thread has
         actually published), never on a pending ``_seek_target``: ``resume()`` at
         EOF may leave ``_seek_target == 0`` until the thread wakes up to consume
         it, and ``pause()`` can arrive before that consumption. A step must never
-        restart from that stale target.
+        restart from that stale target. Consequently two steps issued before the
+        thread has published the first one are one step (the second is computed from
+        the same published position), and a frame the thread was already decoding when
+        the step arrived is dropped rather than shown after it.
         """
+        self._need_transport("step")
         with self._ctrl_lock:
             self.paused = True
             base = self.position
@@ -528,6 +547,9 @@ class ReplaySource(FrameSource):
             self.done = False
 
     def set_speed(self, speed: float) -> None:
+        """Playback speed multiplier. The schedule is re-anchored on the next loop pass, so the new speed applies
+        from the frame published last: no stall when slowing down, no burst of catch-up frames when speeding up."""
+        self._need_transport("speed change")
         with self._ctrl_lock:
             self.speed = max(0.05, float(speed))
 
@@ -545,6 +567,21 @@ class ReplaySource(FrameSource):
                 self.corrupt += 1
                 continue
             yield img
+
+    def _commit(self, idx: int, img, ts: float, step: int, *, seek: bool) -> bool:
+        """Publish frame `idx` unless a newer transport request arrived while it was being decoded.
+
+        The check and the publication are one step under the control lock, so a pause or a seek/step that returned
+        before this call can never be followed by a frame decoded before it (a stale frame). A dropped frame is not
+        lost: the thread comes back to it on resume, or the seek replaces it.
+        """
+        with self._ctrl_lock:
+            if self._seek_target is not None or (self.paused and not seek):
+                return False
+            self.position = idx
+            self._publish(img, ts=ts, step=step)
+            self._last_pub = (time.perf_counter(), ts)
+            return True
 
     def _run(self):
         from .recording import decode
@@ -573,36 +610,45 @@ class ReplaySource(FrameSource):
                 prev_seq = None
             return
 
-        idx = 0
+        idx = 0  # the next frame to publish
         prev_seq = None
-        t_anchor = time.perf_counter()
+        t_anchor = time.perf_counter()  # wall time that corresponds to media time ts_anchor
         ts_anchor = self.stamps[0] if self.stamps else 0.0
+        anchor_speed = self.speed
         while self._running:
             with self._ctrl_lock:
                 seek_to = self._seek_target
                 self._seek_target = None
                 paused = self.paused
                 spd = self.speed
+            if spd != anchor_speed:
+                # The schedule (t_anchor, ts_anchor) was laid out at the old speed. Re-anchor it on the frame published
+                # last, so the new speed counts from there: elapsed wall time is not re-read as media time at the new rate.
+                anchor_speed = spd
+                last = self._last_pub
+                if last is not None and idx < len(self.stamps) and self.stamps[idx] >= last[1]:
+                    t_anchor, ts_anchor = last
+                else:
+                    t_anchor = time.perf_counter()
+                    ts_anchor = self.stamps[min(idx, len(self.stamps) - 1)] if self.stamps else 0.0
             if seek_to is not None:
                 idx = seek_to
                 prev_seq = None
                 f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
                 img = decode(f)
                 if img is not None:
-                    with self._ctrl_lock:
-                        self.position = idx
-                    self._publish(img, ts=ts, step=1)
+                    if not self._commit(idx, img, ts, 1, seek=True):
+                        continue  # a newer seek or step arrived while decoding: serve that one only
                     prev_seq = rseq
                 t_anchor = time.perf_counter()
                 ts_anchor = ts
-                if not paused:
-                    idx += 1
+                idx += 1  # the shown frame is not published again on resume
                 continue
             if paused:
                 time.sleep(0.02)
                 t_anchor = time.perf_counter()
-                if 0 <= idx < len(self.stamps):
-                    ts_anchor = self.stamps[idx]
+                if 0 < idx <= len(self.stamps):
+                    ts_anchor = self.stamps[idx - 1]  # resume continues from the frame shown, one interval later
                 continue
             if idx >= len(self.files):
                 if self.loop:
@@ -627,9 +673,8 @@ class ReplaySource(FrameSource):
                 idx += 1
                 continue
             step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
-            with self._ctrl_lock:
-                self.position = idx
-            self._publish(img, ts=ts, step=step)
+            if not self._commit(idx, img, ts, step, seek=False):
+                continue  # paused or seeked while decoding: this frame is stale now
             prev_seq = rseq
             self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd
             idx += 1

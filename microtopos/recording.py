@@ -209,11 +209,17 @@ def decode(path: Path) -> np.ndarray | None:
         return None
     if not buf.size:
         return None
-    raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-    if raw is not None and raw.dtype == np.uint16:
+    raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)  # the one decode of this file; the rest is conversion
+    if raw is None:
+        return None
+    if raw.dtype == np.uint16:
         return raw
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    if (img is not None and img.shape[0] == 1
-            and raw is not None and raw.dtype == np.uint8 and raw.ndim == 2 and is_jpeg(raw.tobytes())):
-        return cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
-    return img
+    if raw.dtype != np.uint8:  # an exotic depth: let OpenCV reduce it to 8-bit BGR
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if raw.ndim == 2:
+        if raw.shape[0] == 1 and is_jpeg(raw.tobytes()):  # MJPEG bytes stored as a 1xN PNG strip: decode the JPEG inside
+            return cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
+        return cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    if raw.shape[2] == 4:
+        return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+    return raw

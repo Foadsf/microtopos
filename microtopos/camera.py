@@ -66,6 +66,12 @@ def list_cameras() -> list[CameraInfo]:
 
 
 def _v4l2_is_capture(dev: str) -> bool:
+    """Whether `dev` lists at least one capture pixel format (metadata-only nodes list none).
+
+    Both layouts of `v4l2-ctl --list-formats` are accepted: current v4l-utils print `[0]: 'MJPG' ...`, older ones
+    print `Index : 0 / Type : Video Capture / Pixel Format: 'MJPG'`. The second form was added in 59a96f2 so such
+    systems do not show an empty camera list; checked against sample outputs only, NOT hardware-verified here.
+    """
     if shutil.which("v4l2-ctl"):
         try:
             out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
@@ -188,22 +194,23 @@ class FrameSource:
 class CameraSource(FrameSource):
     """UVC / DirectShow / AVFoundation / loopback camera."""
 
-    def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25,
-                 high_bit_depth: bool = False):
+    def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25):
         super().__init__()
         self.info = info
         self.req = (width, height, fps)
-        self.high_bit_depth = high_bit_depth
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
         self._ctrl_lock = threading.Lock()
-        self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
         self.applied: dict = {}
 
     def open(self) -> cv2.VideoCapture:
         if sys.platform.startswith("linux"):
             api = cv2.CAP_V4L2
         elif sys.platform == "win32":
+            # DirectShow rather than OpenCV's default (MSMF) on Windows: the manual-exposure fallback in
+            # _apply_controls writes CAP_PROP_EXPOSURE as log2(seconds), the DirectShow convention, and falls back
+            # to CAP_ANY just below if the device cannot be opened that way. Introduced in 59a96f2 without a
+            # recorded measurement; NOT hardware-verified here (no camera was attached when this was reviewed).
             api = cv2.CAP_DSHOW
         elif sys.platform == "darwin":
             api = cv2.CAP_AVFOUNDATION
@@ -214,10 +221,7 @@ class CameraSource(FrameSource):
             cap = cv2.VideoCapture(self.info.index, cv2.CAP_ANY)
         if not cap.isOpened():
             raise RuntimeError(f"cannot open camera {self.info.name}")
-        if self.high_bit_depth:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"Y16 "))
-        else:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req[1])
         cap.set(cv2.CAP_PROP_FPS, self.req[2])
@@ -285,7 +289,9 @@ class CameraSource(FrameSource):
                 v = math.log2(max(exposure, 1) * 1e-4) if sys.platform == "win32" else float(exposure)
                 cap.set(cv2.CAP_PROP_EXPOSURE, v)
                 cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-                cap.set(cv2.CAP_PROP_GAIN, 0)
+                # Gain is deliberately left to the device: 59a96f2 forced CAP_PROP_GAIN=0 here, which silently darkens
+                # the image on cameras whose gain 0 is not "unity" and is not reported in the read-back. The V4L2 path
+                # only switches automatic gain off (it keeps the current value); this path cannot do even that.
             if sharpness_off:
                 cap.set(cv2.CAP_PROP_SHARPNESS, 0)
             got["exposure"] = round(float(cap.get(cv2.CAP_PROP_EXPOSURE)), 3)
@@ -325,8 +331,7 @@ class CameraSource(FrameSource):
         except RuntimeError as e:
             self.error = str(e)
             return
-        if not self.high_bit_depth:
-            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here
         self.recording = False
         self.rec_writer = None
         t0, n, n_total = time.perf_counter(), 0, 0
@@ -340,8 +345,7 @@ class CameraSource(FrameSource):
                     time.sleep(1.0)
                     try:
                         cap = self.open()
-                        if not self.high_bit_depth:
-                            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
                         n_total = 0  # re-apply exposure and sharpness on the reopened device
                     except RuntimeError:
                         pass
@@ -357,9 +361,9 @@ class CameraSource(FrameSource):
                 except Exception as e:  # a missing control must not stop the stream  # noqa: BLE001
                     self.applied = {"error": str(e)}
             n_total += 1
-            if raw.ndim == 3 or raw.dtype == np.uint16:
+            if raw.ndim == 3:
                 frame = raw
-                self.readback["delivery"] = "16-bit raw" if raw.dtype == np.uint16 else "decoded by the backend"
+                self.readback["delivery"] = "decoded by the backend"
             else:
                 frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
                 if frame is None:

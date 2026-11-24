@@ -19,7 +19,13 @@ from PySide6.QtCore import QSettings, QStandardPaths
 from PySide6.QtWidgets import QApplication
 
 from microtopos import objectives, zstack
-from microtopos.calibration import CalibrationStore, ObjectiveCalibration, bgr_to_luma, bgr_to_rgb_u8
+from microtopos.calibration import (
+    CalibrationStore,
+    ObjectiveCalibration,
+    RadiometricCorrector,
+    bgr_to_luma,
+    bgr_to_rgb_u8,
+)
 from microtopos.camera import (
     FrameSource,
     ReplaySource,
@@ -479,45 +485,159 @@ def test_um_per_px_nominal_fallback():
     assert v == pytest.approx(expected)
 
 
-def test_uint16_bgr_to_luma():
-    img16 = np.full((8, 8, 3), 32768, dtype=np.uint16)
-    y = bgr_to_luma(img16)
+def _lin(v):
+    """255 * (v / 255) ** 2.2, the gamma-2.2 decode, written independently of the implementation."""
+    return 255.0 * (v / 255.0) ** 2.2
+
+
+def test_bgr_to_luma_uint16_uses_the_257_scale_exactly():
+    # 65535 is full scale, so one 8-bit step is 257 counts: 32768 -> 127.502, not 128.0 (a /256 scale would give 128)
+    y = bgr_to_luma(np.full((8, 8, 3), 32768, dtype=np.uint16))
     assert y.dtype == np.float32
-    # ~mid-gray: 32768/257 ≈ 127.5
-    assert y.mean() == pytest.approx(127.5, abs=1.0)
-
-    img8 = np.full((8, 8, 3), 128, dtype=np.uint8)
-    y8 = bgr_to_luma(img8)
-    assert y8.dtype == np.float32
-    assert y8.mean() == pytest.approx(128.0, abs=1.0)
-
-    # uint16 linearize path
-    ylin = bgr_to_luma(img16, linearize=True)
-    assert ylin.dtype == np.float32
+    assert np.all(y == pytest.approx(32768 / 257, abs=1e-4))
+    assert bgr_to_luma(np.full((2, 2, 3), 65535, dtype=np.uint16))[0, 0] == pytest.approx(255.0, abs=1e-4)
+    assert bgr_to_luma(np.zeros((2, 2, 3), dtype=np.uint16))[0, 0] == 0.0
+    # 2-D (monochrome) input takes the same scale
+    assert bgr_to_luma(np.full((4, 4), 32768, dtype=np.uint16))[0, 0] == pytest.approx(32768 / 257, abs=1e-4)
 
 
-def test_bgr_to_rgb_u8():
+def test_bgr_to_luma_rec601_weights_for_uint8_and_uint16():
+    # B, G, R = 10, 20, 30: Y' = 0.114 B + 0.587 G + 0.299 R = 21.85
+    px8 = np.zeros((2, 2, 3), dtype=np.uint8)
+    px8[...] = (10, 20, 30)
+    assert np.all(bgr_to_luma(px8) == 22.0)  # OpenCV's uint8 luma is rounded to a whole level
+    y16 = bgr_to_luma(px8.astype(np.uint16) * 257)
+    assert np.all(y16 == pytest.approx(21.85, abs=1e-4))  # the uint16 path keeps the fraction
+    assert np.all(bgr_to_luma(np.full((2, 2, 3), 128, dtype=np.uint8)) == 128.0)
+
+
+def test_bgr_to_luma_16bit_gradient_keeps_more_than_8_bits_of_levels():
+    ramp = np.arange(0, 65536, 64, dtype=np.uint16)  # 1024 distinct 16-bit levels
+    img16 = np.repeat(np.repeat(ramp[None, :, None], 4, axis=0), 3, axis=2)
+    y = bgr_to_luma(img16)
+    assert len(np.unique(y)) >= 1000  # an 8-bit pipeline could keep at most 256
+    assert np.all(np.diff(y[0]) > 0)  # strictly increasing: no two 16-bit levels collapsed
+    y8 = bgr_to_luma((img16 >> 8).astype(np.uint8))
+    assert len(np.unique(y8)) <= 256  # the contrast case: the same ramp squeezed to 8 bits
+
+
+def test_bgr_to_luma_linearize_has_real_values():
+    # linear-light Rec.709 luminance of gamma-2.2 data: 0.0722 B + 0.7152 G + 0.2126 R, each channel decoded first
+    px = np.zeros((2, 2, 3), dtype=np.uint8)
+    px[...] = (64, 128, 192)
+    want = 0.0722 * _lin(64) + 0.7152 * _lin(128) + 0.2126 * _lin(192)
+    assert np.all(bgr_to_luma(px, linearize=True) == pytest.approx(want, rel=1e-5))
+    assert bgr_to_luma(px, linearize=True)[0, 0] < bgr_to_luma(px)[0, 0]  # mid-greys are darker in linear light
+    # uint16 input: the same decode of 32768/257 counts
+    g16 = bgr_to_luma(np.full((2, 2, 3), 32768, dtype=np.uint16), linearize=True)
+    assert np.all(g16 == pytest.approx(_lin(32768 / 257), rel=1e-5))
+    # monochrome: no weights, just the decode
+    assert bgr_to_luma(np.full((3, 3), 100, dtype=np.uint8), linearize=True)[0, 0] == pytest.approx(_lin(100), rel=1e-5)
+
+
+def test_bgr_to_rgb_u8_swaps_channels_and_rounds_the_16bit_scale():
     img_bgr = np.zeros((4, 4, 3), dtype=np.uint8)
-    img_bgr[..., 0] = 10  # B
-    img_bgr[..., 1] = 20  # G
-    img_bgr[..., 2] = 30  # R
+    img_bgr[...] = (10, 20, 30)
     rgb = bgr_to_rgb_u8(img_bgr)
-    assert rgb.dtype == np.uint8
-    assert rgb[0, 0, 0] == 30  # R
-    assert rgb[0, 0, 1] == 20  # G
-    assert rgb[0, 0, 2] == 10  # B
+    assert rgb.dtype == np.uint8 and np.all(rgb == (30, 20, 10))
+    # uint16 -> 8-bit by /257 (+0.5, truncated): 0->0, 128->0, 129->1, 257->1, 32768->128, 32896->128, 65280->254, 65535->255 (a /256 scale gives 129 for 32896 and 255 for 65280)
+    for v16, v8 in [(0, 0), (128, 0), (129, 1), (257, 1), (32768, 128), (32896, 128), (65280, 254), (65535, 255)]:
+        got = bgr_to_rgb_u8(np.full((2, 2, 3), v16, dtype=np.uint16))
+        assert np.all(got == v8), (v16, int(got[0, 0, 0]), v8)
+    gray = bgr_to_rgb_u8(np.full((4, 4), 50, dtype=np.uint8))
+    assert gray.shape == (4, 4, 3) and np.all(gray == 50)
 
-    # uint16 input
-    img16 = np.full((4, 4, 3), 32768, dtype=np.uint16)
-    rgb16 = bgr_to_rgb_u8(img16)
-    assert rgb16.dtype == np.uint8
-    assert rgb16[0, 0, 0] == pytest.approx(128, abs=1)
 
-    # grayscale input
-    gray = np.full((4, 4), 50, dtype=np.uint8)
-    rgb_gray = bgr_to_rgb_u8(gray)
-    assert rgb_gray.shape == (4, 4, 3)
-    assert np.all(rgb_gray == 50)
+def test_radiometric_corrector_three_channel_image_with_2d_dark_and_flat():
+    h, w = 4, 4
+    dark = np.full((h, w), 10.0, np.float32)
+    flat = np.full((h, w), 110.0, np.float32)
+    flat[:, w // 2:] = 210.0  # signal 100 | 200: mean 150, gain 1.5 | 0.75
+    img = np.full((h, w, 3), 60.0, np.float32)
+    out = RadiometricCorrector(dark, flat)(img)
+    assert out.shape == (h, w, 3) and out.dtype == np.float32
+    assert np.all(out[:, :w // 2] == pytest.approx(75.0)) and np.all(out[:, w // 2:] == pytest.approx(37.5))
+    # a dark/flat stored at another size is resampled to the frame (uniform fields keep their value)
+    small = RadiometricCorrector(np.full((2, 2), 10.0, np.float32), np.full((2, 2), 110.0, np.float32))
+    assert np.all(small(img) == pytest.approx(50.0))
+    # no reference at all: the image comes back unchanged (as float32)
+    assert np.array_equal(RadiometricCorrector()(img.astype(np.uint8)), img)
+
+
+def test_radiometric_corrector_three_channel_image_with_per_channel_dark_and_flat():
+    h, w = 4, 4
+    dark = np.zeros((h, w, 3), np.float32)
+    dark[...] = (5.0, 10.0, 15.0)
+    flat = dark + np.array([100.0, 200.0, 300.0], np.float32)  # signal 100 / 200 / 300: mean 200
+    img = dark + 50.0
+    out = RadiometricCorrector(dark, flat)(img)
+    np.testing.assert_allclose(out, np.broadcast_to(np.array([100.0, 50.0, 50.0 / 1.5], np.float32), out.shape), rtol=1e-5)
+    assert np.all(RadiometricCorrector(dark, None)(img) == pytest.approx(50.0))  # dark only: plain subtraction
+
+
+def test_camera_source_has_no_16bit_capture_mode():
+    """The 'Y16' capture request could never take effect (the stream is always opened as MJPG and decoded here),
+    so the mode and its readback claim are gone. 16-bit data enters through recordings only."""
+    import inspect
+
+    from microtopos.camera import CameraSource
+
+    assert "high_bit_depth" not in inspect.signature(CameraSource).parameters
+    assert "Y16" not in inspect.getsource(CameraSource)
+    assert "16-bit raw" not in inspect.getsource(CameraSource)
+
+
+class _FakeCap:
+    def __init__(self):
+        self.sets: list[tuple[int, float]] = []
+
+    def isOpened(self):
+        return True
+
+    def set(self, prop, value):
+        self.sets.append((prop, value))
+        return True
+
+    def get(self, prop):
+        return 0.0
+
+    def getBackendName(self):
+        return "FAKE"
+
+
+def test_camera_open_requests_mjpg_and_the_manual_exposure_fallback_leaves_gain_alone(monkeypatch):
+    from microtopos.camera import CameraInfo, CameraSource
+
+    cap = _FakeCap()
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: cap)
+    src = CameraSource(CameraInfo(0, "cam"))
+    src.open()
+    assert (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")) in cap.sets
+    cap.sets.clear()
+    src.controls.available = False  # no v4l2-ctl: the OpenCV property fallback is the path under test
+    src.set_manual_exposure(100)
+    src._apply_controls(cap)
+    props = [p for p, _ in cap.sets]
+    assert cv2.CAP_PROP_EXPOSURE in props and cv2.CAP_PROP_AUTO_WB in props
+    assert cv2.CAP_PROP_GAIN not in props  # the user's gain is not overwritten behind their back
+
+
+@pytest.mark.parametrize("out, expected", [
+    ("ioctl: VIDIOC_ENUM_FMT\n\tType: Video Capture\n\n\t[0]: 'MJPG' (Motion-JPEG, compressed)\n", True),
+    ("ioctl: VIDIOC_ENUM_FMT\n\tIndex       : 0\n\tType        : Video Capture\n\tPixel Format: 'MJPG' (compressed)\n",
+     True),  # older v4l-utils print the entry like this, without the [0]: form
+    ("ioctl: VIDIOC_ENUM_FMT\n\tType: Video Capture\n", False),  # a node with no formats is not a camera
+    ("", False),
+])
+def test_v4l2_capture_detection_accepts_both_list_formats_layouts(monkeypatch, out, expected):
+    import subprocess
+    from types import SimpleNamespace
+
+    import microtopos.camera as cam
+
+    monkeypatch.setattr(cam.shutil, "which", lambda name: "/usr/bin/v4l2-ctl")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=out, returncode=0))
+    assert cam._v4l2_is_capture("/dev/video0") is expected
 
 
 def test_lateral_magnification_round_trip(tmp_path):
@@ -570,6 +690,61 @@ def test_16bit_png_keep_8bit_behavior(tmp_path):
     assert got is not None
     assert got.dtype == np.uint8
     assert got.shape == img8.shape
+
+
+def test_16bit_gradient_survives_record_decode_and_luma_with_all_its_levels(tmp_path):
+    ramp = np.arange(0, 65536, 64, dtype=np.uint16)
+    img16 = np.repeat(np.repeat(ramp[None, :, None], 4, axis=0), 3, axis=2)
+    w = RecordingWriter(tmp_path / "g16")
+    w.add(img16, 1, 0.0)
+    w.close()
+    got = decode(tmp_path / "g16" / "000000.png")
+    assert got is not None and got.dtype == np.uint16 and np.array_equal(got, img16)
+    assert len(np.unique(bgr_to_luma(got))) >= 1000  # all 1024 levels are still distinct after the luma conversion
+
+
+def _count_imdecode(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real = cv2.imdecode
+
+    def counting(buf, flags):
+        calls.append(flags)
+        return real(buf, flags)
+
+    monkeypatch.setattr(cv2, "imdecode", counting)
+    return calls
+
+
+@pytest.mark.parametrize("kind", ["png_colour", "png_gray", "png_bgra", "jpeg"])
+def test_decode_decodes_the_file_once_and_matches_imread_colour(tmp_path, monkeypatch, kind):
+    base = np.random.default_rng(3).integers(0, 256, (16, 24, 3), dtype=np.uint8)
+    img = {"png_colour": base, "png_gray": base[..., 0].copy(), "png_bgra": np.dstack([base, np.full((16, 24), 200, np.uint8)]),
+           "jpeg": base}[kind]
+    ext = ".jpg" if kind == "jpeg" else ".png"
+    ok, buf = cv2.imencode(ext, img)
+    assert ok
+    p = tmp_path / f"frame{ext}"
+    p.write_bytes(buf.tobytes())
+    expected = cv2.imdecode(buf, cv2.IMREAD_COLOR)  # what decode() has always returned for 8-bit files
+    calls = _count_imdecode(monkeypatch)
+    got = decode(p)
+    assert got.dtype == np.uint8 and got.shape == (16, 24, 3) and np.array_equal(got, expected)
+    assert len(calls) == 1, f"the file was decoded {len(calls)} times"
+
+
+def test_decode_of_a_jpeg_wrapped_in_a_png_strip_decodes_each_layer_once(tmp_path, monkeypatch):
+    base = np.random.default_rng(4).integers(0, 256, (16, 24, 3), dtype=np.uint8)
+    ok, jpg = cv2.imencode(".jpg", base)
+    assert ok
+    ok, strip = cv2.imencode(".png", np.frombuffer(jpg.tobytes(), np.uint8).reshape(1, -1))  # the 1xN layout of #5
+    assert ok
+    p = tmp_path / "strip.png"
+    p.write_bytes(strip.tobytes())
+    expected = cv2.imdecode(jpg, cv2.IMREAD_COLOR)
+    calls = _count_imdecode(monkeypatch)
+    got = decode(p)
+    assert np.array_equal(got, expected)
+    assert len(calls) == 2  # the PNG container, then the JPEG inside it
 
 
 def test_non_jpeg_1d_bytes_marks_incomplete(tmp_path):

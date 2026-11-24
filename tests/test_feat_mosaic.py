@@ -68,6 +68,7 @@ def _graph_connected(m: Mosaic) -> bool:
 # ------------------------------------------------------------------------------------------- area joining
 
 
+@pytest.mark.characterization("joining areas was already right; the assertions now pin every keyframe to its stage position")
 def test_areas_join_after_a_gap():
     """Pan out, lose tracking long enough to start a second area, then pan back in small steps: the returning
     chain loop-closes onto the first area, everything merges into one area, and every keyframe ends at the
@@ -180,6 +181,7 @@ def test_two_band_blend_has_the_extent_origin_and_nan_mask_of_the_feather_render
     assert np.array_equal(np.isnan(holes_f), np.isnan(holes_b))
 
 
+@pytest.mark.characterization("an empty mosaic already rendered empty; guards that case across the two-band crop fix")
 def test_empty_two_band_mosaic_renders_like_an_empty_feather_one():
     m = Mosaic()
     m.set_blending("multiband")
@@ -287,6 +289,7 @@ def test_rotation_tracking_reads_the_signed_angle_over_many_keyframes(sign):
     assert m.keyframes[-1].angle_deg * sign > 15.0
 
 
+@pytest.mark.characterization("with rotation tracking off the angle never moved; guards the default path across the derotation fix")
 def test_without_rotation_tracking_the_angle_stays_flat():
     world = _smooth_world(7)
     m = Mosaic()
@@ -335,6 +338,7 @@ def test_rotation_between_the_capture_range_and_8_degrees_is_never_a_wrong_pose(
 # ------------------------------------------------------------------------------------------- RGB mosaic
 
 
+@pytest.mark.characterization("channel order was already right; replaces a shape-only check with a per-channel comparison")
 def test_rgb_mosaic_has_the_source_colours_in_channel_order():
     """Where a single keyframe contributes, the colour mosaic is that frame's colour image: channel 0 is the
     source's R (identity), channel 1 is 0.6 R + 20, channel 2 is 1.3 R - 10, alpha marks valid canvas."""
@@ -536,6 +540,7 @@ def test_rebuilding_the_canvas_keeps_height_patch_splats():
     assert np.nanmax(np.abs(before - after)) <= 1e-3
 
 
+@pytest.mark.characterization("backward compatibility: sessions written before the mosaic graph existed still load")
 def test_session_without_a_mosaic_graph_loads(tmp_path):
     """A session in the format of the base branch (no mosaic graph at all), written by hand."""
     blob = {"schema": 2, "result": {"warnings": ["keep me"], "um_per_px": 0.25, "z_unit": "um"}, "settings": {"s": 1},
@@ -811,3 +816,25 @@ def test_gui_flags_a_camera_mode_the_calibration_does_not_cover(window, qapp):
         assert ("CAL " in text) == cal and ("NOMINAL" in text) == (not cal)
         assert ("Not calibrated for this camera mode" in tip) == (not cal)
     del w.engine.snapshot
+
+
+def test_relaxation_moves_the_reacquisition_reference_with_the_graph():
+    """A loop edge that disagrees by 12 px makes the relaxation shift the current chain, and the camera with it, by
+    about 9.6 px. The position stored with the last good frame is where a lost track is re-acquired, so it has to
+    move by the same amount: it equals the camera position before the relaxation and must still equal it after.
+    (Before the fix it stayed behind: 480.09 against a camera at 489.69.)"""
+    rng = np.random.default_rng(1)
+    big = cv2.GaussianBlur(rng.uniform(0, 255, (600, 1400)).astype(np.float32), (0, 0), 2.0)
+    big = (big - big.min()) / (big.max() - big.min()) * 200 + 20
+    m = Mosaic()
+    for x in range(0, 481, 20):  # pan 480 px right in 20 px steps: five keyframes chained by edges
+        m.track(big[100:340, x:x + 320].astype(np.uint8))
+    assert len(m.keyframes) == 5
+    assert m.last_good[2] == pytest.approx((m.x, m.y))
+    k0, kj = m.keyframes[0], m.keyframes[-1]
+    m.edges.append((0, len(m.keyframes) - 1, kj.x - k0.x + 12.0, kj.y - k0.y, 1.0))
+    before = (m.x, m.y)
+    m._relax()
+    assert abs(m.x - before[0]) > 5.0  # the relaxation really moved the camera
+    assert m.last_good[2] == pytest.approx((m.x, m.y), abs=1e-6)
+    assert m.prev_xy == pytest.approx((m.x, m.y), abs=1e-6)

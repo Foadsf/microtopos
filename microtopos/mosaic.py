@@ -666,9 +666,7 @@ class Mosaic:
                     if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
                         p.x = self.keyframes[p.kf].x + p.rel[0]
                         p.y = self.keyframes[p.kf].y + p.rel[1]
-                self.x += shift_x
-                self.y += shift_y
-                self.prev_xy = (self.prev_xy[0] + shift_x, self.prev_xy[1] + shift_y)
+                self._shift_tracker(shift_x, shift_y)
                 self.current_area = target_area
                 merged = True
                 new.append((i, j, ex, ey, 1.0))
@@ -764,8 +762,17 @@ class Mosaic:
                 moved = True
         if moved:
             self._solve_offsets()
-        self.x, self.y = self.x + dxc, self.y + dyc
-        self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
+        self._shift_tracker(dxc, dyc)
+
+    def _shift_tracker(self, dx: float, dy: float) -> None:
+        """The graph moved under the camera (relaxation, or a bridge that joined two areas): move every position the
+        tracker holds by the same amount. `last_good` is the reference for re-acquiring a lost track; left behind,
+        the first frame after a loss would be placed where the graph used to be."""
+        self.x, self.y = self.x + dx, self.y + dy
+        self.prev_xy = (self.prev_xy[0] + dx, self.prev_xy[1] + dy)
+        if self.last_good is not None:
+            gf, gb, gxy, gang = self.last_good
+            self.last_good = (gf, gb, (gxy[0] + dx, gxy[1] + dy), gang)
 
     # ---------------------------------------------------------------- canvas
     def _splat(

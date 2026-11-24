@@ -21,7 +21,8 @@ import cv2
 import numpy as np
 
 from .optics import Objective
-from .simulator import FrameTruth, SpecimenSimulator
+from .simulator import SpecimenSimulator
+from .stage import StageError, StageReadout
 
 SUPPORTED_RESOLUTIONS = (
     "1920x1080",
@@ -158,14 +159,20 @@ class FrameSource:
             self._thread.join(timeout=2)
 
     def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1):
-        """Publish a frame. If a hardware StageDriver is attached and truth is None, tag with live stage pose."""
+        """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
+        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps.
+
+        When a StageDriver is attached (`stage_driver`) and the source supplies no truth of its own, the frame is
+        labelled with the stage's pose read now (`StageReadout`, z in um). A stage that fails or is
+        disconnected leaves the frame unlabelled: a missing label, never a made-up one.
+        """
         if truth is None and self.stage_driver is not None:
             try:
                 p = self.stage_driver.pose()
                 if p.connected:
-                    truth = FrameTruth(p.x_um, p.y_um, p.z_um, (0.0, 0.0), 1.0)
-            except Exception:  # noqa: S110, BLE001 - stage read failures must not interrupt frame publishing
-                pass
+                    truth = StageReadout(p.x_um, p.y_um, p.z_um)
+            except (StageError, OSError):
+                pass  # no label for this frame; the driver reports its failure to whoever commands it
         with self._lock:
             self._seq += max(1, int(step))
             self._frame = (frame, time.perf_counter() if ts is None else ts, self._seq, truth)
@@ -420,6 +427,14 @@ class SimulatorSource(FrameSource):
             back = np.linspace(zs[-1], self._best_focus(), 30)  # refocus afterwards, as a user would
             self.script = [p(z) for z in approach] + [p(zs[0])] * 6 + [p(z) for z in zs] + [p(zs[-1])] * 25 \
                 + [p(z) for z in back]
+
+    def relief_range_um(self) -> tuple[float, float]:
+        """Focus heights (um) that bracket the visible relief by 3 DOF each side: a stage Z sweep over this
+        range passes every pixel through focus (the same bracket as `SpecimenSimulator.sweep_trajectory`)."""
+        with self.lock:
+            _, hz = self.sim.truth_patch()
+            dof = self.sim.objective.dof_um
+        return float(hz.min()) - 3 * dof, float(hz.max()) + 3 * dof
 
     def busy(self) -> bool:
         return bool(self.script)

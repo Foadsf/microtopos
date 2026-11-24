@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -11,17 +12,28 @@ import cv2
 import numpy as np
 import pytest
 
-from microtopos import objectives
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QSettings, QStandardPaths
+from PySide6.QtWidgets import QApplication
+
+from microtopos import objectives, zstack
 from microtopos.calibration import CalibrationStore, ObjectiveCalibration, bgr_to_luma, bgr_to_rgb_u8
 from microtopos.camera import (
+    FrameSource,
     ReplaySource,
     SimulatorSource,
 )
+from microtopos.gui.main_window import MainWindow
+from microtopos.kinematics import Override
+from microtopos.live import LiveEngine
 from microtopos.recording import RecordingError, RecordingWriter, decode
+from microtopos.simulator import SpecimenSimulator
 from microtopos.stage import (
     GrblStageDriver,
     SimulatedStageDriver,
     StageError,
+    capture_z_sweep,
     list_serial_ports,
     parse_grbl_status,
 )
@@ -645,3 +657,236 @@ def test_replay_seek_publishes_immediately(tmp_path):
     rs.seek(5)
     frames = list(rs.frames())
     assert len(frames) == 10  # frames() iterates all, independent of seek
+
+
+# ------------------------------------------------------------------------------------------------ stage -> frames -> height map
+class _RenderedStageSource(FrameSource):
+    """A camera-like source (no simulator truth of its own): it renders the specimen at whatever Z its stage is
+    at and publishes the bare frame, so the only Z label a frame can get is the attached stage's readout."""
+
+    def __init__(self, sim, stage):
+        super().__init__()
+        self.sim = sim
+        self.stage = stage
+        self.stage_driver = stage
+
+    def _run(self):
+        while self._running:
+            self.sim.focus_z_um = self.stage.pose().z_um
+            bgr, _ = self.sim.render()
+            self._publish(bgr)
+            time.sleep(0.04)
+
+
+def _reference_height(sim, h):
+    """Simulator relief resampled onto the reconstruction grid (um), and the valid central crop."""
+    _, gt = sim.truth_patch()
+    g = cv2.resize(gt, (h.shape[1], h.shape[0]), interpolation=cv2.INTER_AREA)
+    c = (slice(16, -16), slice(16, -16))
+    return g[c], h[c]
+
+
+def _check_height_matches_relief(h, sim):
+    g, hh = _reference_height(sim, h)
+    ok = np.isfinite(hh)
+    # Valid-pixel coverage depends on how many frames the live thread happened to capture per Z (observed 0.35-0.70
+    # over repeated runs); r and slope below are the acceptance criteria, this floor only keeps them meaningful.
+    assert ok.mean() > 0.2
+    r = float(np.corrcoef(g[ok], hh[ok])[0, 1])
+    slope = float(np.polyfit(g[ok], hh[ok], 1)[0])
+    assert r >= 0.95, f"Pearson r {r:.3f}"
+    assert abs(slope - 1.0) <= 0.10, f"height slope {slope:.3f}"
+
+
+def test_engine_stage_z_labels_a_non_simulated_source_and_reconstructs_in_um():
+    """Real-camera path: frames carry the attached stage's Z (um), the capture is NOT flagged simulated, and the
+    sweep reconstructed with those labels reproduces the specimen relief."""
+    obj = objectives.default_set().objectives[1]
+    sim = SpecimenSimulator(3, obj, 320, 180)
+    stage = SimulatedStageDriver()
+    lo, hi = SimulatorSource(3, obj, 320, 180).relief_range_um()
+    zs = [float(z) for z in np.linspace(lo, hi, 36)]
+    stage.move_to(z_um=hi)
+    src = _RenderedStageSource(sim, stage)
+    caps: list = []
+    eng = LiveEngine(CalibrationStore(None), obj)
+    eng.on_sweep = caps.append
+    eng.start()
+    eng.set_source(src)
+    src.start()
+    try:
+        poses = capture_z_sweep(stage, src, eng, zs, settle_s=5.0)
+        t0 = time.time()
+        while not caps and time.time() - t0 < 10:
+            time.sleep(0.02)
+    finally:
+        src.stop()
+        eng.stop()
+    assert [p.z_um for p in poses] == zs
+    assert len(caps) == 1
+    cap = caps[0]
+    assert cap.manual is True and cap.simulated is False  # a stage measurement is not a simulation
+    assert cap.z is not None and len(cap.z) == len(cap.frames)
+    assert set(np.unique(cap.z)) >= set(zs)  # every commanded position was captured
+    assert set(np.unique(cap.z)) <= set(zs) | {hi}  # and no other Z was ever labelled
+    assert np.all(np.diff(cap.z) >= 0) and cap.z[-1] == zs[-1]  # monotonic and in the commanded direction
+    res = zstack.reconstruct(cap.frames, cap.z, obj, obj.nominal_um_per_px(cap.frames[0].shape[1]), "um")
+    _check_height_matches_relief(res["height"], sim)
+
+
+def test_capture_z_sweep_needs_a_stage_attached_to_the_source():
+    """Negative control: without the stage readout on the frames no Z label exists, so the sweep refuses."""
+    obj = objectives.default_set().objectives[1]
+    stage = SimulatedStageDriver()
+    src = _RenderedStageSource(SpecimenSimulator(3, obj, 160, 90), stage)
+    src.stage_driver = None  # the stage moves the focus, but nothing labels the frames
+    eng = LiveEngine(CalibrationStore(None), obj)
+    eng.start()
+    eng.set_source(src)
+    src.start()
+    try:
+        with pytest.raises(StageError, match="no frame was captured"):
+            capture_z_sweep(stage, src, eng, [0.0, 1.0, 2.0], settle_s=0.5)
+    finally:
+        src.stop()
+        eng.stop()
+    assert eng.sm.override == Override.AUTO  # the capture was ended again after the failure
+
+
+def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
+    class _Broken(SimulatedStageDriver):
+        def pose(self):
+            raise StageError("no status report within 2 s")
+
+    src = FrameSource()
+    src.stage_driver = _Broken()
+    src._publish(np.zeros((4, 4, 3), np.uint8))
+    assert src.latest()[3] is None
+    ok = SimulatedStageDriver()
+    ok.move_to(z_um=1.5)
+    src.stage_driver = ok
+    src._publish(np.zeros((4, 4, 3), np.uint8))
+    assert src.latest()[3].focus_z_um == 1.5
+    ok.close()
+    src._publish(np.zeros((4, 4, 3), np.uint8))
+    assert src.latest()[3] is None  # a closed stage labels nothing
+
+
+# -- GUI (offscreen)
+@pytest.fixture(scope="module")
+def qapp(tmp_path_factory):
+    QStandardPaths.setTestModeEnabled(True)
+    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture
+def window(qapp, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    w = MainWindow(simulator_only=True)
+    w.show()
+    _pump(qapp, 20)
+    w.timer.stop()
+    yield w
+    w.close()
+    _pump(qapp, 5)
+
+
+def _pump(app, n=25):
+    for _ in range(n):
+        app.processEvents()
+
+
+def _wait(app, cond, timeout=30.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        app.processEvents()
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _stage_idle(w):
+    return not any(j.isRunning() for j in w.jobs)
+
+
+def test_gui_grbl_connect_without_pyserial_shows_a_clear_message(window, qapp, monkeypatch):
+    w = window
+    monkeypatch.setitem(sys.modules, "serial", None)  # pyserial not installed
+    seen: list[str] = []
+    real_notify = w.notify
+    monkeypatch.setattr(w, "notify", lambda text, kind="info": (seen.append(text), real_notify(text, kind))[1])
+    crashed: list = []
+    monkeypatch.setattr(sys, "excepthook", lambda *a: crashed.append(a))
+    w.cmb_stg.setCurrentText("GRBL serial port")
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: _stage_idle(w) and any("microtopos[serial]" in s for s in seen))
+    assert not crashed
+    assert w.stage_driver is None
+    assert w.btn_stg_connect.text() == "Connect" and not w.btn_stg_zero.isEnabled()
+
+
+def test_gui_grbl_stage_error_is_reported_not_raised(window, qapp, monkeypatch):
+    w = window
+    fake = FakeGrbl()
+    fake.silent = True  # a controller that does not answer
+    import microtopos.gui.main_window as mw
+
+    monkeypatch.setattr(mw, "GrblStageDriver", lambda port: GrblStageDriver(port, serial_factory=lambda *a, **k: fake,
+                                                                          timeout=0.1))
+    seen: list[str] = []
+    real_notify = w.notify
+    monkeypatch.setattr(w, "notify", lambda text, kind="info": (seen.append(text), real_notify(text, kind))[1])
+    w.cmb_stg.setCurrentText("GRBL serial port")
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: _stage_idle(w) and any("no status report" in s or "no reply" in s for s in seen))
+    assert w.stage_driver is None
+
+
+def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, monkeypatch):
+    w = window
+    fake = FakeGrbl(start=(5.0, 0.0, 2.5))
+    import microtopos.gui.main_window as mw
+
+    monkeypatch.setattr(mw, "GrblStageDriver", lambda port: GrblStageDriver(port, serial_factory=lambda *a, **k: fake,
+                                                                          timeout=0.3, feedrate_mm_min=6000.0))
+    w.cmb_stg.setCurrentText("GRBL serial port")
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: w.stage_driver is not None and _stage_idle(w))
+    assert "+5000.00" in w.lbl_stg_pose.text() and "+2500.00" in w.lbl_stg_pose.text()
+    w.btn_stg_zero.click()
+    assert _wait(qapp, lambda: _stage_idle(w) and "X +0.00" in w.lbl_stg_pose.text())  # the label follows zero()
+    assert "Z +0.00" in w.lbl_stg_pose.text()
+    assert w.source.stage_driver is w.stage_driver  # attached to the active source
+    w.btn_stg_connect.click()  # disconnect
+    assert _wait(qapp, lambda: w.stage_driver is None)
+    assert w.source.stage_driver is None and not fake.is_open
+
+
+def test_gui_stage_z_sweep_captures_stage_z_and_reconstructs_in_um(window, qapp):
+    """Connect the simulated stage, press 'Z sweep': the stage is driven through the range while the live engine
+    captures it; the capture's z labels are the commanded stage Z (um) and the height map reproduces the relief."""
+    w = window
+    w.btn_stg_connect.click()
+    assert _wait(qapp, lambda: w.stage_driver is not None and _stage_idle(w))
+    assert w.source.stage_driver is w.stage_driver  # attached to the active source
+    z0, z1, n = w.sp_stg_z0.value(), w.sp_stg_z1.value(), w.sp_stg_n.value()
+    assert z1 > z0 and n >= 16
+    commanded = np.linspace(z0, z1, n)
+    assert commanded[-1] - commanded[0] > 2.0  # the default range is the specimen relief, not a token +/-5 um
+    w.btn_stg_zsweep.click()
+    assert _wait(qapp, lambda: w.result is not None, timeout=60.0), "no height map was reconstructed"
+    cap = w.last_cap
+    assert cap.manual is True and cap.simulated is True
+    assert cap.z is not None and len(cap.z) == len(cap.frames) >= n
+    uz = np.unique(cap.z)
+    assert set(np.round(commanded, 9)) <= set(np.round(uz, 9))  # every commanded position captured
+    assert set(np.round(uz, 9)) <= set(np.round(commanded, 9))  # and nothing else (pre-roll sits at the first Z)
+    assert np.all(np.diff(cap.z) >= 0)  # monotonic
+    assert cap.z[0] == pytest.approx(z0) and cap.z[-1] == pytest.approx(z1)  # sign: ascending, as commanded
+    assert w.result["z_unit"] == "um" and w.result["z_status"] == "SIMULATED"
+    _check_height_matches_relief(w.result["height"], w.sim_source.sim)
+    assert w.stage_driver.pose().z_um == pytest.approx(z1)  # the stage ends where the sweep ended

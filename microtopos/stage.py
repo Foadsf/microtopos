@@ -369,7 +369,9 @@ class GrblStageDriver(StageDriver):
             if not wait:
                 return self._pose_locked()
             # generous bound: twice the travel time at the commanded feed rate, plus one reply timeout
-            deadline = time.perf_counter() + self.timeout + (2.0 * dist / self.feedrate * 60.0 if self.feedrate > 0 else 0.0)
+            deadline = time.perf_counter() + self.timeout
+            if self.feedrate > 0:
+                deadline += 2.0 * dist / self.feedrate * 60.0
             while True:
                 pose = self._pose_locked()
                 if not pose.moving:
@@ -388,7 +390,8 @@ class GrblStageDriver(StageDriver):
 
 
 def capture_z_sweep(driver: StageDriver, source, engine, z_um_list: list[float], *, settle_s: float = 5.0,
-                    cancelled: Callable[[], bool] | None = None) -> list[StagePose]:
+                    cancelled: Callable[[], bool] | None = None,
+                    progress: Callable[[float, str], None] | None = None) -> list[StagePose]:
     """Drive `driver` through `z_um_list` (µm) while `engine` captures the sweep under manual-Z override.
 
     One frame per commanded position is awaited: the engine must have *processed* a frame published after
@@ -398,15 +401,21 @@ def capture_z_sweep(driver: StageDriver, source, engine, z_um_list: list[float],
     Raises `StageError` when the stage fails or no frame is processed within `settle_s` per position.
     """
     from .kinematics import Override
+    from .live import PREROLL
 
     if not z_um_list:
         raise ValueError("empty Z list")
     poses: list[StagePose] = []
-    first = driver.move_to(z_um=z_um_list[0])  # approach first: the blurry start of the sweep is the pre-roll
-    _wait_processed_at(source, first.z_um, settle_s)
-    engine.set_override(Override.Z)
+    # Approach the start with motion analysis paused (a jump in Z would otherwise be taken for a sweep that began
+    # early), and let the engine's pre-roll fill with frames at the start Z only.
+    engine.set_override(Override.PAUSE)
     try:
-        for z in z_um_list:
+        first = driver.move_to(z_um=z_um_list[0])
+        _wait_processed_at(source, first.z_um, settle_s, frames=PREROLL)
+        engine.set_override(Override.Z)
+        for i, z in enumerate(z_um_list):
+            if progress:
+                progress(i / len(z_um_list), f"Z {z:+.2f} um ({i + 1}/{len(z_um_list)})")
             if cancelled and cancelled():
                 break
             p = driver.move_to(z_um=z)
@@ -417,18 +426,27 @@ def capture_z_sweep(driver: StageDriver, source, engine, z_um_list: list[float],
     return poses
 
 
-def _wait_processed_at(source, z_um: float, timeout: float) -> None:
-    """Block until a frame labelled with Z == z_um has been published and a LATER frame consumed by the engine."""
+def _wait_processed_at(source, z_um: float, timeout: float, frames: int = 1) -> None:
+    """Block until a frame labelled with Z == z_um has been published and the engine has then processed `frames`
+    further frames (each of them was published after the stage settled, so it carries the same Z)."""
     t0 = time.perf_counter()
     seen_seq = None
+    last_consumed = None
+    got = 0
     while time.perf_counter() - t0 < timeout:
         item = source.latest()
         if item is not None:
             _, _, seq, truth = item
-            if seen_seq is None and truth is not None and truth.focus_z_um == z_um:
-                seen_seq = seq
-            elif seen_seq is not None and source.consumed_seq > seen_seq:
-                return
+            if seen_seq is None:
+                if truth is not None and truth.focus_z_um == z_um:
+                    seen_seq = seq
+            else:
+                c = source.consumed_seq
+                if c > seen_seq and c != last_consumed:
+                    got += 1
+                    last_consumed = c
+                    if got >= frames:
+                        return
         time.sleep(0.002)
     raise StageError(f"no frame was captured with the stage at Z={z_um:g} um within {timeout:g} s "
                      "(is the live engine running on this source, and the stage attached to it?)")

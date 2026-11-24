@@ -138,6 +138,11 @@ class FrameSource:
         FrameSource._ids += 1
         self.source_id = f"{type(self).__name__}-{FrameSource._ids}"
 
+    @property
+    def consumed_seq(self) -> int:
+        """Sequence number of the last frame the consumer reported as processed."""
+        return self._consumed
+
     def consumed(self, seq: int) -> None:
         """Called by the consumer after processing frame `seq` (back-pressure for lossless replay)."""
         self._consumed = max(self._consumed, seq)

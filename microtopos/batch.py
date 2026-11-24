@@ -61,7 +61,7 @@ def run_batch(recording: str | Path, outdir: str | Path, objective: str = "10x /
             continue
         k += 1
         cal = store.get(obj)
-        um = cal.um_per_px(cap.shape[1], obj)
+        um = cal.um_per_px(cap.shape[1], obj, cap.shape[0])
         unit = units.UM if z_um_per_frame else units.FRAMES
         entry = {"index": k, "frames": len(cap.frames), "completeness": cap.completeness,
                  "seq_first": cap.seqs[0] if cap.seqs else None, "seq_last": cap.seqs[-1] if cap.seqs else None}
@@ -74,7 +74,7 @@ def run_batch(recording: str | Path, outdir: str | Path, objective: str = "10x /
             log(f"sweep {k}: not reconstructed: {e}")
             continue
         r.update(z_status="CALIBRATED" if z_um_per_frame else "NOMINAL",
-                 lateral_status="CALIBRATED" if lateral_um_per_px_full else "NOMINAL")
+                 lateral_status=cal.lateral_status_for(cap.shape[1], cap.shape[0]).value)
         d = out / f"sweep-{k:02d}"
         export.write_report_bundle(d, r, {"microtopos": __version__})
         export.export_height(d / "height.tif", "tif", r["sl_surface"], r["um_per_px"], r["z_unit"])

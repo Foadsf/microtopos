@@ -142,6 +142,6 @@ def pytest_sessionfinish(session, exitstatus):  # DIAGNOSTIC (scratch branch onl
 
         qts = [o for o in gc.get_objects() if isinstance(o, QThread)]
         print(f"[thread-census] QThread objects: {len(qts)}; running: {[o for o in qts if o.isRunning()]}", file=out)
-    except Exception as e:  # diagnostic only
+    except ImportError as e:
         print(f"[thread-census] QThread census failed: {e!r}", file=out)
     out.flush()

@@ -40,7 +40,7 @@ Each step has a status chip; click a step to open its settings.
 image::step-camera.png[Step 1,role=narrow]
 
 Source:: a camera, *Simulator (synthetic specimen)*, or a recording given with `--replay`. A microscope camera is preferred over a laptop webcam at start-up.
-Capture size:: 1920×1080 or 1280×720. Both have the same field of view; Z-stacks use the full capture size, and live analysis uses a 640 px preview.
+Capture size:: 1920×1080 or 1280×720. Both are 16:9, and a lateral calibration made at one carries over to the other; a mode with another aspect ratio (for example 4:3) needs its own calibration, because a camera cannot say whether it is a crop or a rescale of the sensor. Z-stacks use the full capture size, and live analysis uses a 640 px preview.
 Automatic exposure:: off by default and for all measurements.
 Exposure slider:: manual exposure in milliseconds. It applies while you drag, and its range is the one the camera reports. *Set once* adjusts it until the brightest areas are just below saturation, then keeps it locked.
 View rotation:: rotates the 2D views (Live, Mosaic, All-in-focus, Height, coverage) for a camera that sits rotated in the eyepiece. *Measure from X pan* sets it from a movement of the X knob alone. Display only: see xref:tutorial-mosaic.adoc#rotating-the-views[rotating the views].

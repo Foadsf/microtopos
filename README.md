@@ -62,22 +62,25 @@ on a real desktop.
 
 ### New capabilities (feat/missing-capabilities, in development)
 
-The following are implemented on the `feat/missing-capabilities` branch and verified by the offscreen GUI tests
-and the full test suite (`pytest -m ""`):
+The following are implemented on the `feat/missing-capabilities` branch and exercised by the offscreen GUI tests
+and the default test suite (`pytest`; `pytest -m ""` adds the slow tests). The tests use the simulator and a fake
+Grbl controller: **no real camera, stage or Grbl hardware has been used with these features.**
 
 - **Motorised stage drivers**: `SimulatedStageDriver` (synthetic, for offline development) and `GrblStageDriver`
-  (serial; opt-in via the `[serial]` extra / `pyserial`), with stage-coupled Z-readback and Z-sweep from the GUI
-  stage panel (connect, zero, and multi-level Z-sweep).
-- **Multi-aspect/resolution camera & calibration support**; 16-bit capture (`Y16` / 16-bit PNG); colour pipeline:
-  RGB EDF and RGB mosaic.
+  (serial; opt-in via the `[serial]` extra / `pyserial`; checked against a fake Grbl only), with stage-coupled
+  Z-readback and Z-sweep from the GUI stage panel (connect, zero, jog and multi-level Z-sweep).
+- **Multi-aspect/resolution camera & calibration support**; 16-bit PNG recordings are decoded (there is no `Y16`
+  capture mode); colour pipeline: RGB EDF (shown, written to the report bundle as `edf_rgb.png` and kept in
+  saved sessions) and RGB mosaic.
 - **Interactive replay transport bar** (`ReplaySource`): pause/resume, seek, single-frame step, playback speed
   and loop, driven from the GUI replay bar — no real camera required.
 - **Mosaicking**: disconnected-area bridging (cross-area loop closure), multi-scale `MosaicInset` overlays,
-  `feather`/`multiband` blending, rotational stage tracking (`track_rotation`), and full mosaic-graph session
-  persistence (schema 2).
-- **3D reconstruction & compute**: focus-breathing correction (`estimate_breathing_scales`), out-of-core tiled
-  Z-stack reconstruction (`allow_tiling`), calibrated optical DOF ruler (`theoretical_fwhm_um`), and expanded
-  OpenCL (`cv2.UMat`) focus metrics and guided filter.
+  `feather` and `multiband` (a two-band blend, not a Laplacian pyramid) blending, rotational stage tracking
+  (`track_rotation`), and saving and reloading the mosaic graph (`LiveEngine.mosaic_state` / `load_mosaic_state`).
+- **3D reconstruction & compute**: experimental focus-breathing correction (`estimate_breathing_scales`, off by
+  default), strip-wise (tiled) Z-stack reconstruction that bounds peak working memory (`allow_tiling`), an optical
+  depth-of-field ruler (`theoretical_fwhm_um`, an estimate), and expanded OpenCL (`cv2.UMat`) focus metrics and
+  guided filter.
 - **Metrology**: ISO 21920 1D profile filtering (`Ra`, `Rq`, `Rz`, …), ISO 25178 `Sdq`, volume parameters
   (`Vmp`, `Vmc`, `Vvc`, `Vvv`), feature parameters (`Sds`, `Ssc`, `Spd`, `Spc`, `S5p`, `S5v`, `S10z`),
   interactive 3-point levelling, exclusion-mask ROI, step-height ROIs, topographic grain segmentation, and
@@ -195,7 +198,7 @@ Simulator ground truth (every instrument parameter randomised per seed):
 - Textureless patch: 91–97 % masked. ISO Gaussian filter: 0.500 transmission at the cutoff.
 - 48 frames at 1920×1080: 4.1 s end to end on this laptop (target ≤ 15 s; 2.8–4.2 s in earlier runs).
 
-Pipeline tests (`pytest`, 59 tests): recordings (raw JPEG and decoded PNG modes, a non-JPEG buffer refused, a
+Pipeline tests (`pytest`): recordings (raw JPEG and decoded PNG modes, a non-JPEG buffer refused, a
 non-empty folder refused, a failed write visible with the manifest marked incomplete), legacy manifests with a
 count mismatch, damaged replay frames as sequence gaps with the engine still running, an engine error that does not
 stop the engine, dark frames cancelled by a source or size change, a late height map not pinned into a restarted
@@ -214,15 +217,18 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
 ## Known limits (stated, not hidden)
 
 - Manual Z: a hand sweep assumes a constant knob speed while moving; its scale holds for that sweep only, and its
-  sign is unknown unless stated. Only a measured Z (encoder, motorised drive) removes this; none is supported yet.
+  sign is unknown unless stated. A measured Z (the stage drivers) removes this, but it has only been exercised with
+  the simulator and a fake Grbl, and a stage that settles or jitters in z is handled only for repeated labels: equal
+  z runs are merged into one frame, jitter inside a position is not modelled.
 - Physical accuracy, uncertainty and ISO/ASTM equivalence are not established: no certified flatness, step-height,
   pitch-grid or roughness reference has been measured, and no clause-by-clause standards audit was done. The
   simulator shares the reconstruction's optics model; the new signed-step control uses an independent blur law.
 - The optional OpenCL focus measure matched the CPU (relative L2 1e-7) and was 4 % faster than the best CPU
   setting for one 960×540 frame on an Intel UHD 620 (i5-8365U laptop). That is not a measured end-to-end gain,
   so the CPU stays the default. CUDA, Vulkan, SYCL and NPU paths are not implemented.
-- The reconstruction still holds the whole processing stack in memory (now one preallocated stack per stage and an
-  admission check); tiled or spilled processing for very long sweeps is not implemented.
+- The reconstruction holds the input frames in memory (one preallocated stack per stage and an admission check).
+  Strip-wise tiling bounds the working memory of the focus computation, but there is no spill to disk, so a very
+  long sweep can still exceed memory.
 - The GUI has not had a usability study, a keyboard-only walkthrough or native high-DPI checks; the offscreen smoke
   test drives it programmatically only. The window fits 1280×720 with both panels.
 
@@ -230,12 +236,16 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
   tied on one seed earlier; it is experimental, reported and not gated. Its 2× is per axis (4× the pixels), and a
   real resolution gain on optical targets has not been measured.
 - The DOF ruler's µm/frame estimate was off by −34 % to +13 % in simulation; it is stored as an ESTIMATED scale.
-- Focus breathing (magnification change with focus) is not corrected: two estimators were biased by defocus more
-  than the breathing itself. Effect: about 1 px at the image edges in far-defocused frames.
+- Focus breathing (magnification change with focus) is not corrected by default: two estimators were biased by
+  defocus more than the breathing itself (about 1 px at the image edges in far-defocused frames). The opt-in
+  correction on the 3D tab is experimental and caps the excursion it applies at 1.5 % over a sweep.
 - The magnification guess after an objective change is a texture-scale heuristic and is not validated; the
   prompt always offers all objectives in the list.
 - The simulator scales its relief to each objective's depth of field so every objective can be demonstrated.
-- Not implemented: high-magnification insets inside a low-magnification mosaic, a motorised Z drive, multiband
-  blending (feathering is used).
+- Not implemented: Laplacian-pyramid blending (the `multiband` option is a two-band blend; feathering is the
+  default).
+- A lateral calibration covers capture modes with the aspect ratio it was measured at; another aspect ratio gets no
+  guessed scale and needs its own calibration. Calibrations saved without a recorded frame size (older files) are
+  scaled by image width for every mode, as before.
 - OpenCV 5.0's `phaseCorrelate` modifies its inputs when given a window; all calls go through a wrapper that
   avoids this (`registration.phase_shift`).

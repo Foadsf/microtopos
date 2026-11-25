@@ -247,8 +247,8 @@ class ImagePanel(pg.GraphicsLayoutWidget):
             finite = data[np.isfinite(data)]
             if levels is None:
                 levels = (float(np.percentile(finite, 1)), float(np.percentile(finite, 99))) if finite.size else (0, 1)
-                if levels[1] <= levels[0]:
-                    levels = (levels[0], levels[0] + 1e-6)
+            if levels[1] <= levels[0]:
+                levels = (levels[0], levels[0] + 1e-6)
             if self.bar is not None:
                 self.bar.setLevels(levels)
             self.img.setImage(data, autoLevels=False, levels=levels)
@@ -268,7 +268,10 @@ class ImagePanel(pg.GraphicsLayoutWidget):
         self.rotation = float(deg)
         self.group.setRotation(self.rotation)
         lab = "" if abs(self.rotation) < 1e-6 else f"  (view rotated {self.rotation:+.1f}°)"
+        was_vis = self.plot.getAxis("bottom").isVisible()
         self.plot.setLabel("bottom", "x" + lab, units="µm")
+        if not was_vis:
+            self.plot.hideAxis("bottom")
         if self.data is not None:
             self.plot.setRange(self.group.mapRectToParent(self.img.mapRectToParent(self.img.boundingRect())),
                                padding=0.02)

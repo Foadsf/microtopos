@@ -38,6 +38,7 @@ class ObjectiveCalibration:
     lateral_um_per_px_full: float | None = None
     lateral_source: str = ""
     lateral_date: str = ""
+    lateral_magnification: float | None = None
     z_um_per_frame: float | None = None
     z_source: str = ""
     z_date: str = ""
@@ -137,8 +138,8 @@ class CalibrationStore:
                     continue  # never used: nothing to keep
                 meta[name] = {
                     k: getattr(c, k)
-                    for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "z_um_per_frame",
-                              "z_source", "z_date", "z_uncertainty_pct", "revision")
+                    for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date", "lateral_magnification",
+                              "z_um_per_frame", "z_source", "z_date", "z_uncertainty_pct", "revision")
                 }
                 for kind, d in (("dark", c.darks), ("flat", c.flats)):
                     for key, arr in list(d.items()):

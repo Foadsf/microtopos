@@ -63,6 +63,7 @@ class StateMachine:
         self.analysis_width = analysis_width
         self.state = State.DWELL
         self.override = Override.AUTO
+        self._prev_override = Override.AUTO
         self.prev = None
         self.prev_b = None
         self.prev_luma = None
@@ -70,7 +71,7 @@ class StateMachine:
         self.quiet_db = collections.deque(maxlen=120)
         self.quiet_resp = collections.deque(maxlen=120)
         self.cut_before = None
-        self.sweep_complete = True  # set by the caller each frame during a sweep (live completeness >= 0.5)
+        self.sweep_complete = True  # set by the caller each frame during a sweep (live.MIN_COMPLETENESS)
         self.trend = collections.deque(maxlen=6)
         self.enter_count = 0
         self.exit_count = 0
@@ -95,6 +96,12 @@ class StateMachine:
         return med, max(floor, 1.4826 * float(np.median(np.abs(a - med))))
 
     def update(self, luma: np.ndarray) -> tuple[State, Features, list[Event]]:
+        try:
+            return self._update(luma)
+        finally:
+            self._prev_override = self.override
+
+    def _update(self, luma: np.ndarray) -> tuple[State, Features, list[Event]]:
         s = self._small(luma)
         b = brenner(s)
         luma_mean = float(s.mean())
@@ -137,10 +144,17 @@ class StateMachine:
             forced = {Override.PAN: State.PAN, Override.Z: State.Z_SWEEP, Override.PAUSE: State.DWELL}[self.override]
             if forced != self.state:
                 if self.state == State.Z_SWEEP:
-                    events.append(Event("sweep_ended", {}))
+                    events.append(Event("sweep_ended", {"manual": self._prev_override == Override.Z}))
                 if forced == State.Z_SWEEP:
                     events.append(Event("sweep_started", {}))
                 self.state = forced
+            return self.state, feats, events
+
+        if self._prev_override == Override.Z and self.state == State.Z_SWEEP:
+            events.append(Event("sweep_ended", {"manual": True}))
+            self.state = State.DWELL
+            self.trend.clear()
+            self.enter_count = self.exit_count = 0
             return self.state, feats, events
 
         if self.state == State.DWELL and not moving and not cut and abs(dlb) < 3 * sd_db + 0.02:

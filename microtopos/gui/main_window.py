@@ -26,7 +26,7 @@ from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
 from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
 from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
-from ..live import LiveEngine, SweepCapture
+from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
 from ..superres import dwell_superres
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         self.bridge.sweep.connect(self._on_sweep)
         self.bridge.objective_hint.connect(self._on_objective_hint)
         self.source = None
+        self._readback_seq: int | None = None  # CameraSource.applied_seq shown in the "Device reports" label
         self.sim_source: SimulatorSource | None = None
         self.result: dict | None = None
         self.prev_result: dict | None = None
@@ -767,7 +768,7 @@ class MainWindow(QMainWindow):
         self.cmb_override = QComboBox()
         self.cmb_override.addItems([o.value for o in Override])
         self.cmb_override.setToolTip("Auto: motion is detected from the video. The others force a mode.")
-        self.cmb_override.currentTextChanged.connect(lambda s: self.engine.set_override(Override(s)))
+        self.cmb_override.currentTextChanged.connect(self._on_override_changed)
         self.btn_manual = self._btn("Start Z capture  (Space)", self._toggle_manual, "Capture a focus sweep manually")
         self.btn_repeat = self._btn("Repeat sweep here", self._arm_repeat,
                                     "Repeat a sweep at the same spot to measure repeatability (σ_inst)")
@@ -785,8 +786,11 @@ class MainWindow(QMainWindow):
         self.sp_ls.setRange(0, 100)
         self.sp_ls.setDecimals(2)
         self.sp_ls.setSuffix(" µm")
-        self.sp_ls.setToolTip("S-filter nesting index λs (removes shorter wavelengths). Default: optical cutoff λ/2NA")
+        self.sp_ls.setSpecialValueText("off")
+        self.sp_ls.setToolTip("S-filter nesting index λs (removes shorter wavelengths). Default: optical cutoff λ/2NA; 0 = off")
         self.sp_ls.setValue(self.obj.lateral_cutoff_um)
+        self._ls_user_set = False
+        self.sp_ls.valueChanged.connect(lambda _v: setattr(self, "_ls_user_set", True))
         self.sp_lc = QDoubleSpinBox()
         self.sp_lc.setRange(0, 5000)
         self.sp_lc.setDecimals(1)
@@ -960,6 +964,8 @@ class MainWindow(QMainWindow):
         self._on_source(pick)
 
     def _on_source(self, idx: int):
+        self._ae_active = False
+        self._cancel_rotation_measure()
         info = self.cmb_source.itemData(idx)
         if self.source is not None:
             self.engine.set_source(None)
@@ -1000,15 +1006,28 @@ class MainWindow(QMainWindow):
         for p in self._rot_panels():
             p.set_rotation(deg)
 
+    def _cancel_rotation_measure(self):
+        if hasattr(self, "btn_rot_measure") and self.btn_rot_measure.isChecked():
+            self.btn_rot_measure.blockSignals(True)
+            self.btn_rot_measure.setChecked(False)
+            self.btn_rot_measure.setText("Measure from X pan")
+            self.btn_rot_measure.blockSignals(False)
+        self._rot_start = None
+
     def _measure_rotation(self, on: bool):
         s = self.engine.snapshot()
         if on:
-            self._rot_start = s.mosaic_xy
+            self._rot_start = (s.mosaic_xy, s.mosaic_generation)
             self.btn_rot_measure.setText("Finish (after an X-only move)")
             self.notify("Move only the stage's X knob for at least a field width, then click 'Finish'.")
             return
         self.btn_rot_measure.setText("Measure from X pan")
-        x0, y0 = getattr(self, "_rot_start", (0.0, 0.0))
+        start = getattr(self, "_rot_start", None)
+        self._rot_start = None
+        if not start or start[1] != s.mosaic_generation:
+            self.notify("Rotation measurement was reset because the mosaic changed.", "warning")
+            return
+        x0, y0 = start[0]
         dx, dy = s.mosaic_xy[0] - x0, s.mosaic_xy[1] - y0
         if math.hypot(dx, dy) < 40 or s.mosaic_lost:
             self.notify("Not enough tracked X movement to measure the angle; move further while the mosaic tracks.",
@@ -1025,23 +1044,39 @@ class MainWindow(QMainWindow):
             self.notify("One-shot exposure needs a real camera.", "warning")
             return
         self.chk_autoexp.setChecked(False)
+        self._ae_active = True
+        self._ae_gen = self.engine.source_generation
         self._ae_steps = 0
-        self._ae_seq = -1
+        self._ae_stalls = 0
+        self._ae_seq = self.engine.snapshot().seq
         self.btn_autoexp_once.setEnabled(False)
         QTimer.singleShot(600, self._auto_exposure_step)
 
     def _auto_exposure_step(self):
+        if (not getattr(self, "_ae_active", False) or not isinstance(self.source, CameraSource)
+                or self.engine.source_generation != getattr(self, "_ae_gen", -1)):
+            self._ae_active = False
+            self.btn_autoexp_once.setEnabled(isinstance(self.source, CameraSource))
+            return
         s = self.engine.snapshot()
-        if s.preview is None or s.seq == self._ae_seq:
+        if s.preview is None or s.seq == self._ae_seq or s.source_generation != self._ae_gen:
+            self._ae_stalls = getattr(self, "_ae_stalls", 0) + 1
+            if self._ae_stalls >= 15:
+                self._ae_active = False
+                self.btn_autoexp_once.setEnabled(True)
+                self.notify("One-shot exposure timed out: no new frames from the camera.", "warning")
+                return
             QTimer.singleShot(300, self._auto_exposure_step)
             return
+        self._ae_stalls = 0
         self._ae_seq = s.seq
-        p = float(np.percentile(s.preview, 99.5))
+        p = s.raw_p995 if s.raw_p995 is not None else float(np.percentile(s.preview, 99.5))
         lo, hi = self.sl_exp.minimum(), self.sl_exp.maximum()
         cur = self.sl_exp.value()
         new = int(np.clip(round(cur * 220.0 / max(p, 1.0)) if p < 250 else cur * 0.6, lo, hi))
         self._ae_steps += 1
         if abs(new - cur) <= max(2, 0.03 * cur) or self._ae_steps >= 8 or new == cur:
+            self._ae_active = False
             self.btn_autoexp_once.setEnabled(True)
             note = "" if 150 < p < 250 else " The lamp may be too dim or too bright for the exposure range."
             self.notify(f"Exposure set to {cur / 10:.1f} ms (brightest areas {p:.0f}/255).{note}",
@@ -1057,19 +1092,27 @@ class MainWindow(QMainWindow):
         self.settings.setValue("exposure", self.sl_exp.value())
         self.engine.exposure = None if auto else float(self.sl_exp.value())
         if isinstance(self.source, CameraSource):
-            got = self.source.set_manual_exposure(None if auto else self.sl_exp.value())
-            self.cam_controls = got
+            # While streaming, the capture thread applies this with its next frame; _tick refreshes the readback
+            # when the device's answer arrives (CameraSource.applied_seq), so the label never shows a stale report.
+            self.source.set_manual_exposure(None if auto else self.sl_exp.value())
             self._show_readback()
         self.engine._corrector_key = None
 
     def _show_readback(self):
         if isinstance(self.source, CameraSource):
             rb = dict(self.source.readback)
-            rb.update(getattr(self, "cam_controls", {}) or {})
+            rb.update(self.source.applied)
+            self._readback_seq = self.source.applied_seq
             err = f"  Error: {self.source.error}" if self.source.error else ""
             self.lbl_readback.setText("Device reports: " + ", ".join(f"{k}={v}" for k, v in rb.items()) + err)
         else:
+            self._readback_seq = None
             self.lbl_readback.setText("Simulator: 640×360, randomised noise, MJPEG, tremor and focus breathing.")
+
+    def _refresh_readback(self):
+        """Show the device's answer as soon as the capture thread has applied a control request."""
+        if isinstance(self.source, CameraSource) and self.source.applied_seq != self._readback_seq:
+            self._show_readback()
 
     def _on_objective(self, name: str):
         obj = self.objset.get(name)
@@ -1080,7 +1123,11 @@ class MainWindow(QMainWindow):
         self.engine.set_objective(self.obj)
         if self.sim_source is not None:
             self.sim_source.set_objective(self.obj)
+        self.sp_ls.blockSignals(True)
         self.sp_ls.setValue(self.obj.lateral_cutoff_um)
+        self.sp_ls.blockSignals(False)
+        self._ls_user_set = False
+        self._cancel_rotation_measure()
         self.engine.reset_mosaic()
         self._refresh_checklist()
         self.notify(f"Objective {name}. Mosaic restarted for the new magnification.")
@@ -1109,13 +1156,16 @@ class MainWindow(QMainWindow):
             self.sim_source.demo_sweep(reversal=(kind == "rev"))
         self.tabs.setCurrentIndex(1 if kind == "pan" else 0)
 
+    def _on_override_changed(self, text: str):
+        mode = Override(text)
+        self.engine.set_override(mode)
+        self.btn_manual.setText("Finish Z capture  (Space)" if mode == Override.Z else "Start Z capture  (Space)")
+
     def _toggle_manual(self):
         if self.engine.sm.override == Override.Z:
             self.cmb_override.setCurrentText(Override.AUTO.value)
-            self.btn_manual.setText("Start Z capture  (Space)")
         else:
             self.cmb_override.setCurrentText(Override.Z.value)
-            self.btn_manual.setText("Finish Z capture  (Space)")
             self.notify("Capturing: turn the fine focus through the surface, then press Space.")
 
     def _toggle_record(self, on: bool):
@@ -1155,15 +1205,27 @@ class MainWindow(QMainWindow):
                             "success")
 
     def _reset_mosaic(self):
+        self._cancel_rotation_measure()
         self.engine.reset_mosaic()
         self.notify("Mosaic cleared.")
 
     # ================================================================== calibration actions
+    def _reject_simulator_cal(self) -> bool:
+        if self.sim_source is not None:
+            self.notify("Simulator active: calibration is only for real cameras (disk calibrations untouched).",
+                        "warning")
+            return True
+        return False
+
     def _record(self, kind):
+        if self._reject_simulator_cal():
+            return
         self.engine.request_calibration(kind, 24)
         self.notify(f"Recording {kind} frame: keep still…")
 
     def _clear_radiometric(self):
+        if self._reject_simulator_cal():
+            return
         c = self.store.get(self.obj)
         c.darks.clear()
         c.flats.clear()
@@ -1185,6 +1247,8 @@ class MainWindow(QMainWindow):
                 self._lat_placed = True
 
     def _calibrate_lateral(self):
+        if self._reject_simulator_cal():
+            return
         if self.p_live.data is None:
             self.notify("No live image yet.", "warning")
             return
@@ -1204,6 +1268,7 @@ class MainWindow(QMainWindow):
         c.lateral_um_per_px_full = full
         c.lateral_source = f"stage micrometer: {val:g} µm over {px:.1f} px"
         c.lateral_date = today()
+        c.lateral_magnification = self.obj.magnification
         self.store.touch(self.obj)
         self.store.save()
         self._refresh_checklist()
@@ -1211,8 +1276,11 @@ class MainWindow(QMainWindow):
         self.notify(f"Lateral scale {full:.4f} µm/px at 1920 px ({full / nominal:.2f}× the nominal value).", "success")
 
     def _clear_lateral(self):
+        if self._reject_simulator_cal():
+            return
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = None
+        c.lateral_magnification = None
         self.store.touch(self.obj)
         self.store.save()
         self._refresh_checklist()
@@ -1299,9 +1367,11 @@ class MainWindow(QMainWindow):
         self.notify(f"Z of the selected result set: {z_status_text(new)}.", "success")
 
     def _calibrate_z_ruler(self):
+        if self._reject_simulator_cal():
+            return
         r = self.result
         est = r.get("dof_ruler_um_per_frame") if r else None
-        if not est:
+        if not est or r.get("z_status") == CalStatus.SIMULATED.value:
             self.notify("Needs a hand sweep reconstructed in focus-frame units first.", "warning")
             return
         c = self.store.get(r["objective"])  # the objective the sweep was made with
@@ -1316,6 +1386,8 @@ class MainWindow(QMainWindow):
                     "new sweeps use it and are labelled ESTIMATED.", "warning")
 
     def _clear_z(self):
+        if self._reject_simulator_cal():
+            return
         c = self.store.get(self.obj)
         c.z_um_per_frame = None
         self.store.touch(self.obj)
@@ -1388,6 +1460,7 @@ class MainWindow(QMainWindow):
         return ""
 
     def _tick(self):
+        self._refresh_readback()
         s = self.engine.snapshot()
         if s.preview is None:
             return
@@ -1472,18 +1545,21 @@ class MainWindow(QMainWindow):
                 self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
             self._refresh_checklist()
         self._cal_was = cp
-        if self.tabs.currentIndex() == 1:
-            self._draw_camera_box(s, um_prev)
         if s.mosaic_version != self.last_mosaic_version and self.tabs.currentIndex() == 1:
             self.last_mosaic_version = s.mosaic_version
             (img, origin, d), parts, nkf, npatch = self.engine.mosaic_image()
-            if nkf <= 1 and self.loaded_mosaic is not None:  # nothing mapped yet: show the opened session's mosaic
-                (img, origin, d), parts = self.loaded_mosaic
+            showing_loaded = nkf <= 1 and self.loaded_mosaic is not None
+            if showing_loaded:  # nothing mapped yet: show the opened session's mosaic
+                (img, origin, d), parts, um_loaded = self.loaded_mosaic
+                m_um = um_loaded or um_prev
+            else:
+                m_um = um_prev
+            self.mosaic_um = m_um
             self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
             if mode == 2 and parts:
                 key, hz, horig, n = parts[0]
-                self.p_mosaic.set_image(hz, um_prev, unit=self._key_unit(key))
+                self.p_mosaic.set_image(hz, m_um, unit=self._key_unit(key))
                 self.p_mosaic.set_overlay(None)
                 self.mosaic_origin = horig
                 self.lbl_hlegend.setText(self._legend(parts, hz))
@@ -1491,12 +1567,18 @@ class MainWindow(QMainWindow):
                 valid = np.isfinite(img).astype(np.uint8)
                 g = np.clip(np.nan_to_num(img, nan=0.0), 0, 255).astype(np.uint8)
                 rgba = np.dstack([g, g, g, valid * 255])  # empty = transparent; at most ~1600 px: cheap to repaint
-                self.p_mosaic.set_image(rgba, um_prev * d, rgb=True)
+                self.p_mosaic.set_image(rgba, m_um * d, rgb=True)
                 self.mosaic_origin = origin
-                self._draw_height_overlay(parts if mode == 1 else [], origin, um_prev)
-            span = (img.shape[1] * d * um_prev, img.shape[0] * d * um_prev)
+                self._draw_height_overlay(parts if mode == 1 else [], origin, m_um)
+            span = (img.shape[1] * d * m_um, img.shape[0] * d * m_um)
             self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · {span[0]:.0f} × {span[1]:.0f} µm"
                                     + (f" · shown at 1/{d}" if d > 1 else ""))
+        if self.tabs.currentIndex() == 1:
+            showing_loaded = self.loaded_mosaic is not None and self.engine.mosaic_image()[2] <= 1
+            if showing_loaded:
+                self.cam_box.hide()
+            else:
+                self._draw_camera_box(s, um_prev)
         if s.seq % 20 == 0:
             self._refresh_checklist()
             if self.diag.isVisible() and self.result is None:
@@ -1552,7 +1634,8 @@ class MainWindow(QMainWindow):
         if p and self._confirm_export(p, f"stitched height mosaic ({n} map(s), group '{key}')", self._key_unit(key),
                                       "median-filled in the .gsf; the mask file records them"):
             try:
-                export.export_height(p, "gsf", hz, self.um_preview, "um" if key.startswith("um") else "frames",
+                export.export_height(p, "gsf", hz, getattr(self, "mosaic_um", getattr(self, "um_preview", 1.0)),
+                                     "um" if key.startswith("um") else "frames",
                                      {"kind": "height mosaic", "group": key, "maps": n, "origin_px": list(origin)},
                                      "MicroTopos height mosaic")
                 self.notify(f"Saved {p} (+ mask and provenance)", "success")
@@ -1584,7 +1667,7 @@ class MainWindow(QMainWindow):
             pct = s.sweep_completeness
             txt = (f"<b>Focus sweep in progress</b> — keep turning slowly <i>past</i> sharp until the image is blurry "
                    f"again, then stop.  {s.sweep_frames} frames · {pct:.0%} of the field has gone sharp and blurry again"
-                   + (" (enough)" if pct >= 0.5 else " (needs 50%)"))
+                   + (" (enough)" if pct >= MIN_COMPLETENESS else f" (needs {MIN_COMPLETENESS:.0%})"))
         elif s.state == State.OBJECTIVE_CHANGE:
             txt = "<b>The view changed abruptly</b> — if you turned the nosepiece, pick the objective in the banner."
         elif s.state == State.PAN and s.shift_px > 0.18 * self.engine.sm.analysis_width and not s.mosaic_lost:
@@ -1633,9 +1716,13 @@ class MainWindow(QMainWindow):
             self._reconstruct(cap, force=True)
 
     def _lam_s(self, obj) -> float | None:
-        """λs from the spin box; None (the optical default) when it still shows that objective's default."""
+        """λs from the spin box; 0.0 when explicitly set to off, None when at the objective's optical default."""
         v = self.sp_ls.value()
-        return None if v == 0 or abs(v - round(obj.lateral_cutoff_um, 2)) < 1e-9 else v
+        if v == 0:
+            return 0.0
+        if not getattr(self, "_ls_user_set", False):
+            return None
+        return None if abs(v - round(obj.lateral_cutoff_um, 2)) < 1e-9 else v
 
     def _start_job(self, job: Job, on_done, main: bool = False) -> bool:
         """Start a job the window owns. main=True: the reconstruction slot (one at a time)."""
@@ -1655,7 +1742,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _reconstruct(self, cap: SweepCapture, force: bool = False):
-        if cap.completeness < 0.5 and self.engine.sm.override != Override.Z and not force:
+        if not cap.usable and self.engine.sm.override != Override.Z and not force:
             # a quick refocus, or refocusing right after a successful sweep: not a failed attempt, stay quiet
             if len(cap.frames) < 45 or time.perf_counter() - self._result_t < 15.0:
                 return
@@ -1694,12 +1781,17 @@ class MainWindow(QMainWindow):
             self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
 
     def _on_progress(self, job, f, msg):
+        if job is not self.job and self.job is not None and self.job.isRunning():
+            return
         self.prog.setValue(int(f * 1000))
         self.lbl_job.setText(f"{job.label}: {msg}")
 
     def _on_failed(self, job, msg):
         if job is self.job:
             self.btn_cancel.setEnabled(False)
+        if job is not self.job and self.job is not None and self.job.isRunning():
+            self.notify(f"{job.label}: {msg}", "warning")
+            return
         self.prog.setValue(0)
         self.lbl_job.setText(f"{job.label}: {msg}")
         self.notify(f"{job.label}: {msg}", "warning")
@@ -1826,10 +1918,11 @@ class MainWindow(QMainWindow):
     def _on_sr(self, r):
         self.sr_result = r
         self.sr_count = getattr(self, "sr_count", 0) + 1
-        self.prog.setValue(1000)
-        self.lbl_job.setText(f"Super-resolution (2× linear, 4× pixels): {r['frames_used']} frames used, "
-                             f"{r['frames_rejected']} rejected, {r['subpixel_bins']} sub-pixel phases, "
-                             f"RL {r['rl_iterations']} iterations, PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
+        if self.job is None or not self.job.isRunning():
+            self.prog.setValue(1000)
+            self.lbl_job.setText(f"Super-resolution (2× linear, 4× pixels): {r['frames_used']} frames used, "
+                                 f"{r['frames_rejected']} rejected, {r['subpixel_bins']} sub-pixel phases, "
+                                 f"RL {r['rl_iterations']} iterations, PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
         self.cmb_edf.setCurrentIndex(1)
         self.tabs.setCurrentIndex(2)
         self._show_result()
@@ -2193,7 +2286,9 @@ class MainWindow(QMainWindow):
                 extra.update(height_mosaic=parts[0][1], height_mosaic_origin=list(parts[0][2]),
                              height_mosaic_key=parts[0][0])
         elif self.loaded_mosaic is not None:  # re-saving an opened session keeps its mosaic
-            (limg, lorig, _d), lparts = self.loaded_mosaic
+            (limg, lorig, _d), lparts, lum = self.loaded_mosaic
+            if lum is not None:
+                extra["um_preview"] = lum
             extra.update(mosaic_image=limg, mosaic_origin=list(lorig))
             if lparts:
                 extra.update(height_mosaic=lparts[0][1], height_mosaic_origin=list(lparts[0][2]),
@@ -2233,7 +2328,12 @@ class MainWindow(QMainWindow):
                 if isinstance(r.get("height_mosaic"), np.ndarray):
                     parts = [(r.get("height_mosaic_key", "um" if units.is_um(r.get("z_unit")) else "frames#loaded"),
                               r["height_mosaic"], tuple(r["height_mosaic_origin"]), 1)]
-                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts)
+                um_loaded = r.get("um_preview")
+                if not (isinstance(um_loaded, (int, float)) and np.isfinite(um_loaded) and um_loaded > 0):
+                    um_loaded = None
+                    if has and isinstance(r.get("preview_shape"), (list, tuple)) and len(r["preview_shape"]) == 2 and r["preview_shape"][1]:
+                        um_loaded = float(r["um_per_px"]) * float(r["height"].shape[1]) / float(r["preview_shape"][1])
+                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
                 self.last_mosaic_version = -1
             if has:
                 r.setdefault("result_id", uuid.uuid4().hex[:12])

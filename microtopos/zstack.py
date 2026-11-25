@@ -322,20 +322,41 @@ def rescale_heights(result: dict, factor: float, new_unit: str, settings: ZSetti
     for k in HEIGHT_ARRAYS:
         if isinstance(result.get(k), np.ndarray):
             out[k] = (result[k] * factor).astype(np.float32)
-    out["z_values"] = [v * factor for v in result.get("z_values", [])]
+    z_vals = [v * factor for v in result.get("z_values", [])]
+    if factor < 0:
+        z_vals.reverse()
+        if isinstance(result.get("frame_indices"), list):
+            out["frame_indices"] = list(reversed(result["frame_indices"]))
+        if isinstance(result.get("sample_positions"), list):
+            out["sample_positions"] = list(reversed(result["sample_positions"]))
+    out["z_values"] = z_vals
     if "z_first" in result:  # keep z ascending, as reconstruct returns it
         a, b = result["z_first"] * factor, result["z_last"] * factor
         out["z_first"], out["z_last"] = min(a, b), max(a, b)
+    if isinstance(result.get("fwhm_z"), (int, float)) and np.isfinite(result["fwhm_z"]):
+        out["fwhm_z"] = float(result["fwhm_z"]) * abs(factor)
+    rep_cleared = any(k in out for k in ("sigma_inst", "repeat_offset", "repeat_overlap", "sigma_inst_lt_Sq_over_10"))
+    for k in ("sigma_inst", "repeat_offset", "repeat_overlap", "sigma_inst_lt_Sq_over_10"):
+        out.pop(k, None)
     out["z_unit"] = units.canon(new_unit)
     st = settings or ZSettings()
     from .objectives import resolve_result
+    lam_s = result.get("lambda_s_requested_um")
+    if lam_s is None:
+        if any("No S-filter: the default" in n for n in result.get("filter_notes", [])):
+            lam_s = None
+        else:
+            lam_s = result.get("lambda_s_um")
+    lam_c = result.get("lambda_c_requested_um", result.get("lambda_c_um", 0.0))
     m = metrology.analyze(out["height"], out["edf_proc"], out["um_per_px"], out["z_unit"],
                           resolve_result(out).lateral_cutoff_um, out.get("form_order", st.form_order),
-                          out.get("lambda_s_um"), out.get("lambda_c_um", 0.0))
+                          lam_s, lam_c)
     for k in metrology.PARAMETER_KEYS:
         out.pop(k, None)
     metro_warn = m.pop("warnings")
     out.update(m)
+    extra_warn = (["Repeatability cleared: Z scale of this sweep was changed after comparison."]
+                  if rep_cleared else [])
     out["warnings"] = [w for w in result.get("warnings", []) if not metrology.is_metrology_warning(w)
-                       and "Sweep direction unknown" not in w] + metro_warn
+                       and "Sweep direction unknown" not in w] + extra_warn + metro_warn
     return out

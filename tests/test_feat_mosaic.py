@@ -752,7 +752,7 @@ def test_every_call_site_gives_the_same_scale_for_the_same_camera_mode(monkeypat
 
 # ------------------------------------------------------------------------------------------- GUI session load
 
-pg = pytest.importorskip("pyqtgraph")
+import pyqtgraph as pg
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QApplication, QFileDialog
 

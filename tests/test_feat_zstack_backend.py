@@ -518,8 +518,8 @@ def test_memory_guard_refuses_a_job_that_cannot_fit_even_in_strips(monkeypatch):
     assert zstack.reconstruct(frames, zs, OBJ, 1.0, "um")["n_strips"] == 1
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows memory query (ctypes GlobalMemoryStatusEx)")
-def test_windows_available_memory_matches_the_os_report():
+@pytest.mark.characterization("only the skip mechanism changed (conftest fixture instead of skipif); the memory query it checks is unchanged")
+def test_windows_available_memory_matches_the_os_report(windows_memory_query):
     import subprocess
 
     def os_free_bytes() -> int:
@@ -988,7 +988,6 @@ def _run_policy_pytest(tmp_path, test_src: str, **env):
     import os
     import pathlib
     import subprocess
-    import sys
 
     (tmp_path / "conftest.py").write_text((pathlib.Path(__file__).parent / "conftest.py").read_text(encoding="utf-8"),
                                           encoding="utf-8")
@@ -1030,6 +1029,32 @@ def test_require_opencl_skips_or_fails_per_environment(tmp_path, monkeypatch):
     assert "1 skipped" in strict, strict  # the one allowed reason stays a skip even in strict mode
 
 
+@pytest.mark.characterization("tests tests/conftest.py, which tests_bite cannot swap for the base's; fails with the wasxfail guard removed (mutation run in the PR)")
+def test_strict_skips_do_not_judge_an_expected_failure_as_a_skip(tmp_path):
+    """pytest reports an xfail as 'skipped'; its reason is not a capability, and strict=True already polices it."""
+    src = ("import pytest\n"
+           "@pytest.mark.xfail(strict=True, reason='known defect')\ndef test_known():\n    assert 0\n"
+           "@pytest.mark.xfail(strict=True, reason='fixed since')\ndef test_fixed():\n    assert 1\n")
+    out = _run_policy_pytest(tmp_path, src, MICROTOPOS_STRICT_SKIPS="1")
+    assert "1 xfailed" in out, out  # the known defect stays an expected failure, not a policy failure
+    assert "1 failed" in out and "XPASS(strict)" in out, out  # a defect that got fixed still turns the build red
+    assert "not an absent capability" not in out, out
+
+
+@pytest.mark.characterization("tests the new conftest fixtures, which tests_bite cannot swap for the base's; exercises the fixtures directly")
+def test_capability_fixtures_skip_with_allowed_reasons_even_in_strict_mode(tmp_path):
+    src = ("import conftest\nimport pytest\n"
+           "def test_x(monkeypatch, request):\n"
+           "    monkeypatch.setattr(conftest.shutil, 'which', lambda *a, **k: None)\n"
+           "    request.getfixturevalue('xvfb_and_window_manager')\n"
+           "def test_w(monkeypatch, request):\n"
+           "    monkeypatch.setattr(conftest.sys, 'platform', 'linux')\n"
+           "    request.getfixturevalue('windows_memory_query')\n")
+    out = _run_policy_pytest(tmp_path, src, MICROTOPOS_STRICT_SKIPS="1")
+    assert "2 skipped" in out and "failed" not in out, out
+    assert "needs Xvfb and a window manager" in out and "Windows memory query" in out, out
+
+
 # ---------------------------------------------------------------- colour all-in-focus is reachable from the GUI
 
 @pytest.fixture
@@ -1037,7 +1062,7 @@ def gui_window(tmp_path_factory):
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    pg = pytest.importorskip("pyqtgraph")
+    import pyqtgraph as pg
     from PySide6.QtCore import QStandardPaths
     from PySide6.QtWidgets import QApplication
 

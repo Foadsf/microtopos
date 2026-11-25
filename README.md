@@ -254,3 +254,7 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
   normalised, so a uint16 frame holding 257 times the values of a uint8 frame scores 257 times higher in amplitude.
 - OpenCV 5.0's `phaseCorrelate` modifies its inputs when given a window; all calls go through a wrapper that
   avoids this (`registration.phase_shift`).
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) first; it applies to people and AI agents alike. In short: every new or changed test must fail on the base branch (`tools/tests_bite.py`, run by CI on every pull request) or carry `@pytest.mark.characterization("reason")`; tests may not skip themselves, and CI turns any skip whose reason is not an absent capability into a failure; documentation must say only what the code does, and what was verified only against a simulator must say so.

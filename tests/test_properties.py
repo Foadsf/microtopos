@@ -25,6 +25,7 @@ def test_brenner_same_image_any_storage_dtype(seed):
     assert brenner(img.astype(np.uint16) * 257) == pytest.approx(ref * 257.0**2, rel=1e-5)
 
 
+@pytest.mark.characterization("float input: the scaling law already held on main; only integer input wrapped")
 @pytest.mark.parametrize("seed", SEEDS)
 def test_brenner_energy_scales_with_gain_squared(seed):
     gain = (0.25, 0.5, 2.0, 4.0)[seed % 4]
@@ -32,6 +33,7 @@ def test_brenner_energy_scales_with_gain_squared(seed):
     assert brenner(base * gain) == pytest.approx(brenner(base) * gain**2, rel=1e-5)
 
 
+@pytest.mark.characterization("compares two inputs that wrap identically on main, so it holds there; the exact-value tests are the ones that bite")
 @pytest.mark.parametrize("seed", SEEDS)
 def test_brenner_and_tiles_ignore_a_dc_offset(seed):
     img = _u8(seed, hi=200)

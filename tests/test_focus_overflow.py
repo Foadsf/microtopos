@@ -44,6 +44,7 @@ def test_tile_scores_exact_uint8_vs_float():
     np.testing.assert_allclose(tile_scores(u8, 2), tile_scores(u8.astype(np.float64), 2), rtol=1e-5)
 
 
+@pytest.mark.characterization("focus_map already converted to float32 before differencing; brenner and tile_scores did not")
 @pytest.mark.parametrize("measure", MEASURES)
 def test_focus_map_dtype_invariant(measure):
     rng = np.random.default_rng(5)

@@ -247,5 +247,10 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
 - A lateral calibration covers capture modes with the aspect ratio it was measured at; another aspect ratio gets no
   guessed scale and needs its own calibration. Calibrations saved without a recorded frame size (older files) are
   scaled by image width for every mode, as before.
+- Mosaic keyframes are placed on whole pixels, so a keyframe sits up to half a pixel from its tracked position
+  (0.25, 0.5 and 0.25 px at fractions 0.25, 0.5 and 0.75, measured on a blob). Sub-pixel resampling would soften the
+  tiles and has to keep the un-splat used by the graph relaxation exact; it is not done.
+- Focus measures convert integer frames to float before differencing; the intensity scale is preserved, not
+  normalised, so a uint16 frame holding 257 times the values of a uint8 frame scores 257 times higher in amplitude.
 - OpenCV 5.0's `phaseCorrelate` modifies its inputs when given a window; all calls go through a wrapper that
   avoids this (`registration.phase_shift`).

@@ -9,6 +9,7 @@ import io
 import json
 import math
 import os
+import threading
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -718,9 +719,12 @@ def test_every_call_site_gives_the_same_scale_for_the_same_camera_mode(monkeypat
     seen = []
     orig = ObjectiveCalibration.lateral_for
 
+    me = threading.get_ident()
+
     def spy(self, frame_width, frame_height=None, objective=None):
         out = orig(self, frame_width, frame_height, objective)
-        seen.append((frame_width, frame_height, out))
+        if threading.get_ident() == me:  # the patch is class-wide: another window's engine thread also calls it
+            seen.append((frame_width, frame_height, out))
         return out
 
     monkeypatch.setattr(ObjectiveCalibration, "lateral_for", spy)
@@ -746,14 +750,13 @@ def test_every_call_site_gives_the_same_scale_for_the_same_camera_mode(monkeypat
 # ------------------------------------------------------------------------------------------- GUI session load
 
 pg = pytest.importorskip("pyqtgraph")
-from PySide6.QtCore import QSettings, QStandardPaths
+from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 
 @pytest.fixture(scope="module")
 def qapp(tmp_path_factory):
     QStandardPaths.setTestModeEnabled(True)
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(imageAxisOrder="row-major")
     yield app

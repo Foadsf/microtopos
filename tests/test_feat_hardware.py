@@ -15,7 +15,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QStandardPaths
+from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QApplication
 
 from microtopos import objectives, zstack
@@ -696,8 +696,11 @@ def _count_imdecode(monkeypatch) -> list[int]:
     calls: list[int] = []
     real = cv2.imdecode
 
+    me = threading.get_ident()
+
     def counting(buf, flags):
-        calls.append(flags)
+        if threading.get_ident() == me:  # a simulator thread of another window also decodes (its JPEG noise)
+            calls.append(flags)
         return real(buf, flags)
 
     monkeypatch.setattr(cv2, "imdecode", counting)
@@ -1047,9 +1050,10 @@ def _reference_height(sim, h):
 def _check_height_matches_relief(h, sim):
     g, hh = _reference_height(sim, h)
     ok = np.isfinite(hh)
-    # Valid-pixel coverage depends on how many frames the live thread happened to capture per Z (observed 0.35-0.70
-    # over repeated runs); r and slope below are the acceptance criteria, this floor only keeps them meaningful.
-    assert ok.mean() > 0.2
+    # A stage that dwells at each position delivers several frames per z. They used to leave 8-30 % valid pixels (the
+    # run-to-run spread was blamed on timing and the floor lowered to 0.2); zstack.reconstruct now keeps one frame per
+    # position and the GUI sweep gives 0.93 every time. r and slope below are the accuracy criteria.
+    assert ok.mean() > 0.8, f"valid pixels {ok.mean():.2f}"
     r = float(np.corrcoef(g[ok], hh[ok])[0, 1])
     slope = float(np.polyfit(g[ok], hh[ok], 1)[0])
     assert r >= 0.95, f"Pearson r {r:.3f}"
@@ -1134,7 +1138,6 @@ def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
 @pytest.fixture(scope="module")
 def qapp(tmp_path_factory):
     QStandardPaths.setTestModeEnabled(True)
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
     app = QApplication.instance() or QApplication([])
     yield app
 

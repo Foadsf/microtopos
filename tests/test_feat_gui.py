@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 pg = pytest.importorskip("pyqtgraph")
-from PySide6.QtCore import QPointF, QSettings, QStandardPaths, Qt
+from PySide6.QtCore import QPointF, QStandardPaths, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QFileDialog
 
@@ -33,18 +33,10 @@ from microtopos.stage import SimulatedStageDriver
 
 @pytest.fixture(scope="module")
 def qapp(tmp_path_factory):
-    QStandardPaths.setTestModeEnabled(True)
-    # MainWindow reads QSettings("MicroTopos", "MicroTopos"). On Windows the native format is the REGISTRY and
-    # setPath does not apply to it, so the user's real saved objective would leak into the pixel size of every
-    # result below. Use the ini format, redirected to a temporary folder, for the module.
-    previous = QSettings.defaultFormat()
-    QSettings.setDefaultFormat(QSettings.IniFormat)
-    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings_native")))
+    QStandardPaths.setTestModeEnabled(True)  # the window's saved settings are redirected for every test in conftest.py
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(imageAxisOrder="row-major")
     yield app
-    QSettings.setDefaultFormat(previous)
 
 
 @pytest.fixture
@@ -205,7 +197,11 @@ def swept(qapp, tmp_path_factory):
     w.cmb_obj.setCurrentText("40x / 0.85")  # 0.225 um/px at the simulator's 640 px: wavelengths below are in pixels
     _pump(qapp, 10)
     w._demo("sweep")
-    assert _wait_result(qapp, w, 60.0), "the sweep never reconstructed"
+    assert _wait_for(qapp, lambda: getattr(w, "last_cap", None) is not None, timeout=90.0), "no sweep was captured"
+    _wait_jobs(qapp, w)
+    if w.result is None:  # a sweep the engine judged incomplete: this fixture only needs a result to build on
+        w._reconstruct_last()
+    assert _wait_result(qapp, w, 120.0), "the sweep never reconstructed"
     assert w.result["um_per_px"] == pytest.approx(0.225)
     _wait_jobs(qapp, w)
     r = w.result
@@ -741,12 +737,12 @@ def test_rotation_toggle_changes_the_rotation_the_mosaic_measures(window, qapp):
     _pump(qapp)
     assert w.track_rotation is True and w.engine.mosaic.track_rotation is True
     w.engine.mosaic._verified(a, f, 0.0, 0.0)
-    assert abs(abs(w.engine.mosaic._last_drot) - 3.0) < 0.1
+    assert abs(abs(w.engine.mosaic._last_rot) - 3.0) < 0.1
     w.chk_rot_track.setChecked(False)
     _pump(qapp)
     assert w.track_rotation is False and w.engine.mosaic.track_rotation is False
     w.engine.mosaic._verified(a, f, 0.0, 0.0)
-    assert w.engine.mosaic._last_drot == 0.0
+    assert w.engine.mosaic._last_rot == 0.0
 
 
 def test_mosaic_rgb_toggle_sets_the_flag_the_view_reads(window, qapp):

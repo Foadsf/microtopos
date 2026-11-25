@@ -518,6 +518,7 @@ def test_memory_guard_refuses_a_job_that_cannot_fit_even_in_strips(monkeypatch):
     assert zstack.reconstruct(frames, zs, OBJ, 1.0, "um")["n_strips"] == 1
 
 
+@pytest.mark.characterization("only the skip mechanism changed (conftest fixture instead of skipif); the memory query it checks is unchanged")
 def test_windows_available_memory_matches_the_os_report(windows_memory_query):
     import subprocess
 
@@ -1028,6 +1029,7 @@ def test_require_opencl_skips_or_fails_per_environment(tmp_path, monkeypatch):
     assert "1 skipped" in strict, strict  # the one allowed reason stays a skip even in strict mode
 
 
+@pytest.mark.characterization("tests tests/conftest.py, which tests_bite cannot swap for the base's; fails with the wasxfail guard removed (mutation run in the PR)")
 def test_strict_skips_do_not_judge_an_expected_failure_as_a_skip(tmp_path):
     """pytest reports an xfail as 'skipped'; its reason is not a capability, and strict=True already polices it."""
     src = ("import pytest\n"
@@ -1039,6 +1041,7 @@ def test_strict_skips_do_not_judge_an_expected_failure_as_a_skip(tmp_path):
     assert "not an absent capability" not in out, out
 
 
+@pytest.mark.characterization("tests the new conftest fixtures, which tests_bite cannot swap for the base's; exercises the fixtures directly")
 def test_capability_fixtures_skip_with_allowed_reasons_even_in_strict_mode(tmp_path):
     src = ("import conftest\nimport pytest\n"
            "def test_x(monkeypatch, request):\n"

@@ -122,3 +122,26 @@ def pytest_make_collect_report(collector):
     outcome = yield
     _strict_outcome(outcome.get_result(), "collection")
 
+
+
+def pytest_sessionfinish(session, exitstatus):  # DIAGNOSTIC (scratch branch only): who is still alive at exit?
+    import gc
+    import threading
+
+    out = sys.__stderr__
+    frames = sys._current_frames()
+    print("\n[thread-census] python threads at session end:", file=out)
+    for t in threading.enumerate():
+        print(f"[thread-census]   {t.name!r} daemon={t.daemon} alive={t.is_alive()} ident={t.ident}", file=out)
+        import traceback
+        fr = frames.get(t.ident)
+        if fr is not None and t is not threading.main_thread():
+            print("".join("[thread-census]       " + ln for ln in traceback.format_stack(fr)[-4:]), file=out)
+    try:
+        from PySide6.QtCore import QThread
+
+        qts = [o for o in gc.get_objects() if isinstance(o, QThread)]
+        print(f"[thread-census] QThread objects: {len(qts)}; running: {[o for o in qts if o.isRunning()]}", file=out)
+    except Exception as e:  # diagnostic only
+        print(f"[thread-census] QThread census failed: {e!r}", file=out)
+    out.flush()

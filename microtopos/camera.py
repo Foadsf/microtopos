@@ -21,7 +21,8 @@ import cv2
 import numpy as np
 
 from .optics import Objective
-from .simulator import FrameTruth, SpecimenSimulator
+from .simulator import SpecimenSimulator
+from .stage import StageError, StageReadout
 
 SUPPORTED_RESOLUTIONS = (
     "1920x1080",
@@ -65,6 +66,12 @@ def list_cameras() -> list[CameraInfo]:
 
 
 def _v4l2_is_capture(dev: str) -> bool:
+    """Whether `dev` lists at least one capture pixel format (metadata-only nodes list none).
+
+    Both layouts of `v4l2-ctl --list-formats` are accepted: current v4l-utils print `[0]: 'MJPG' ...`, older ones
+    print `Index : 0 / Type : Video Capture / Pixel Format: 'MJPG'`. The second form was added in 59a96f2 so such
+    systems do not show an empty camera list; checked against sample outputs only, NOT hardware-verified here.
+    """
     if shutil.which("v4l2-ctl"):
         try:
             out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
@@ -138,6 +145,11 @@ class FrameSource:
         FrameSource._ids += 1
         self.source_id = f"{type(self).__name__}-{FrameSource._ids}"
 
+    @property
+    def consumed_seq(self) -> int:
+        """Sequence number of the last frame the consumer reported as processed."""
+        return self._consumed
+
     def consumed(self, seq: int) -> None:
         """Called by the consumer after processing frame `seq` (back-pressure for lossless replay)."""
         self._consumed = max(self._consumed, seq)
@@ -153,14 +165,20 @@ class FrameSource:
             self._thread.join(timeout=2)
 
     def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1):
-        """Publish a frame. If a hardware StageDriver is attached and truth is None, tag with live stage pose."""
+        """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
+        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps.
+
+        When a StageDriver is attached (`stage_driver`) and the source supplies no truth of its own, the frame is
+        labelled with the stage's pose read now (`StageReadout`, z in um). A stage that fails or is
+        disconnected leaves the frame unlabelled: a missing label, never a made-up one.
+        """
         if truth is None and self.stage_driver is not None:
             try:
                 p = self.stage_driver.pose()
                 if p.connected:
-                    truth = FrameTruth(p.x_um, p.y_um, p.z_um, (0.0, 0.0), 1.0)
-            except Exception:  # noqa: S110, BLE001 - stage read failures must not interrupt frame publishing
-                pass
+                    truth = StageReadout(p.x_um, p.y_um, p.z_um)
+            except (StageError, OSError):
+                pass  # no label for this frame; the driver reports its failure to whoever commands it
         with self._lock:
             self._seq += max(1, int(step))
             self._frame = (frame, time.perf_counter() if ts is None else ts, self._seq, truth)
@@ -176,21 +194,28 @@ class FrameSource:
 class CameraSource(FrameSource):
     """UVC / DirectShow / AVFoundation / loopback camera."""
 
-    def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25,
-                 high_bit_depth: bool = False):
+    def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25):
         super().__init__()
         self.info = info
         self.req = (width, height, fps)
-        self.high_bit_depth = high_bit_depth
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
+        # _ctrl_lock guards only the request (_want, _apply_pending) and the result (applied, applied_seq).
+        # It is never held while talking to the device: v4l2-ctl can take seconds, and the GUI thread asks here.
         self._ctrl_lock = threading.Lock()
-        self.applied: dict = {}
+        self._want: tuple[int | None, bool] | None = None
+        self._apply_pending = False
+        self.applied: dict = {}  # what the device reported after the last time the controls were applied
+        self.applied_seq = 0  # incremented every time `applied` is replaced (the GUI refreshes its readback on it)
 
     def open(self) -> cv2.VideoCapture:
         if sys.platform.startswith("linux"):
             api = cv2.CAP_V4L2
         elif sys.platform == "win32":
+            # DirectShow rather than OpenCV's default (MSMF) on Windows: the manual-exposure fallback in
+            # _apply_controls writes CAP_PROP_EXPOSURE as log2(seconds), the DirectShow convention, and falls back
+            # to CAP_ANY just below if the device cannot be opened that way. Introduced in 59a96f2 without a
+            # recorded measurement; NOT hardware-verified here (no camera was attached when this was reviewed).
             api = cv2.CAP_DSHOW
         elif sys.platform == "darwin":
             api = cv2.CAP_AVFOUNDATION
@@ -201,10 +226,7 @@ class CameraSource(FrameSource):
             cap = cv2.VideoCapture(self.info.index, cv2.CAP_ANY)
         if not cap.isOpened():
             raise RuntimeError(f"cannot open camera {self.info.name}")
-        if self.high_bit_depth:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"Y16 "))
-        else:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.req[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req[1])
         cap.set(cv2.CAP_PROP_FPS, self.req[2])
@@ -227,19 +249,35 @@ class CameraSource(FrameSource):
     def set_manual_exposure(self, exposure: int | None, sharpness_off: bool = True) -> dict:
         """exposure in the device's units (UVC: 100 us). None = automatic exposure.
 
-        If the capture thread is already running, defer hardware application to the capture thread
-        so `v4l2-ctl` / OpenCV properties are never called concurrently from two threads.
-        """
+        Remembered and re-applied by the capture thread after the first frame and after every reconnect,
+        because many UVC drivers reset or ignore controls set before streaming starts.
+
+        While streaming this only records the request and returns at once: the capture thread applies it with
+        the next frame, then replaces `applied` and increments `applied_seq`. The value returned in that case is
+        the PREVIOUS device report; read `applied` after `applied_seq` has changed for the new one."""
         with self._ctrl_lock:
             self._want = (exposure, sharpness_off)
             self._apply_pending = True
-        if not self._running:
-            self.applied = self._apply_controls()
-        return dict(self.applied)
+            if self._running:
+                return dict(self.applied)
+        return self._apply_now()
 
-    def _apply_controls(self, cap=None) -> dict:
+    def _apply_now(self, cap=None) -> dict:
+        """Apply the latest request to the device and publish what it reports. The lock is not held during I/O;
+        a request that arrives meanwhile leaves `_apply_pending` set and is applied on the next call."""
         with self._ctrl_lock:
-            want = getattr(self, "_want", None)
+            self._apply_pending = False
+            want = self._want
+        try:
+            applied = self._apply_controls(cap, want)
+        except Exception as e:  # noqa: BLE001 - a missing control must not stop the stream
+            applied = {"error": str(e)}
+        with self._ctrl_lock:
+            self.applied = applied
+            self.applied_seq += 1
+        return dict(applied)
+
+    def _apply_controls(self, cap=None, want: tuple[int | None, bool] | None = None) -> dict:
         if want is None:
             return {}
         exposure, sharpness_off = want
@@ -272,7 +310,9 @@ class CameraSource(FrameSource):
                 v = math.log2(max(exposure, 1) * 1e-4) if sys.platform == "win32" else float(exposure)
                 cap.set(cv2.CAP_PROP_EXPOSURE, v)
                 cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-                cap.set(cv2.CAP_PROP_GAIN, 0)
+                # Gain is deliberately left to the device: 59a96f2 forced CAP_PROP_GAIN=0 here, which silently darkens
+                # the image on cameras whose gain 0 is not "unity" and is not reported in the read-back. The V4L2 path
+                # only switches automatic gain off (it keeps the current value); this path cannot do even that.
             if sharpness_off:
                 cap.set(cv2.CAP_PROP_SHARPNESS, 0)
             got["exposure"] = round(float(cap.get(cv2.CAP_PROP_EXPOSURE)), 3)
@@ -285,7 +325,7 @@ class CameraSource(FrameSource):
         not empty. MJPEG bytes are saved as they came; decoded frames (no raw mode) as lossless PNG."""
         from .recording import RecordingWriter
 
-        self.rec_writer = RecordingWriter(folder, self.info.name, dict(self.readback), dict(getattr(self, "applied", {})))
+        self.rec_writer = RecordingWriter(folder, self.info.name, dict(self.readback), dict(self.applied))
         self.rec_dir = self.rec_writer.folder
         self.rec_t0 = time.perf_counter()
         self.rec_error = None
@@ -312,8 +352,7 @@ class CameraSource(FrameSource):
         except RuntimeError as e:
             self.error = str(e)
             return
-        if not self.high_bit_depth:
-            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here
         self.recording = False
         self.rec_writer = None
         t0, n, n_total = time.perf_counter(), 0, 0
@@ -327,8 +366,7 @@ class CameraSource(FrameSource):
                     time.sleep(1.0)
                     try:
                         cap = self.open()
-                        if not self.high_bit_depth:
-                            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+                        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
                         n_total = 0  # re-apply exposure and sharpness on the reopened device
                     except RuntimeError:
                         pass
@@ -337,16 +375,12 @@ class CameraSource(FrameSource):
                 continue
             last_ok = time.perf_counter()
             self.error = None
-            if getattr(self, "_apply_pending", False) or n_total == 0:
-                self._apply_pending = False
-                try:
-                    self.applied = self._apply_controls(cap)
-                except Exception as e:  # a missing control must not stop the stream  # noqa: BLE001
-                    self.applied = {"error": str(e)}
+            if self._apply_pending or n_total == 0:
+                self._apply_now(cap)
             n_total += 1
-            if raw.ndim == 3 or raw.dtype == np.uint16:
+            if raw.ndim == 3:
                 frame = raw
-                self.readback["delivery"] = "16-bit raw" if raw.dtype == np.uint16 else "decoded by the backend"
+                self.readback["delivery"] = "decoded by the backend"
             else:
                 frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
                 if frame is None:
@@ -416,6 +450,14 @@ class SimulatorSource(FrameSource):
             self.script = [p(z) for z in approach] + [p(zs[0])] * 6 + [p(z) for z in zs] + [p(zs[-1])] * 25 \
                 + [p(z) for z in back]
 
+    def relief_range_um(self) -> tuple[float, float]:
+        """Focus heights (um) that bracket the visible relief by 3 DOF each side: a stage Z sweep over this
+        range passes every pixel through focus (the same bracket as `SpecimenSimulator.sweep_trajectory`)."""
+        with self.lock:
+            _, hz = self.sim.truth_patch()
+            dof = self.sim.objective.dof_um
+        return float(hz.min()) - 3 * dof, float(hz.max()) + 3 * dof
+
     def busy(self) -> bool:
         return bool(self.script)
 
@@ -463,16 +505,29 @@ class ReplaySource(FrameSource):
         self.position = 0
         self._seek_target: int | None = None
         self._ctrl_lock = threading.Lock()
+        self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
 
     @property
     def total_frames(self) -> int:
         return len(self.files)
 
+    @property
+    def transport_supported(self) -> bool:
+        """False in exhaustive (lossless) mode: the consumer paces that playback, so pause, seek, step and speed
+        have no meaning and are refused (RuntimeError) instead of being silently ignored."""
+        return not self.exhaustive
+
+    def _need_transport(self, what: str) -> None:
+        if self.exhaustive:
+            raise RuntimeError(f"{what} is not available in exhaustive replay mode (the consumer paces the playback)")
+
     def pause(self) -> None:
+        self._need_transport("pause")
         with self._ctrl_lock:
             self.paused = True
 
     def resume(self) -> None:
+        self._need_transport("resume")
         with self._ctrl_lock:
             self.paused = False
             if self.done:
@@ -488,19 +543,24 @@ class ReplaySource(FrameSource):
 
     def seek(self, index: int) -> None:
         """Jump to frame `index` (0 .. total_frames - 1) and publish it immediately."""
+        self._need_transport("seek")
         with self._ctrl_lock:
             self._seek_target = int(np.clip(index, 0, max(0, len(self.files) - 1)))
             self.done = False
 
     def step_frames(self, delta: int = 1) -> None:
-        """Pause and step by `delta` frames from the last committed position.
+        """Pause and step by `delta` frames from the last published position.
 
         The step bases on ``self.position`` (the frame the playback thread has
         actually published), never on a pending ``_seek_target``: ``resume()`` at
         EOF may leave ``_seek_target == 0`` until the thread wakes up to consume
         it, and ``pause()`` can arrive before that consumption. A step must never
-        restart from that stale target.
+        restart from that stale target. Consequently two steps issued before the
+        thread has published the first one are one step (the second is computed from
+        the same published position), and a frame the thread was already decoding when
+        the step arrived is dropped rather than shown after it.
         """
+        self._need_transport("step")
         with self._ctrl_lock:
             self.paused = True
             base = self.position
@@ -508,6 +568,9 @@ class ReplaySource(FrameSource):
             self.done = False
 
     def set_speed(self, speed: float) -> None:
+        """Playback speed multiplier. The schedule is re-anchored on the next loop pass, so the new speed applies
+        from the frame published last: no stall when slowing down, no burst of catch-up frames when speeding up."""
+        self._need_transport("speed change")
         with self._ctrl_lock:
             self.speed = max(0.05, float(speed))
 
@@ -525,6 +588,21 @@ class ReplaySource(FrameSource):
                 self.corrupt += 1
                 continue
             yield img
+
+    def _commit(self, idx: int, img, ts: float, step: int, *, seek: bool) -> bool:
+        """Publish frame `idx` unless a newer transport request arrived while it was being decoded.
+
+        The check and the publication are one step under the control lock, so a pause or a seek/step that returned
+        before this call can never be followed by a frame decoded before it (a stale frame). A dropped frame is not
+        lost: the thread comes back to it on resume, or the seek replaces it.
+        """
+        with self._ctrl_lock:
+            if self._seek_target is not None or (self.paused and not seek):
+                return False
+            self.position = idx
+            self._publish(img, ts=ts, step=step)
+            self._last_pub = (time.perf_counter(), ts)
+            return True
 
     def _run(self):
         from .recording import decode
@@ -553,36 +631,45 @@ class ReplaySource(FrameSource):
                 prev_seq = None
             return
 
-        idx = 0
+        idx = 0  # the next frame to publish
         prev_seq = None
-        t_anchor = time.perf_counter()
+        t_anchor = time.perf_counter()  # wall time that corresponds to media time ts_anchor
         ts_anchor = self.stamps[0] if self.stamps else 0.0
+        anchor_speed = self.speed
         while self._running:
             with self._ctrl_lock:
                 seek_to = self._seek_target
                 self._seek_target = None
                 paused = self.paused
                 spd = self.speed
+            if spd != anchor_speed:
+                # The schedule (t_anchor, ts_anchor) was laid out at the old speed. Re-anchor it on the frame published
+                # last, so the new speed counts from there: elapsed wall time is not re-read as media time at the new rate.
+                anchor_speed = spd
+                last = self._last_pub
+                if last is not None and idx < len(self.stamps) and self.stamps[idx] >= last[1]:
+                    t_anchor, ts_anchor = last
+                else:
+                    t_anchor = time.perf_counter()
+                    ts_anchor = self.stamps[min(idx, len(self.stamps) - 1)] if self.stamps else 0.0
             if seek_to is not None:
                 idx = seek_to
                 prev_seq = None
                 f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
                 img = decode(f)
                 if img is not None:
-                    with self._ctrl_lock:
-                        self.position = idx
-                    self._publish(img, ts=ts, step=1)
+                    if not self._commit(idx, img, ts, 1, seek=True):
+                        continue  # a newer seek or step arrived while decoding: serve that one only
                     prev_seq = rseq
                 t_anchor = time.perf_counter()
                 ts_anchor = ts
-                if not paused:
-                    idx += 1
+                idx += 1  # the shown frame is not published again on resume
                 continue
             if paused:
                 time.sleep(0.02)
                 t_anchor = time.perf_counter()
-                if 0 <= idx < len(self.stamps):
-                    ts_anchor = self.stamps[idx]
+                if 0 < idx <= len(self.stamps):
+                    ts_anchor = self.stamps[idx - 1]  # resume continues from the frame shown, one interval later
                 continue
             if idx >= len(self.files):
                 if self.loop:
@@ -607,9 +694,8 @@ class ReplaySource(FrameSource):
                 idx += 1
                 continue
             step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
-            with self._ctrl_lock:
-                self.position = idx
-            self._publish(img, ts=ts, step=step)
+            if not self._commit(idx, img, ts, step, seek=False):
+                continue  # paused or seeked while decoding: this frame is stale now
             prev_seq = rseq
             self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd
             idx += 1

@@ -1,14 +1,16 @@
-"""Optional compute backend for one stage (the DoG focus measure), with the CPU result as the reference.
+"""Optional OpenCL compute backend for the focus measures and the guided filter, with the CPU result as reference.
 
     uv run microtopos-bench [--size 960x540] [--reps 20] [--json FILE]
 
 The CPU path is the default everywhere. OpenCL (OpenCV's transparent API, cv2.UMat) is used only when asked for
-(ZSettings.backend = "opencl"), only for the DoG measure, and falls back to the CPU on any OpenCL error; the
-result records which backend actually ran. The benchmark measures CPU, OpenCL with the input already on the
-device, and OpenCL including upload and download, synchronised, after warm-up, and checks that the outputs
-agree (and that a deliberately corrupted output does not).
+(ZSettings.backend = "opencl"), only for measures that have an OpenCL implementation of the SAME measure
+(DoG band-pass, Tenengrad, SML; same kernels, window and border mode as focus.focus_map) and for the guided
+filter, and falls back to the CPU on any OpenCL error; the result records which backend actually ran.
+OpenCL is NOT claimed to be faster: on a given computer it can be slower (kernel launch and transfer costs);
+the benchmark below measures it for every offered measure, with the input already on the device and
+including upload and download, synchronised, after warm-up, and checks that each output agrees with the CPU
+reference (and that a deliberately corrupted output does not).
 """
-
 from __future__ import annotations
 
 import argparse
@@ -21,7 +23,7 @@ import numpy as np
 
 from .focus import focus_map
 
-PARITY_REL_L2 = 1e-4
+PARITY_REL_L2 = 1e-5
 
 
 def opencl_info() -> dict:
@@ -47,41 +49,51 @@ def _dog_umat(u: cv2.UMat, window: int, psf_sigma_px: float) -> cv2.UMat:
     return cv2.boxFilter(cv2.multiply(bp, bp), cv2.CV_32F, (window, window), borderType=cv2.BORDER_REFLECT)
 
 
-def _tenengrad_umat(u: cv2.UMat) -> cv2.UMat:
-    """Tenengrad focus measure: sum of squared Sobel gradients."""
+def _box_umat(u: cv2.UMat, window: int) -> cv2.UMat:
+    """Same box average as focus._box (mean over window x window, BORDER_REFLECT)."""
+    return cv2.boxFilter(u, cv2.CV_32F, (window, window), borderType=cv2.BORDER_REFLECT)
+
+
+def _tenengrad_umat(u: cv2.UMat, window: int) -> cv2.UMat:
+    """Tenengrad, as focus.focus_map: squared 3x3 Sobel gradient magnitude, box-averaged over `window`."""
     gx = cv2.Sobel(u, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(u, cv2.CV_32F, 0, 1, ksize=3)
-    return cv2.add(cv2.multiply(gx, gx), cv2.multiply(gy, gy))
+    return _box_umat(cv2.add(cv2.multiply(gx, gx), cv2.multiply(gy, gy)), window)
 
 
-def _sml_umat(u: cv2.UMat, radius: int = 1) -> cv2.UMat:
-    """SML focus measure: local standard deviation in a (2r+1) x (2r+1) box."""
-    k = (2 * radius + 1, 2 * radius + 1)
-    mean = cv2.boxFilter(u, cv2.CV_32F, k, normalize=True, borderType=cv2.BORDER_REFLECT)
-    mean2 = cv2.boxFilter(cv2.multiply(u, u), cv2.CV_32F, k, normalize=True, borderType=cv2.BORDER_REFLECT)
-    return cv2.sqrt(cv2.max(cv2.subtract(mean2, cv2.multiply(mean, mean)), 0.0))
+def _sml_umat(u: cv2.UMat, window: int) -> cv2.UMat:
+    """Sum-modified Laplacian, as focus.focus_map: |[-1 2 -1]| along x plus along y, box-averaged over `window`."""
+    k = np.array([[-1, 2, -1]], np.float32)
+    lx = cv2.absdiff(cv2.filter2D(u, cv2.CV_32F, k, borderType=cv2.BORDER_REFLECT), 0.0)
+    ly = cv2.absdiff(cv2.filter2D(u, cv2.CV_32F, k.T, borderType=cv2.BORDER_REFLECT), 0.0)
+    return _box_umat(cv2.add(lx, ly), window)
+
+
+# Measures with an OpenCL implementation that matches focus.focus_map (same kernels, window and border mode,
+# checked to rel. L2 <= 1e-5 by the tests). Any other measure runs on the CPU and is reported as "cpu".
+OPENCL_MEASURES = ("DoG band-pass", "Tenengrad", "SML")
 
 
 def focus_map_backend(img: np.ndarray, measure: str, window: int, psf_sigma_px: float,
                       backend: str = "cpu") -> tuple[np.ndarray, str]:
-    """(focus map, backend that actually ran). Anything but OpenCL, an unsupported measure, or any OpenCL
-    failure runs on the CPU. DoG, Tenengrad and SML are available on OpenCL."""
+    """(focus map, backend that actually ran). The CPU implementation (focus.focus_map) is the reference.
+    OpenCL is used only when asked for, when a device exists and the measure has an OpenCL implementation of the
+    SAME measure (OPENCL_MEASURES); otherwise, and on any OpenCL error, the CPU runs and "cpu" is returned."""
     used = "cpu"
-    if backend == "opencl" and cv2.ocl.haveOpenCL() and measure in ("DoG band-pass", "Tenengrad", "SML"):
+    if backend == "opencl" and cv2.ocl.haveOpenCL() and measure in OPENCL_MEASURES:
         try:
             cv2.ocl.setUseOpenCL(True)
             u = cv2.UMat(img.astype(np.float32, copy=False))
             if measure == "DoG band-pass":
                 out = _dog_umat(u, window, psf_sigma_px)
             elif measure == "Tenengrad":
-                out = _tenengrad_umat(u)
+                out = _tenengrad_umat(u, window)
             else:
-                out = _sml_umat(u)
+                out = _sml_umat(u, window)
             return out.get(), "opencl"
         except cv2.error:
             used = "cpu"
     return focus_map(img, measure, window, psf_sigma_px), used
-
 
 def _guided_filter_cpu(w: np.ndarray, p: np.ndarray, guide: np.ndarray, radius: int,
                        eps: float) -> np.ndarray:
@@ -181,48 +193,73 @@ def parity(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return float(np.linalg.norm(d) / max(np.linalg.norm(a[m]), 1e-30)), float(np.abs(d).max())
 
 
+def _median_ms(fn, reps: int, sync: bool = False) -> float:
+    ts = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        fn()
+        if sync:
+            cv2.ocl.finish()  # synchronise: queued work is not finished work
+        ts.append(time.perf_counter() - t0)
+    return round(1e3 * float(np.median(ts)), 3)
+
+
+def _parity_entry(ref: np.ndarray, out: np.ndarray) -> dict:
+    rel, mx = parity(ref, out)
+    bad_rel, _ = parity(ref, out * 1.01)  # negative control: a 1 % corruption must fail the parity test
+    return {"rel_l2": rel, "max_abs": mx, "ok": bool(rel <= PARITY_REL_L2),
+            "negative_control_detected": bool(bad_rel > PARITY_REL_L2)}
+
+
 def benchmark(w: int = 960, h: int = 540, reps: int = 20, window: int = 9, psf: float = 1.0, threads=(1, 4, 0)) -> dict:
+    """CPU vs OpenCL for every offered measure and the guided filter: timing and parity with the CPU reference.
+
+    res["measures"][name] = {cpu_ms (default threads), opencl_resident_ms, opencl_with_transfer_ms, parity,
+    opencl_faster_than_cpu}; res["cpu_threads_ms"] is the DoG CPU time per OpenCV thread count."""
     rng = np.random.default_rng(0)
     img = cv2.GaussianBlur(rng.uniform(0, 255, (h, w)).astype(np.float32), (0, 0), 1.2)
-    ref = focus_map(img, "DoG band-pass", window, psf)
-    res = {"size": [w, h], "reps": reps, "opencl": opencl_info(), "cpu_ms": {}, "platform": platform.platform(),
-           "opencv": cv2.__version__}
+    res = {"size": [w, h], "reps": reps, "window": window, "opencl": opencl_info(), "cpu_threads_ms": {},
+           "measures": {}, "platform": platform.platform(), "opencv": cv2.__version__}
     keep = cv2.getNumThreads()
     for t in threads:
         cv2.setNumThreads(t)
         focus_map(img, "DoG band-pass", window, psf)  # warm-up
-        ts = []
-        for _ in range(reps):
-            t0 = time.perf_counter()
-            focus_map(img, "DoG band-pass", window, psf)
-            ts.append(time.perf_counter() - t0)
-        res["cpu_ms"][str(t if t else f"default({keep})")] = round(1e3 * float(np.median(ts)), 3)
+        res["cpu_threads_ms"][str(t if t else f"default({keep})")] = _median_ms(
+            lambda: focus_map(img, "DoG band-pass", window, psf), reps)
     cv2.setNumThreads(keep)
-    if res["opencl"]["have_opencl"]:
+    have = res["opencl"]["have_opencl"]
+    if have:
         cv2.ocl.setUseOpenCL(True)
-        u = cv2.UMat(img)
-        _dog_umat(u, window, psf).get()  # warm-up: kernel compilation is a cold-start cost, reported apart
-        t0 = time.perf_counter()
-        _dog_umat(cv2.UMat(img), window, psf).get()
-        res["opencl_cold_ms"] = round(1e3 * (time.perf_counter() - t0), 3)
-        resident, total = [], []
-        for _ in range(reps):
+    fns = {"DoG band-pass": lambda u: _dog_umat(u, window, psf), "Tenengrad": lambda u: _tenengrad_umat(u, window),
+           "SML": lambda u: _sml_umat(u, window)}
+    for name in OPENCL_MEASURES:
+        ref = focus_map(img, name, window, psf)
+        ent = {"cpu_ms": _median_ms(lambda n=name: focus_map(img, n, window, psf), reps)}
+        if have:
+            u = cv2.UMat(img)
+            fns[name](u).get()  # warm-up: kernel compilation is a cold-start cost, reported apart
             t0 = time.perf_counter()
-            r = _dog_umat(u, window, psf)
-            cv2.ocl.finish()  # synchronise: queued work is not finished work
-            resident.append(time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            out = _dog_umat(cv2.UMat(img), window, psf).get()
-            total.append(time.perf_counter() - t0)
-        r.get()
-        res["opencl_resident_ms"] = round(1e3 * float(np.median(resident)), 3)
-        res["opencl_with_transfer_ms"] = round(1e3 * float(np.median(total)), 3)
-        rel, mx = parity(ref, out)
-        bad_rel, _ = parity(ref, out * 1.01)  # negative control: a 1 % corruption must fail the parity test
-        res["parity"] = {"rel_l2": rel, "max_abs": mx, "ok": rel < PARITY_REL_L2,
-                         "negative_control_detected": bad_rel >= PARITY_REL_L2}
-        best_cpu = min(res["cpu_ms"].values())
-        res["opencl_faster_than_best_cpu"] = res["opencl_with_transfer_ms"] < best_cpu
+            fns[name](cv2.UMat(img)).get()
+            ent["opencl_cold_ms"] = round(1e3 * (time.perf_counter() - t0), 3)
+            ent["opencl_resident_ms"] = _median_ms(lambda f=fns[name], u=u: f(u), reps, sync=True)
+            ent["opencl_with_transfer_ms"] = _median_ms(lambda f=fns[name]: f(cv2.UMat(img)).get(), reps)
+            out = fns[name](cv2.UMat(img)).get()
+            ent["parity"] = _parity_entry(ref, out)
+            ent["opencl_faster_than_cpu"] = bool(ent["opencl_with_transfer_ms"] < ent["cpu_ms"])
+        res["measures"][name] = ent
+    # guided filter (the depth-refinement step): inputs are numpy, so OpenCL timing includes the transfers
+    p = (50.0 * cv2.GaussianBlur(rng.normal(size=(h, w)).astype(np.float32), (0, 0), 6)).astype(np.float32)
+    p[::13, ::17] = np.nan
+    wgt = rng.uniform(0.2, 1.0, (h, w)).astype(np.float32)
+    ent = {"cpu_ms": _median_ms(lambda: _guided_filter_cpu(wgt, p, img, 4, 1e-2), reps)}
+    if have:
+        _guided_filter_umat(wgt, p, img, 4, 1e-2)
+        ent["opencl_with_transfer_ms"] = _median_ms(lambda: _guided_filter_umat(wgt, p, img, 4, 1e-2), reps)
+        ref = _guided_filter_cpu(wgt, p, img, 4, 1e-2)
+        out = _guided_filter_umat(wgt, p, img, 4, 1e-2)
+        ent["parity"] = _parity_entry(ref, out)
+        ent["opencl_faster_than_cpu"] = bool(ent["opencl_with_transfer_ms"] < ent["cpu_ms"])
+    res["measures"]["guided filter"] = ent
     return res
 
 
@@ -241,9 +278,10 @@ def main(argv=None):
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump(r, f, indent=1)
-    if "parity" in r and not (r["parity"]["ok"] and r["parity"]["negative_control_detected"]):
-        raise SystemExit("OpenCL output does not match the CPU reference")
-
+    bad = [n for n, m in r["measures"].items()
+           if "parity" in m and not (m["parity"]["ok"] and m["parity"]["negative_control_detected"])]
+    if bad:
+        raise SystemExit(f"OpenCL output does not match the CPU reference for: {', '.join(bad)}")
 
 if __name__ == "__main__":
     main()

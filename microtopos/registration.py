@@ -47,6 +47,10 @@ SNR_MIN_CORRELATION = 0.5
 # 3.6 px at 3 deg). The affine fit itself is accurate to ~0.01 deg and ~0.001 in scale on these pairs.
 MAX_ROT_DEG = 2.0
 MAX_SCALE_DEV = 0.03
+BREATHING_MAX_SIDE = 480  # the pair scale used for breathing is measured at up to this size: the 160 px default reads
+# +9..18 % high on exact 0.1..0.4 % zoom steps (area-downsampling bias), 480 px reads within 1 %
+BREATHING_MAX_TOTAL = 0.015  # largest total magnification excursion a sweep correction applies (see estimate_breathing_scales)
+BREATHING_MIN_TOTAL = 0.005  # below this total drift no correction is applied
 
 
 @dataclass
@@ -236,7 +240,8 @@ def _to_similarity(A: np.ndarray) -> tuple[np.ndarray, float, float]:
 
 
 def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, model: str = "translation",
-                  max_scale_dev: float = MAX_SCALE_DEV, max_rot_deg: float = MAX_ROT_DEG) -> PairRegistration:
+                  max_scale_dev: float = MAX_SCALE_DEV, max_rot_deg: float = MAX_ROT_DEG,
+                  deform_max_side: int = 160) -> PairRegistration:
     """Translation ("translation") or similarity ("similarity") transform between two frames.
 
     Estimated at 1/factor resolution and returned at full resolution. ok is True only for an ECC result on the
@@ -286,7 +291,7 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
             near = math.hypot(We[0, 2] - init[0, 2], We[1, 2] - init[1, 2]) < 3.0
             if near and np.isfinite(Ws).all() and float(cc_e) >= SNR_MIN_CORRELATION:
                 # last, as it costs a second (affine) ECC run: is a translation-only result valid for this pair?
-                d = deformation(th, mh, float(We[0, 2]), float(We[1, 2])) if model == "translation" else (sc, rot)
+                d = deformation(th, mh, float(We[0, 2]), float(We[1, 2]), deform_max_side) if model == "translation" else (sc, rot)
                 scale_step = float(d[0])
                 if within_envelope(d, max_scale_dev, max_rot_deg):
                     W, cc, ok, method = Ws, float(cc_e), True, "ecc"
@@ -306,13 +311,15 @@ class RegistrationCancelled(Exception):
 
 
 def estimate_breathing_scales(pairs: list[PairRegistration], ref: int,
-                              z: list[float] | None = None) -> np.ndarray:
+                              z: list[float] | None = None, notes: list[str] | None = None) -> np.ndarray:
     """Per-frame magnification scale from the consecutive pairs' scale steps, fit as a line in z.
 
     scale[k] = 1 + slope * (z[k] - z[ref]); slope is the median log-scale drift per z unit over
     registration-OK pairs with nonzero z spacing. When too few pairs are usable or the total drift is
-    negligible, unity scales are returned. The excursion is clamped to MAX_SCALE_DEV/2 so breathing
-    correction can never push a pair outside the registration envelope.
+    negligible, unity scales are returned. The total excursion over the sweep is limited to BREATHING_MAX_TOTAL
+    (1.5 %), the size the pair-wise scale fits were validated for; a larger measured drift is NOT silently
+    clamped: a message goes to `notes` (and the correction is limited to that size). Likewise a request that
+    could not be honoured (too few measurable pairs) is reported in `notes`.
     """
     n = len(pairs) + 1
     if n < 3:
@@ -326,19 +333,27 @@ def estimate_breathing_scales(pairs: list[PairRegistration], ref: int,
           & np.isfinite(steps) & (steps > 0))
     slopes = [math.log(steps[k]) / dz[k] for k in range(n - 1) if ok[k]]
     if len(slopes) < 2:
+        if notes is not None:
+            notes.append(f"Breathing correction requested but only {len(slopes)} frame pair(s) gave a usable scale "
+                         "measurement: no correction applied.")
         return np.ones(n)
     slope = float(np.median(slopes))
     span = abs(float(coord[-1] - coord[0]))
-    if abs(slope) * span <= 0.005:  # under half a percent: treat as no breathing
+    if abs(slope) * span <= BREATHING_MIN_TOTAL:  # under half a percent: treat as no breathing
         return np.ones(n)
-    cap = 0.015 / max(abs(slope) * span, 1e-12)
+    cap = BREATHING_MAX_TOTAL / max(abs(slope) * span, 1e-12)
+    if cap < 1.0 and notes is not None:
+        notes.append(f"Focus breathing of {abs(slope) * span:.1%} over the sweep exceeds the {BREATHING_MAX_TOTAL:.1%} "
+                     f"the correction is validated for: the correction was limited to {BREATHING_MAX_TOTAL:.1%}, so "
+                     f"about {abs(slope) * span - BREATHING_MAX_TOTAL:.1%} of magnification change remains "
+                     "uncorrected (lateral error at the image edges).")
     slope *= min(1.0, cap)
     return 1.0 + slope * (coord - coord[ref])
 
 
 def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int = 2, workers: int = 4,
                    progress=None, cancelled=None, correct_breathing: bool = False,
-                   z: list[float] | None = None
+                   z: list[float] | None = None, notes: list[str] | None = None
                    ) -> tuple[list[np.ndarray], list[PairRegistration]]:
     """Register a focus sweep to its reference frame.
 
@@ -348,7 +363,7 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
     instead of an invented shift; `unsupported_pairs` counts them. Allowing scale in every pair lets
     defocus-induced scale errors accumulate along the chain, so the model is translation only.
     With `correct_breathing=True` a per-frame magnification scale (focus breathing) is estimated from the
-    pairs' scale steps as a function of `z` and folded into the warps instead.
+    pairs' scale steps as a function of `z` and folded into the warps instead; `notes` collects its warnings.
     Returns warps W_k (reference coords -> frame k coords) and the pair results (pair k = frames k, k+1).
     """
     n = len(frames)
@@ -358,7 +373,8 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
     def job(k):
         if cancelled and cancelled():
             raise RegistrationCancelled()
-        res = register_pair(frames[k], frames[k + 1], factor, "translation")
+        res = register_pair(frames[k], frames[k + 1], factor, "translation",
+                            deform_max_side=BREATHING_MAX_SIDE if correct_breathing else 160)
         done[0] += 1
         if progress:
             progress(0.8 * done[0] / max(1, n - 1))
@@ -383,10 +399,9 @@ def register_sweep(frames: list[np.ndarray], ref: int | None = None, factor: int
     if correct_breathing:
         if z is None:
             raise ValueError("correct_breathing=True requires one z value per frame")
-        scale = estimate_breathing_scales(pairs, ref, z)
+        scale = estimate_breathing_scales(pairs, ref, z, notes)
     else:
-        # Focus breathing (magnification change with focus) is not corrected: both reference-based and
-        # pair-based similarity fits were biased by defocus by more than the breathing itself (see self-test).
+        # Off by default: the correction is experimental (see ZSettings.correct_breathing).
         scale = np.ones(n)
     if progress:
         progress(1.0)

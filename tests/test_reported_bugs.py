@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 
 import cv2
 import numpy as np
 import pytest
 
 from microtopos import batch, calibration, export, kinematics, live, metrology, objectives, sff, zstack
-from microtopos.camera import CameraInfo, CameraSource, FrameSource, SimulatorSource, V4L2Controls
+from microtopos.camera import CameraInfo, CameraSource, SimulatorSource, V4L2Controls
 from microtopos.mosaic import HeightPatch, Mosaic
 from microtopos.recording import RecordingError, RecordingWriter
 
@@ -154,6 +156,37 @@ def test_objectives_commit_edit_clears_readded_and_handles_reused_name(tmp_path)
     assert not any("A:" in n and "cleared" in n for n in notes3)
 
 
+def test_objectives_commit_edit_flags_legacy_unstamped_calibration_on_readd(tmp_path):
+    """A calibration file written before magnifications were recorded holds a lateral scale for 'A' with no
+    magnification. When 'A' comes back at some magnification, nothing can confirm the number belongs to it:
+    it is kept (as removal promised) but the user is told, once, that it is unverified."""
+    store = calibration.CalibrationStore(tmp_path)
+    c = store.get("A")
+    c.lateral_um_per_px_full, c.lateral_source = 0.3, "stage micrometer: 100 µm over 333.3 px"
+    assert c.lateral_magnification is None
+    old = objectives.ObjectiveSet([objectives.Objective("B", 20, 0.40)])
+    new_list = [objectives.Objective("A", 50, 0.85), objectives.Objective("B", 20, 0.40)]
+
+    new1, notes = objectives.commit_edit(tmp_path, store, old, new_list)
+    assert store.get("A").lateral_um_per_px_full == 0.3
+    assert store.get("A").lateral_magnification == 50
+    flagged = [n for n in notes if n.startswith("A:") and "predates magnification tracking" in n]
+    assert len(flagged) == 1 and "50x" in flagged[0] and "0.3 µm/px" in flagged[0]
+    assert calibration.CalibrationStore(tmp_path).get("A").lateral_magnification == 50  # persisted
+
+    # said once: the next edit of the same list is quiet, and a later magnification change clears as usual
+    new2, notes2 = objectives.commit_edit(tmp_path, store, new1, new_list)
+    assert not any("predates" in n for n in notes2)
+    new3, notes3 = objectives.commit_edit(tmp_path, store, new2,
+                                          [objectives.Objective("A", 10, 0.25), objectives.Objective("B", 20, 0.40)])
+    assert store.get("A").lateral_um_per_px_full is None and any("cleared" in n for n in notes3)
+
+    # an objective that never left the list is stamped quietly: its calibration was measured on this row
+    store.get("B").lateral_um_per_px_full = 0.15
+    _, notes4 = objectives.commit_edit(tmp_path, store, new3, new3.objectives)
+    assert store.get("B").lateral_magnification == 20 and not any(n.startswith("B:") for n in notes4)
+
+
 # ------------------------------------------------------------------------------------------------ A7 & B1 & B2
 def test_live_flush_preserves_simulated_and_manual_z_ends_immediately():
     obj = objectives.default_set().objectives[1]
@@ -192,21 +225,54 @@ def test_live_flush_preserves_simulated_and_manual_z_ends_immediately():
     assert len(caps) == 1 and caps[0].simulated is True
 
 
-def test_batch_skips_incomplete_focus_wiggles(tmp_path):
+def _half_sweep_frames():
+    """A focus movement that stops at best focus and stays there: blurry -> sharp, never blurry again.
+
+    At 640x480 the live engine detects it as a sweep, holds it as incomplete and emits it when the hold
+    times out (at 160x120 the engine never emits anything for this input, so nothing would be tested)."""
     obj = objectives.default_set().objectives[1]
-    sim = SimulatorSource(2, obj, 160, 120)
+    sim = SimulatorSource(2, obj, 640, 480)
     zs = sim.sim.sweep_trajectory(n_frames=40)
-    # Only half-sweep (no return to blurry) followed by a long dwell so it gets emitted by HOLD_FRAMES
+    for z in [float(zs[0])] * 15 + [float(v) for v in zs[:20]] + [float(zs[19])] * 70:
+        sim.sim.focus_z_um = z
+        yield sim.sim.render()[0]
+
+
+def test_engine_emits_the_half_sweep_as_unusable():
+    """Precondition of the batch test below: the incomplete capture really reaches the consumer."""
+    eng = live.LiveEngine(calibration.CalibrationStore(None), objectives.default_set().objectives[1])
+    eng.sync_callbacks = True
+    caps = []
+    eng.on_sweep = caps.append
+    for i, bgr in enumerate(_half_sweep_frames()):
+        eng.process_frame(bgr, 0.04 * i, i + 1)
+    eng.flush()
+    assert len(caps) == 1
+    assert caps[0].completeness < live.MIN_COMPLETENESS and not caps[0].manual
+    assert caps[0].usable is False
+
+
+def test_sweep_capture_usable_is_the_single_completeness_decision():
+    def cap(completeness, manual=False):
+        return live.SweepCapture([], None, (0.0, 0.0), "10x / 0.25", (4, 4), False, completeness, manual=manual)
+
+    assert live.MIN_COMPLETENESS == 0.5
+    assert cap(0.5).usable and cap(1.0).usable
+    assert not cap(0.49).usable and not cap(0.0).usable
+    assert cap(0.0, manual=True).usable  # the user marked the sweep with Space: their call
+
+
+def test_batch_skips_incomplete_focus_wiggles(tmp_path):
     w = RecordingWriter(tmp_path / "rec", "sim")
-    seq_z = [float(zs[0])] * 15 + list(zs[:20]) + [float(zs[19])] * 70
-    for i, z in enumerate(seq_z):
-        sim.sim.focus_z_um = float(z)
-        bgr, _ = sim.sim.render()
+    for i, bgr in enumerate(_half_sweep_frames()):
         w.add(_jpeg(bgr), i + 1, 0.04 * i)
     w.close()
-    res = batch.run_batch(tmp_path / "rec", tmp_path / "out", log=lambda *_: None)
+    logs = []
+    res = batch.run_batch(tmp_path / "rec", tmp_path / "out", log=logs.append)
     assert res["sweeps"] == []
     assert not (tmp_path / "out" / "sweep-01").exists()
+    ignored = [m for m in logs if "ignored incomplete focus movement" in m]
+    assert len(ignored) == 1, logs  # the capture reached the filter and the filter said why it dropped it
 
 
 # ------------------------------------------------------------------------------------------------ B7
@@ -229,26 +295,102 @@ def test_v4l2_handles_timeout_and_streaming_defers_apply(monkeypatch):
     assert called == [] and src._apply_pending is True
 
 
+class _FakeCap:
+    """The few cv2.VideoCapture methods the capture thread uses; delivers a small decoded frame every 5 ms."""
+
+    def read(self):
+        time.sleep(0.005)
+        return True, np.zeros((8, 8, 3), np.uint8)
+
+    def set(self, *a):
+        return True
+
+    def get(self, *a):
+        return 0.0
+
+    def getBackendName(self):
+        return "fake"
+
+    def release(self):
+        pass
+
+
+def _wait_for(cond, timeout=5.0):
+    t0 = time.perf_counter()
+    while not cond():
+        assert time.perf_counter() - t0 < timeout, "timed out"
+        time.sleep(0.005)
+
+
+def test_camera_control_request_never_waits_for_the_device(monkeypatch):
+    """The GUI thread asks for a new exposure while the capture thread is in the middle of a slow v4l2-ctl
+    call (each control can take up to its 3 s timeout). The request must return at once, and the capture
+    thread must go on to apply the newest value and publish the device's answer."""
+    src = CameraSource(CameraInfo(0, "cam", "/dev/video0"))
+    monkeypatch.setattr(src, "open", lambda: _FakeCap())
+    slow, entered, gate, calls = threading.Event(), threading.Event(), threading.Event(), []
+
+    def device(*_a):  # stands in for the v4l2-ctl round trips; reports the exposure it was asked to set
+        want = src._want
+        calls.append(want[0])
+        if slow.is_set():
+            entered.set()
+            gate.wait(5.0)
+        return {"exposure_time_absolute": want[0]}
+
+    monkeypatch.setattr(src, "_apply_controls", device)
+    src.set_manual_exposure(200)  # not streaming yet: applied directly
+    assert src.applied == {"exposure_time_absolute": 200}
+    src.start()
+    try:
+        _wait_for(lambda: len(calls) >= 2)  # re-applied by the capture thread with its first frame
+        slow.set()
+        src.set_manual_exposure(300)
+        _wait_for(entered.is_set)  # the capture thread is now inside the slow device call
+        t0 = time.perf_counter()
+        got = src.set_manual_exposure(400)
+        waited = time.perf_counter() - t0
+        assert waited < 0.25, f"set_manual_exposure blocked for {waited:.2f} s behind the device call"
+        assert got == {"exposure_time_absolute": 200}  # documented: the previous report while streaming
+        seq_before = src.applied_seq
+        slow.clear()
+        gate.set()
+        _wait_for(lambda: src.applied == {"exposure_time_absolute": 400})  # the newest request wins
+        assert src.applied_seq >= seq_before + 2  # one report for 300 (superseded), one for 400
+    finally:
+        gate.set()
+        src.stop()
+
+
 # ------------------------------------------------------------------------------------------------ B8
 def test_find_reversal_ignores_boundary_zero_padding_artifact():
-    # Single monotonic pass with slight non-zero energy at boundary frame 0 -> 1
-    x = np.linspace(-2.5, 2.5, 30)[:, None]
+    """A single monotonic pass that starts sharp on another layer (dust, a cover slip) and then passes through
+    the surface once. Smoothing with zero padding pulled the first sample down by a third in log energy, which
+    turned the decaying start into a second 'focus peak' at frame 1 in every tile; the midpoint between it and
+    the real peak was then returned as a turnaround, and half of the sweep was thrown away."""
+    n = 30
+    k = np.arange(n, dtype=float)[:, None]
+    x = np.linspace(-2.5, 2.5, n)[:, None]
     offsets = np.linspace(-0.6, 0.6, 36)[None, :]
-    tiles = 100.0 * np.exp(-(x - offsets) ** 2) + 20.0
-    tiles[0] = 40.0
-    tiles[1] = 25.0
+    one_pass = 100.0 * np.exp(-(x - offsets) ** 2) + 20.0
+    tiles = one_pass + 300.0 * np.exp(-k / 1.5)  # in focus on the other layer at frame 0, gone by frame ~5
     assert sff.find_reversal(tiles) is None
+
+    # positive control: a real forward-and-back sweep (the same pass, then mirrored) still has its turnaround found
+    there_and_back = np.vstack([one_pass, one_pass[::-1]])
+    t = sff.find_reversal(there_and_back)
+    assert t is not None and abs(t - (n - 0.5)) <= 1.5
 
 
 # ------------------------------------------------------------------------------------------------ GUI tests (A2, A4, B3, B5, B6, C6)
+@pytest.mark.characterization("edited only to stop redirecting QSettings by setPath (the settings-isolation fixture does it now)")
 def test_gui_fixes_offscreen(tmp_path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pg = pytest.importorskip("pyqtgraph")
-    from PySide6.QtCore import QSettings, QStandardPaths
+    from PySide6.QtCore import QStandardPaths
     from PySide6.QtWidgets import QApplication
 
     QStandardPaths.setTestModeEnabled(True)
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path / "qs"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     pg.setConfigOptions(imageAxisOrder="row-major")
@@ -288,6 +430,10 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
         )
         monkeypatch.setattr("PySide6.QtWidgets.QFileDialog.getOpenFileName", lambda *a, **k: (str(sess), ""))
         w._on_objective("4x / 0.10")
+        w.tabs.setCurrentIndex(1)
+        w._tick()
+        # cam_box is a QGraphicsRectItem: isVisible() is its own flag, independent of the window being shown
+        assert w.cam_box.isVisible()  # live mosaic: the camera box is part of the view
         w._load_session()
         w.tabs.setCurrentIndex(1)
         w._tick()
@@ -299,9 +445,7 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
         # B6: stalled camera times out one-shot auto-exposure and re-enables button
         class DummyCam(CameraSource):
             def __init__(self):
-                FrameSource.__init__(self)
-                self.applied = {}
-                self.readback = {}
+                CameraSource.__init__(self, CameraInfo(0, "dummy"))
 
             def set_manual_exposure(self, exposure, sharpness_off=True):
                 return {}
@@ -311,6 +455,16 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
 
         w.source = DummyCam()
         w.sim_source = None
+
+        # B7: "Device reports" follows what the capture thread applied, not the stale return value of the request
+        w.source.readback = {"size": "1920x1080"}
+        w._apply_exposure()
+        assert "exposure_time_absolute" not in w.lbl_readback.text()
+        w.source.applied = {"exposure_time_absolute": 123}  # the capture thread publishes the device's answer
+        w.source.applied_seq += 1
+        w._tick()
+        assert w.lbl_readback.text() == "Device reports: size=1920x1080, exposure_time_absolute=123"
+
         w._auto_exposure_once()
         assert not w.btn_autoexp_once.isEnabled()
         for _ in range(16):
@@ -321,6 +475,18 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
         w.p_height.set_image(np.ones((10, 10), np.float32), 1.0, levels=(3.0, 3.0))
         lo, hi = w.p_height.img.getLevels()
         assert hi > lo
+
+        # The coach's "(enough)" is the engine's decision (live.MIN_COMPLETENESS), not a second copy of the number
+        from types import SimpleNamespace
+
+        import microtopos.gui.main_window as mw
+
+        sweeping = SimpleNamespace(state=live.State.Z_SWEEP, sweep_completeness=0.6, sweep_frames=12)
+        w._update_guide(sweeping)
+        assert "60% of the field has gone sharp and blurry again (enough)" in w.guide.text()
+        monkeypatch.setattr(mw, "MIN_COMPLETENESS", 0.8)
+        w._update_guide(sweeping)
+        assert "(needs 80%)" in w.guide.text()
     finally:
         w.close()
         app.processEvents()

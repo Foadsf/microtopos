@@ -18,6 +18,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     tmp = tempfile.mkdtemp(prefix="microtopos-smoke-")
     os.environ["XDG_DATA_HOME"] = tmp  # never touch the user's real calibration
     os.environ["XDG_CONFIG_HOME"] = tmp
+    os.environ["MICROTOPOS_SETTINGS_DIR"] = tmp  # nor their saved window settings (the registry on Windows)
     import pyqtgraph as pg
     from PySide6.QtWidgets import QApplication
 

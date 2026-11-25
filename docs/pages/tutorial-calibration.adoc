@@ -30,7 +30,7 @@ image::step-lateral.png[Step 4: lateral scale,role=narrow]
 
 image::live-lateral.png[Step 4 open: the blue calibration line on the Live view, with a handle at each end]
 
-The chip turns green and every length, area and µm axis now uses the calibrated scale. The scale is stored for full resolution and converted automatically for the other capture size, which has the same field of view.
+The chip turns green and every length, area and µm axis now uses the calibrated scale. The scale is stored for full resolution and converted automatically for another capture size with the same aspect ratio. A mode with a different aspect ratio (for example 4:3) is not converted, because a camera cannot say whether it is a crop or a rescale of the sensor: calibrate that mode on its own.
 
 Repeat this for *every* objective. The nominal scale is the nameplate magnification divided into an assumed 3 µm sensor pixel, but neither the camera's real pixel pitch nor the magnification of any relay lens in the camera adapter is known. Even with an infinity-corrected objective and a 1× tube, the true scale can differ from the nominal one by a large factor, and only a stage micrometer measures it.
 

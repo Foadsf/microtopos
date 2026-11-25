@@ -16,6 +16,8 @@ import os
 import re
 import shutil
 import sys
+import threading
+import time
 
 import cv2
 import numpy as np
@@ -77,6 +79,40 @@ def _fresh_settings(tmp_path_factory, monkeypatch):
     """Every test starts from empty settings, so what one test's window saved (objective, exposure, layout) cannot
     change the result of another."""
     monkeypatch.setenv("MICROTOPOS_SETTINGS_DIR", str(tmp_path_factory.mktemp("settings")))
+
+
+def started_threads() -> list[threading.Thread]:
+    """Live threads started with `threading.Thread` (a source's capture thread, the live engine, a sweep consumer,
+    an executor's worker). Threads that Qt or a library created natively and Python merely noticed are a different
+    class (`_DummyThread`) and are not listed."""
+    return [t for t in threading.enumerate() if type(t) is threading.Thread and t.is_alive()]
+
+
+THREAD_GRACE_S = 10.0  # how long a thread that is stopping (a join that timed out, a sweep consumer) may take
+
+
+def threads_left_running(before: set, grace_s: float | None = None) -> list[threading.Thread]:
+    """Threads started since `before` that are still alive; a thread that is stopping gets `grace_s`."""
+    deadline = time.monotonic() + (THREAD_GRACE_S if grace_s is None else grace_s)
+    while True:
+        left = [t for t in started_threads() if t not in before]
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(0.05)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _no_thread_outlives_its_module():
+    """A thread that a test module starts and never stops is a failure of that module.
+
+    A source or engine thread is a daemon that renders with OpenCV; still running when the interpreter exits, it made
+    the process abort (exit 134 "terminate called without an active exception") on Linux after every test had passed."""
+    before = set(started_threads())
+    yield
+    left = threads_left_running(before)
+    if left:
+        pytest.fail("threads started by this module are still running (a test swapped or dropped a source without "
+                    f"stopping it): {sorted(t.name for t in left)}", pytrace=False)
 
 
 @pytest.fixture

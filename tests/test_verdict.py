@@ -45,6 +45,7 @@ def test_exception_in_check_is_a_failure():
     assert run_check(lambda s: [], 1)[0].status is Status.ERROR
 
 
+@pytest.mark.characterization("lint-only edit (explicit check=False); the exit-code behaviour was already right on main")
 @pytest.mark.parametrize("kind", ["numpy_false", "python_false", "string"])
 def test_injected_failure_exits_nonzero(kind):
     """Subprocess control: a deliberately failing row must make the CLI exit 1, and the fast check alone exit 0."""
@@ -58,6 +59,7 @@ def test_injected_failure_exits_nonzero(kind):
     assert good.returncode == 0, good.stdout[-2000:]
 
 
+@pytest.mark.characterization("lint-only edit (explicit check=False); safe_console already worked on main")
 def test_console_output_never_crashes_on_a_narrow_codepage():
     """Windows consoles use cp1252: printing σ crashed the frozen self-test before safe_console()."""
     env = {**os.environ, "PYTHONIOENCODING": "cp1252"}

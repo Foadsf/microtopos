@@ -582,6 +582,7 @@ def test_session_without_a_mosaic_graph_loads(tmp_path):
     assert r["warnings"] == ["keep me"] and np.array_equal(r["edf"], np.ones((16, 16), np.float32))
 
 
+@pytest.mark.characterization("backward compatibility: a session without a mosaic graph already round-trips on main")
 def test_session_round_trip_without_mosaic_unchanged(tmp_path):
     result = {"edf": np.zeros((16, 16), np.float32), "warnings": ["keep me"], "um_per_px": 0.25, "z_unit": "um"}
     p = tmp_path / "plain.npz"
@@ -615,6 +616,7 @@ def test_empty_mosaic_has_no_rgb_and_invalid_blending_is_rejected():
         m.set_blending("not-a-mode")
 
 
+@pytest.mark.characterization("guards main's refusal of a session with damaged metadata across the mosaic-graph change")
 def test_load_session_rejects_bad_meta(tmp_path):
     buf = io.BytesIO()
     np.savez_compressed(buf, edf=np.zeros((4, 4), np.float32))
@@ -623,6 +625,7 @@ def test_load_session_rejects_bad_meta(tmp_path):
         load_session(tmp_path / "real.npz")
 
 
+@pytest.mark.characterization("guards main's refusal of a newer session schema across the mosaic-graph change")
 def test_load_session_rejects_newer_schema(tmp_path):
     blob = json.dumps({"schema": 99, "result": {}, "settings": {}})
     buf = io.BytesIO()

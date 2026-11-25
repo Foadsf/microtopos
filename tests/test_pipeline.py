@@ -307,6 +307,7 @@ def test_report_bundle_strict_json_and_encoder_failure(tmp_path, monkeypatch):
     assert not any((tmp_path / "bad").iterdir())  # nothing half-written is left behind
 
 
+@pytest.mark.characterization("lint-only edit (unused name); the round trip it checks was already right on main")
 def test_session_round_trip_keeps_original_arrays_and_warnings(tmp_path):
     r = _result()
     export.save_session(tmp_path / "s.npz", r, {"objective": "10x / 0.25"})

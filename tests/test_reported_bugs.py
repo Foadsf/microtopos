@@ -383,6 +383,7 @@ def test_find_reversal_ignores_boundary_zero_padding_artifact():
 
 
 # ------------------------------------------------------------------------------------------------ GUI tests (A2, A4, B3, B5, B6, C6)
+@pytest.mark.characterization("edited only to stop redirecting QSettings by setPath (the settings-isolation fixture does it now)")
 def test_gui_fixes_offscreen(tmp_path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pg = pytest.importorskip("pyqtgraph")

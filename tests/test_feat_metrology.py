@@ -176,6 +176,7 @@ def test_volume_parameters_of_a_sinusoid_match_the_iso_closed_form():
         assert fp2[k] == pytest.approx(2.0 * v, rel=0.01), k
 
 
+@pytest.mark.characterization("main's functional_parameters already returns {} for a field under 100 valid pixels; pins that edge")
 def test_functional_parameters_too_few_pixels_is_empty():
     assert metrology.functional_parameters(np.zeros((10, 10), np.float32)) == {}
 

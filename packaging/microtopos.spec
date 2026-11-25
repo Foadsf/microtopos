@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hidden = collect_submodules("pyqtgraph", filter=lambda m: not m.startswith(("pyqtgraph.examples", "pyqtgraph.jupyter")))
 hidden += collect_submodules("OpenGL") + collect_submodules("skimage")
+hidden += collect_submodules("serial")  # Grbl stage driver; the platform-specific list_ports_* modules load by name
 datas = collect_data_files("pyqtgraph", excludes=["**/examples/**"]) + collect_data_files("skimage")
 
 a = Analysis(

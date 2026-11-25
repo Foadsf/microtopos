@@ -51,6 +51,16 @@ class StageReadout:
     focus_z_um: float
 
 
+def pyserial_version() -> str | None:
+    """Version of the optional `pyserial` library, or None when it is not installed (the Grbl driver is then off).
+    The release build records this in the executable's self-test report so a build without it cannot ship unnoticed."""
+    if not _HAS_PYSERIAL:
+        return None
+    import serial
+
+    return str(serial.__version__)
+
+
 def list_serial_ports() -> list[str]:
     """Available serial ports for motorised stage / focus controllers."""
     if _HAS_PYSERIAL:

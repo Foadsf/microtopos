@@ -839,9 +839,11 @@ def run(seeds=(11, 22, 33), out=print, real: str | None = None, only: str | None
         import platform
 
         from . import __version__
+        from .stage import pyserial_version
         Path(json_path).write_text(json.dumps({
             "version": __version__, "python": platform.python_version(), "numpy": np.__version__,
-            "opencv": cv2.__version__, "platform": platform.platform(), "seeds": list(seeds), "only": only,
+            "opencv": cv2.__version__, "pyserial": pyserial_version(), "platform": platform.platform(),
+            "seeds": list(seeds), "only": only,
             "summary": {"passed": s.passed, "failed": s.failed, "errors": s.errors, "info": s.info, "ok": s.ok},
             "thresholds": {k: list(v) if isinstance(v, tuple) else v for k, v in THRESH.items()},
             "results": [r.as_dict() for r in results]}, indent=1), encoding="utf-8")

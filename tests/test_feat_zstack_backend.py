@@ -727,6 +727,126 @@ def test_live_manual_z_sweep_ended_by_switching_to_another_override_is_flagged_m
     assert caps[0].manual is True
     assert caps[0].z is not None and len(caps[0].z) == 12
 
+
+def _colour_result(h: int = 12, w: int = 16) -> dict:
+    rng = np.random.default_rng(5)
+    return {"edf": rng.uniform(0, 255, (h, w)).astype(np.float32),
+            "edf_rgb": rng.integers(0, 256, (h, w, 3), dtype=np.uint8),
+            "height": rng.normal(0, 1, (h, w)), "um_per_px": 0.5, "z_unit": "um"}
+
+
+def test_the_colour_all_in_focus_image_is_saved_in_the_report_and_the_session(tmp_path):
+    """The window displayed edf_rgb but neither the report bundle nor the session file carried it."""
+    from microtopos.export import load_session, save_session, write_report_bundle
+
+    r = _colour_result()
+    names = {p.name for p in write_report_bundle(tmp_path / "rep", r, {})}
+    assert "edf_rgb.png" in names
+    back = cv2.cvtColor(cv2.imread(str(tmp_path / "rep" / "edf_rgb.png"), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    assert np.array_equal(back, r["edf_rgb"])  # PNG is lossless and the channel order is RGB on disk as in memory
+    save_session(tmp_path / "s.npz", r, {})
+    loaded, _ = load_session(tmp_path / "s.npz")
+    assert np.array_equal(loaded["edf_rgb"], r["edf_rgb"])
+    # negative control: a grey sweep has no colour file
+    grey = {k: v for k, v in r.items() if k != "edf_rgb"}
+    assert "edf_rgb.png" not in {p.name for p in write_report_bundle(tmp_path / "rep2", grey, {})}
+
+
+def test_a_session_whose_colour_image_does_not_match_its_height_map_is_refused(tmp_path):
+    from microtopos.export import load_session, save_session
+
+    r = _colour_result()
+    r["edf_rgb"] = r["edf_rgb"][:-1]
+    save_session(tmp_path / "bad.npz", r, {})
+    with pytest.raises(ValueError, match="edf_rgb has shape"):
+        load_session(tmp_path / "bad.npz")
+
+
+def _dwelling_sweep(seed: int, n_pos: int = 24, dwell: int = 4):
+    """What a motorised stage delivers: `dwell` frames (fresh noise each) at every one of `n_pos` positions."""
+    sim = SpecimenSimulator(seed, OBJ, out_w=320, out_h=240)
+    _, hz = sim.truth_patch()
+    zs = np.linspace(float(hz.min()) - 3 * OBJ.dof_um, float(hz.max()) + 3 * OBJ.dof_um, n_pos)
+    frames, z = [], []
+    for z_k in zs:
+        sim.focus_z_um = float(z_k)
+        for _ in range(dwell):
+            bgr, truth = sim.render()
+            frames.append(bgr_to_luma(bgr))
+            z.append(truth.focus_z_um)
+    return sim, frames, np.array(z)
+
+
+def test_frames_taken_while_the_stage_dwells_at_a_position_do_not_degrade_the_height_map():
+    """Several frames at one z left the peak fit with windows of one or two distinct z values: a capture that gave
+    93 % valid pixels with one frame per position gave 8-18 % with 3-5. The last (settled) frame per position is used."""
+    sim, frames, z = _dwelling_sweep(3)
+    s = ZSettings(allow_tiling=False)
+    r = zstack.reconstruct(frames, z, OBJ, sim.um_per_px, "um", settings=s)
+    last = list(range(3, len(frames), 4))
+    one = zstack.reconstruct([frames[k] for k in last], z[last], OBJ, sim.um_per_px, "um", settings=s)
+    assert float(np.isfinite(one["height"]).mean()) > 0.8  # the reference itself is a good map (so the check is fair)
+    assert r["frame_indices"] == last  # exactly the settled frame of each of the 24 positions
+    assert np.array_equal(r["height"], one["height"], equal_nan=True)  # and nothing else enters the result
+    assert any("taken while z had not changed" in w for w in r["warnings"]), r["warnings"]
+    assert not any("taken while z had not changed" in w for w in one["warnings"])  # negative control: nothing to merge
+
+
+def test_a_sweep_that_never_repeats_a_z_is_untouched_by_the_dwell_merge():
+    frames, z = _sim_sweep(3, n_frames=12)
+    r = zstack.reconstruct(frames, z, OBJ, 0.5, "um", settings=ZSettings(allow_tiling=False))
+    assert r["frame_indices"] == list(range(12)) or r["frame_indices"] == list(range(11, -1, -1))
+    assert not any("taken while z had not changed" in w for w in r["warnings"])
+
+
+def _auto_sweep_then_pan(seed: int, sweep_fraction: float):
+    """Drive the engine in Auto mode: rest in focus, sweep the focus through `sweep_fraction` of the relief bracket,
+    then move the stage at once (no pause). Returns (captures, stage x of every source frame, x at rest, log)."""
+    sim = SimulatorSource(seed, OBJ, 320, 240)
+    s = sim.sim
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.sync_callbacks = True
+    caps: list = []
+    eng.on_sweep = caps.append
+    eng.set_source(sim)
+    z_lo, z_hi = sim.relief_range_um()
+    z_focus = sim._best_focus()
+    x0, fov = s.stage_x_um, s.out_w * s.um_per_px
+    z_end = z_lo + sweep_fraction * (z_hi - z_lo)
+    path = [(x0, z_focus)] * 30  # at rest: the state machine learns its noise
+    path += [(x0, float(z)) for z in np.linspace(z_focus, z_lo, 20)]  # out of focus, as a hand would start
+    path += [(x0, float(z)) for z in np.linspace(z_lo, z_end, 50)]  # the sweep
+    path += [(x0 + 0.04 * fov * k, z_end) for k in range(1, 13)]  # then the stage moves, 4 % of the field per frame
+    xs = {}
+    for i, (x, z) in enumerate(path):
+        s.stage_x_um, s.focus_z_um = x, z
+        bgr, truth = s.render()
+        xs[i + 1] = x
+        eng.process_frame(bgr, i * 0.04, i + 1, truth=truth)
+    eng.flush()
+    return caps, xs, x0, list(eng.events)
+
+
+def test_live_a_complete_sweep_is_kept_when_the_stage_moves_right_after_it():
+    """The sweep had passed the whole field through focus when the stage moved: those frames are one view and are a
+    sweep. (They used to be discarded with 'ABORTED by motion', which also hit sweeps whose last, fully defocused
+    frames merely looked like motion.)"""
+    caps, xs, x0, log = _auto_sweep_then_pan(seed=4, sweep_fraction=1.0)
+    assert any("ABORTED by motion" in line for line in log), log[-8:]  # the scenario reached the abort branch
+    assert len(caps) == 1, log[-8:]
+    cap = caps[0]
+    assert cap.completeness >= 0.9 and cap.usable and cap.manual is False
+    assert all(xs[q] == x0 for q in cap.seqs)  # no frame taken while the stage was moving is part of the sweep
+    assert len(cap.frames) >= 50
+
+
+def test_live_an_incomplete_sweep_is_still_dropped_when_the_stage_moves():
+    """Negative control: the stage moved before the field had passed through focus, so there is no sweep to keep."""
+    caps, _xs, _x0, log = _auto_sweep_then_pan(seed=4, sweep_fraction=0.45)
+    assert any("ABORTED by motion" in line for line in log), log[-8:]
+    assert caps == []
+
+
 def test_live_request_calibration_refuses_simulator_against_disk_store(tmp_path):
     sim = SimulatorSource(6, OBJ, 120, 90)
     eng = LiveEngine(CalibrationStore(tmp_path / "cal"), OBJ)
@@ -918,13 +1038,12 @@ def gui_window(tmp_path_factory):
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pg = pytest.importorskip("pyqtgraph")
-    from PySide6.QtCore import QSettings, QStandardPaths
+    from PySide6.QtCore import QStandardPaths
     from PySide6.QtWidgets import QApplication
 
     from microtopos.gui.main_window import MainWindow
 
     QStandardPaths.setTestModeEnabled(True)
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
     app = QApplication.instance() or QApplication([])
     pg.setConfigOptions(imageAxisOrder="row-major")
     base = tmp_path_factory.mktemp("gui_data")

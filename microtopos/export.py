@@ -233,7 +233,8 @@ def _jsonable(v):
 
 
 def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> list[Path]:
-    """report.json (all scalar results + provenance), summary.csv, edf.png, confidence.png, valid_mask.png.
+    """report.json (all scalar results + provenance), summary.csv, edf.png, confidence.png, valid_mask.png, and
+    edf_rgb.png when the sweep was captured in colour.
 
     Every file is produced in a staging folder and checked first; only a complete bundle is moved into place,
     so a failed encoder or a full disk never leaves a partial bundle that looks complete.
@@ -253,6 +254,9 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
                 wr.writerow([k, "" if v is None else v])
         files["summary.csv"] = csv_buf.getvalue().encode("utf-8")
         files["edf.png"] = _png_bytes(np.clip(result["edf"], 0, 255).astype(np.uint8))
+        rgb = result.get("edf_rgb")  # colour all-in-focus, RGB uint8 (zstack.reconstruct with colour frames)
+        if isinstance(rgb, np.ndarray) and rgb.ndim == 3 and rgb.shape[2] == 3:
+            files["edf_rgb.png"] = _png_bytes(cv2.cvtColor(np.ascontiguousarray(rgb, np.uint8), cv2.COLOR_RGB2BGR))
         if isinstance(result.get("confidence"), np.ndarray):
             files["confidence.png"] = _png_bytes(np.clip(result["confidence"] * 255, 0, 255).astype(np.uint8))
         if isinstance(result.get("height"), np.ndarray):
@@ -272,8 +276,8 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
 
 
 SESSION_SCHEMA = 2
-SESSION_ARRAYS = ("edf", "edf_proc", "height", "height_raw", "sl_surface", "confidence", "support", "mosaic_image",
-                  "height_mosaic")
+SESSION_ARRAYS = ("edf", "edf_rgb", "edf_proc", "height", "height_raw", "sl_surface", "confidence", "support",
+                  "mosaic_image", "height_mosaic")
 MOSAIC_ARRAY_PREFIX = "mosaic_"
 MOSAIC_META_KEY = "mosaic_meta"
 MOSAIC_ARRAYS_KEY = "mosaic_arrays"
@@ -352,6 +356,9 @@ def load_session(path: Path | str) -> tuple[dict, dict]:
         for k in ("height_raw", "confidence", "edf_proc", "sl_surface", "support"):
             if k in result and result[k].shape != h.shape:
                 raise ValueError(f"{k} has shape {result[k].shape}, height has {h.shape}")
+        rgb = result.get("edf_rgb")
+        if rgb is not None and (rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.shape[:2] != h.shape):
+            raise ValueError(f"edf_rgb has shape {rgb.shape}, height has {h.shape}")
         um = result.get("um_per_px")
         if not isinstance(um, (int, float)) or not np.isfinite(um) or um <= 0:
             raise ValueError("missing or invalid pixel size")

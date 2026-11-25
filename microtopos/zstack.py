@@ -269,6 +269,17 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
         warnings.append(f"Focus direction reversed at frame {reversal_at}; used the longer monotonic part, the "
                         f"{part} ({len(idx)} of {n_in} frames)"
                         + ("; a stated direction refers to that pass." if z_labels is None else "."))
+    if z_labels is not None and len(idx) > 1:
+        # A motorised stage settles at each position, and frames keep arriving meanwhile: several frames share one z.
+        # The peak fit runs over consecutive samples, so a window of them spanning one or two distinct z values has no
+        # curvature to fit (a real capture went from 93 % to 8-18 % valid pixels). Keep the last, settled frame of each
+        # run of unchanged z, as the hand-sweep path does for pauses (sff.drop_pauses).
+        tol = 1e-4 * float(np.ptp(z)) if np.ptp(z) > 0 else 0.0
+        last_of_run = np.append(np.abs(np.diff(z)) > tol, True)
+        if not last_of_run.all():
+            warnings.append(f"{int((~last_of_run).sum())} of {len(idx)} frames were taken while z had not changed; "
+                            f"the last frame at each of the {int(last_of_run.sum())} positions was used.")
+            idx, z = idx[last_of_run], z[last_of_run]
     if len(idx) < 7:
         raise ValueError(f"Too few usable frames in the sweep ({len(idx)}); sweep more slowly or further.")
     if z[-1] < z[0]:

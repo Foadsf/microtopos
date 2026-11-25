@@ -18,7 +18,7 @@ def _id(c):
     return getattr(c, "__name__", "check")
 
 
-@pytest.mark.parametrize("check", [pytest.param(c, marks=pytest.mark.xfail(reason=KNOWN[_id(c)], strict=False))
+@pytest.mark.parametrize("check", [pytest.param(c, marks=pytest.mark.xfail(reason=KNOWN[_id(c)], strict=True))
                                    if _id(c) in KNOWN else c for c in CHECKS], ids=_id)
 def test_check(check):
     results = selftest.run_check(check, 11)

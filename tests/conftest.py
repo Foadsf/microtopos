@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import sys
 
 import cv2
 import numpy as np
@@ -22,8 +24,7 @@ import pytest
 # Reasons that describe an absent capability. Never add a reason that describes a wrong or diverging result.
 ALLOWED_SKIP_REASONS = (
     r"^no OpenCL device$",
-    r"needs Xvfb and a window manager",
-    r"could not import 'pyqtgraph'",  # optional GUI dependency not installed
+    r"^needs Xvfb and a window manager ",  # a test that needs a real X server and window manager (Linux only)
     r"^Windows memory query ",  # a Windows-only API test on another platform
 )
 
@@ -84,8 +85,24 @@ def opencl():
     require_opencl()
 
 
+@pytest.fixture
+def windows_memory_query():
+    """For the test of the Windows-only memory query (ctypes GlobalMemoryStatusEx)."""
+    if sys.platform != "win32":
+        pytest.skip("Windows memory query is only available on Windows")
+
+
+@pytest.fixture
+def xvfb_and_window_manager():
+    """For a test that needs a real X server and window manager: offscreen Qt maximises synchronously."""
+    if not (shutil.which("xvfb-run") and shutil.which("metacity")):
+        pytest.skip("needs Xvfb and a window manager (metacity): offscreen Qt maximises synchronously")
+
+
 def _strict_outcome(rep, what: str) -> None:
     if not (_env_on("MICROTOPOS_STRICT_SKIPS") and rep.skipped):
+        return
+    if hasattr(rep, "wasxfail"):  # pytest reports an expected failure as "skipped"; it is judged by strict=True instead
         return
     reason = rep.longrepr[2] if isinstance(rep.longrepr, tuple) else str(rep.longrepr)
     reason = re.sub(r"^Skipped: ", "", reason)

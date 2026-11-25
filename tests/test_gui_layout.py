@@ -1,7 +1,6 @@
 """Main-window layout: a stable header and a left panel that is never cut off (offscreen, isolated settings)."""
 
 import os
-import shutil
 import subprocess
 import sys
 
@@ -9,7 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-pg = pytest.importorskip("pyqtgraph")
+import pyqtgraph as pg
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QApplication
 
@@ -113,9 +112,7 @@ sys.exit(3 if not w.isMaximized() else 1 if stray else 0)
 """
 
 
-@pytest.mark.skipif(not (shutil.which("xvfb-run") and shutil.which("metacity")),
-                    reason="needs Xvfb and a window manager (metacity): offscreen Qt maximises synchronously")
-def test_reopening_a_maximised_window_leaves_no_stray_dock_separators(tmp_path):
+def test_reopening_a_maximised_window_leaves_no_stray_dock_separators(tmp_path, xvfb_and_window_manager):
     """A window saved maximised (here: on a second monitor) and reopened must have dock separators only at the dock
     edges. Restoring the dock
     layout into a window already marked maximised (but not yet shown) left separators from the unmaximised size,

@@ -13,9 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cv2
 import numpy as np
+import pyqtgraph as pg
 import pytest
-
-pg = pytest.importorskip("pyqtgraph")
 from PySide6.QtCore import QPointF, QStandardPaths, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QApplication, QFileDialog

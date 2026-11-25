@@ -41,7 +41,8 @@ line-length = 120
 testpaths = ["tests"]
 # The full generalisation matrix (tests/test_gen_*.py) is marked slow and deselected by default; the default run
 # keeps a representative subset. Run it with `pytest -m slow`, or everything with `pytest -m "slow or not slow"`.
-addopts = "-m 'not slow'"
+addopts = "-m 'not slow' --strict-markers"
+xfail_strict = true  # an expected failure that starts passing fails the run (see AGENTS.md)
 markers = [
     "slow: full generalisation matrix (several minutes); run with -m slow",
     "characterization(reason): guards behaviour that was already right before the change it arrived with, so it passes on the base branch by design; the reason says what it guards",

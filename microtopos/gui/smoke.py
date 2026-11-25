@@ -18,6 +18,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     tmp = tempfile.mkdtemp(prefix="microtopos-smoke-")
     os.environ["XDG_DATA_HOME"] = tmp  # never touch the user's real calibration
     os.environ["XDG_CONFIG_HOME"] = tmp
+    os.environ["MICROTOPOS_SETTINGS_DIR"] = tmp  # nor their saved window settings (the registry on Windows)
     import pyqtgraph as pg
     from PySide6.QtWidgets import QApplication
 
@@ -50,7 +51,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         try:
             fn()
             log.append(f"ok    {name}")
-        except Exception:
+        except Exception:  # noqa: BLE001  # smoke harness must run every demo and report failures
             errors.append(f"{name}: {traceback.format_exc()}")
             log.append(f"ERROR {name}")
 
@@ -199,7 +200,7 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         step("save+load session", lambda: export.load_session(_save(export, d, r)))
 
         def mosaic_only():
-            (img, origin), parts = w.engine.mosaic_full()
+            (img, origin), _ = w.engine.mosaic_full()
             export.save_session(d / "m.npz", None, {}, {"mosaic_image": img, "mosaic_origin": list(origin)})
             m, _ = export.load_session(d / "m.npz")
             assert "mosaic_image" in m and "height" not in m

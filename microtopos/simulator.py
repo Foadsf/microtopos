@@ -169,12 +169,12 @@ class SpecimenSimulator:
             img = alb
         mlen = math.hypot(*motion_px)
         if mlen >= 1.0:  # linear motion blur along the direction of stage travel
-            k = int(math.ceil(mlen)) | 1
+            k = math.ceil(mlen) | 1
             ker = np.zeros((k, k), np.float32)
             c = k // 2
             ux, uy = motion_px[0] / mlen, motion_px[1] / mlen
             for t in np.linspace(-mlen / 2, mlen / 2, 4 * k):
-                ker[int(round(c + t * uy)), int(round(c + t * ux))] = 1.0
+                ker[round(c + t * uy), round(c + t * ux)] = 1.0
             img = cv2.filter2D(img, -1, ker / ker.sum(), borderType=cv2.BORDER_REFLECT)
         flick = 1.0 + (float(r.normal(0, self.flicker)) if noise else 0.0)
         img = img * self.vignette * self.gain * flick + self.dark_level
@@ -184,7 +184,7 @@ class SpecimenSimulator:
         u8 = np.clip(img + 0.5, 0, 255).astype(np.uint8)
         bgr = cv2.merge([np.clip(u8 * 0.93, 0, 255).astype(np.uint8), u8, np.clip(u8 * 1.05, 0, 255).astype(np.uint8)])
         if noise:
-            ok, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+            _, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
             bgr = cv2.imdecode(enc, cv2.IMREAD_COLOR)
         return bgr, FrameTruth(self.stage_x_um, self.stage_y_um, self.focus_z_um, shift, scale)
 

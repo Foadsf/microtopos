@@ -7,7 +7,6 @@ import sys
 
 from . import __version__
 
-
 # harmless Qt warnings that otherwise flood the console (window-manager size hints, XCB/Wayland notes)
 _QT_NOISE = ("propagateSizeHints", "QXcbConnection", "Wayland does not support", "requestActivate")
 

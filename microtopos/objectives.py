@@ -81,7 +81,7 @@ def problems(objs: list[Objective]) -> list[str]:
         else:
             seen[name.casefold()] = name
         for label, v in (("magnification", o.magnification), ("NA", o.na), ("immersion n", o.immersion_n)):
-            if not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+            if not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):  # noqa: PLR0124  # v != v is the canonical NaN test
                 out.append(f"{tag}: {label} is not a finite number.")
                 break
         else:
@@ -137,7 +137,7 @@ class ObjectiveSet:
                 "objectives": [o.to_dict() for o in self.objectives]}
 
     @classmethod
-    def from_json(cls, d: dict) -> "ObjectiveSet":
+    def from_json(cls, d: dict) -> ObjectiveSet:
         if not isinstance(d, dict) or not isinstance(d.get("objectives"), list):
             raise ObjectiveError("not an objective list")
         if int(d.get("schema", 1)) > SCHEMA:

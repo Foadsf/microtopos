@@ -2,6 +2,16 @@
 
 Positions are camera positions over the sample in mosaic pixels. If phase correlation reports image content
 moving by +d, the camera moved by -d, so the new frame is placed at keyframe_position - d.
+
+In-plane rotation (track_rotation): angle_deg is the rotation of the VIEW relative to the mosaic orientation, in
+the sense of cv2.getRotationMatrix2D: positive = the content appears turned counter-clockwise on the screen
+(y down). A frame at angle_deg = a is the mosaic-oriented view warped with getRotationMatrix2D(centre, +a), so it
+is brought back into the mosaic orientation with getRotationMatrix2D(centre, -a). registration.deformation
+reports the rotation of the warp that maps the template onto the view, which is the opposite sign; the conversion
+happens in ONE place (Mosaic._verified: `_last_rot = -deformation rotation`). Keyframes are stored derotated into
+the mosaic orientation (their angle_deg records the rotation they had when captured), so a view matched against
+a keyframe measures its absolute angle; a view matched against the previous (raw, rotated) frame measures an
+increment, and its shift is turned into mosaic axes with that frame's angle.
 """
 
 from __future__ import annotations
@@ -14,8 +24,16 @@ import cv2
 import numpy as np
 
 from .focus import brenner
-from .registration import (PEAK_SEPARATION_MIN, correlation_peaks, correlation_surface, deformation, phase_shift,
-                           phase_surface, surface_peak, within_envelope)
+from .registration import (
+    PEAK_SEPARATION_MIN,
+    correlation_peaks,
+    correlation_surface,
+    deformation,
+    phase_shift,
+    phase_surface,
+    surface_peak,
+    within_envelope,
+)
 
 
 @dataclass
@@ -26,8 +44,23 @@ class Keyframe:
     sharpness: float
     bp: np.ndarray | None = None
     # keyframes that show parts of this view more sharply: (other_kf_index, grid) where grid = YIELD_GRID x
-    # YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0)
+    # YIELD_GRID tiles of this view where that keyframe is sharper (1) or not (0). Offsets are computed live
+    # from current keyframe positions in _yield_mask - never frozen/stored.
     yields: list = field(default_factory=list)
+    area: int = 0  # mosaic area this keyframe belongs to
+    angle_deg: float = 0.0  # in-plane stage angle at capture (degrees)
+    rgb: np.ndarray | None = None  # uint8 HxWx3 colour image matching image, if any
+
+
+@dataclass
+class MosaicInset:
+    """Multi-scale inset reference view."""
+
+    objective: str
+    um_per_px: float
+    x_um: float
+    y_um: float
+    image: np.ndarray
 
 
 @dataclass
@@ -48,8 +81,11 @@ class HeightPatch:
 class Mosaic:
     tile: int = 512
     tiles: dict = field(default_factory=dict)  # (tx, ty) -> [num, den]
+    tiles_low: dict = field(default_factory=dict)  # multiband low-frequency band (only when blending == "multiband")
+    tiles_rgb: dict = field(default_factory=dict)  # colour canvas, feather weights reused from tiles
     keyframes: list = field(default_factory=list)
     patches: list = field(default_factory=list)
+    insets: list = field(default_factory=list)  # multi-scale inset reference views
     x: float = 0.0
     y: float = 0.0
     lost: bool = False
@@ -58,6 +94,14 @@ class Mosaic:
     prev_xy: tuple = (0.0, 0.0)
     ref: int = 0
     areas: int = 1
+    angle_deg: float = 0.0  # current in-plane angle estimate (degrees)
+    track_rotation: bool = False  # estimate & compensate in-plane rotation while tracking
+    current_area: int = 0  # area new keyframes are added to
+    # "feather": weighted average with a sine feather. "multiband": a TWO-band blend (not a Laplacian pyramid): the
+    # image is split at Gaussian sigma 8 px; the low band is feather-weighted, the high band is weighted by
+    # feather**4 so that overlaps take fine texture mostly from the keyframe whose centre is nearest. The id
+    # "multiband" is kept for saved sessions and the GUI.
+    blending: str = "feather"
     recent_b: collections.deque = field(default_factory=lambda: collections.deque(maxlen=12))
     edges: list = field(default_factory=list)  # (i, j, dx, dy, weight): position of j minus position of i
     lost_frames: int = 0
@@ -65,17 +109,25 @@ class Mosaic:
     last_good: tuple | None = None  # (frame, band-pass, position) of the latest frame with a known position
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
     rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
+    _last_rot: float = field(default=0.0, repr=False)  # rotation (angle_deg convention) measured by the last verified match
 
-    def reset(self) -> None:
+    def reset(self, keep_insets: bool = False) -> None:
         self.tiles.clear()
+        self.tiles_low.clear()
+        self.tiles_rgb.clear()
         self.keyframes.clear()
         self.patches.clear()
+        if not keep_insets:
+            self.insets.clear()
         self.x = self.y = 0.0
         self.lost = False
         self.prev_frame = None
         self.edges.clear()
         self.ref = 0
         self.areas = 1
+        self.angle_deg = 0.0
+        self.current_area = 0
+        self._last_rot = 0.0
         self.lost_frames = 0
         self.lost_view = None
         self.velocity = None
@@ -83,6 +135,16 @@ class Mosaic:
         self.prev_bp = None
         self.recent_b.clear()
         self.rep_cache.clear()
+
+    def set_blending(self, mode: str) -> None:
+        if mode not in ("feather", "multiband"):
+            raise ValueError("blending must be 'feather' or 'multiband'")
+        if self.blending != mode:
+            self.blending = mode
+            self._rebuild_canvas()
+
+    def add_inset(self, objective: str, um_per_px: float, x_um: float, y_um: float, image: np.ndarray) -> None:
+        self.insets.append(MosaicInset(objective, um_per_px, x_um, y_um, np.asarray(image).copy()))
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -102,7 +164,7 @@ class Mosaic:
         b_bp = b_bp.astype(np.float32, copy=False)
         h, w = a_bp.shape
         hx, hy = dx / 2, dy / 2
-        ix, iy = int(math.floor(hx)), int(math.floor(hy))
+        ix, iy = math.floor(hx), math.floor(hy)
         if abs(ix) > 0.75 * w or abs(iy) > 0.75 * h:
             return -1.0
         fx, fy = hx - ix, hy - iy
@@ -139,7 +201,7 @@ class Mosaic:
         return min((math.hypot(sx, sy) for sx, sy, z in ac.candidates[1:] if z > -PEAK_SEPARATION_MIN),
                    default=math.inf)
 
-    def _match(self, a_img, a_bp, f, f_bp, win, predict=None, gate=None):
+    def _match(self, a_img, a_bp, f, f_bp, win, predict=None, gate=None, derot=True):
         """Shift of f relative to a (full preview pixels) from band-pass phase correlation, and its NCC check.
 
         A periodic view fixes the shift only modulo its repeat distance R: the NCC passes at a wrong period just as
@@ -159,6 +221,8 @@ class Mosaic:
         hit = self.rep_cache.get(id(a_bp))
         if hit is not None and hit[0] is a_bp:  # keyframes are matched against every frame: test them once
             rep = hit[1]
+        elif not derot:  # the derotated re-match of a pair (temporary arrays): do not evict the keyframes' entries
+            rep = self._repeat_distance(a32, hwin)
         else:
             rep = self._repeat_distance(a32, hwin)
             if len(self.rep_cache) >= 8:  # bounded: holds at most 8 band-pass frames
@@ -171,7 +235,7 @@ class Mosaic:
             # pattern and slides along it (measured: up to 16 px errors with ECC refinement allowed to move 8 px)
             dx, dy = surface_peak(pc)
             dx, dy = 2 * dx, 2 * dy
-            return dx, dy, self._verified(a32, f32, dx, dy, periodic)
+            return self._verified(a32, f32, dx, dy, periodic, derot)
         if periodic:
             if predict is None or gate is None:
                 dx, dy, _ = phase_shift(a32, f32, hwin)
@@ -188,8 +252,8 @@ class Mosaic:
             if not np.isfinite(W).all() or math.hypot(dx - px, dy - py) > tol:
                 return predict[0], predict[1], 0.0
             dx, dy = 2 * dx, 2 * dy
-            return dx, dy, self._verified(a32, f32, dx, dy, periodic)
-        dx, dy, r = phase_shift(a32, f32, hwin)
+            return self._verified(a32, f32, dx, dy, periodic, derot)
+        dx, dy, _ = phase_shift(a32, f32, hwin)
         # Refine with ECC (correlation coefficient): motion blur is a box kernel whose sinc spectrum flips sign,
         # which splits the phase-only correlation peak; plain correlation still peaks at the true shift.
         try:
@@ -201,10 +265,33 @@ class Mosaic:
         except cv2.error:
             pass
         dx, dy = 2 * dx, 2 * dy
-        return dx, dy, self._verified(a32, f32, dx, dy, periodic)
+        return self._verified(a32, f32, dx, dy, periodic, derot)
 
-    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float, periodic: bool = False) -> float:
-        """NCC of the overlap at the shift (full preview px), or 0 when a translation cannot describe the pair.
+    # Largest in-plane rotation between two matched views (change since the previous frame, or since the angle
+    # estimate the frame is derotated by) that the rotation estimate (affine ECC started from the translation,
+    # then a derotated re-match) recovers reliably. Measured on a textured world, 3 worlds x 3 shifts x both signs
+    # (tests/test_feat_mosaic.py::test_rotation_capture_range): <= 3 deg matched 18/18 with position error <= 0.10
+    # px and angle error <= 0.02 deg; 4-7 deg matched only 6-17 of 18 (the first translation estimate of a strongly
+    # rotated pair often locks on a false peak) and at 8 deg and beyond never. Larger rotations are reported as NOT
+    # matched (q = 0) instead of a pose that could be wrong.
+    ROT_CAPTURE_DEG = 3.5
+    ROT_MIN_DEG = 0.2  # smaller rotations are within the translation matcher's tolerance and are not corrected
+
+    @staticmethod
+    def _to_mosaic(dx: float, dy: float, angle_deg: float) -> tuple[float, float]:
+        """A shift measured in the axes of a view at angle_deg, expressed in mosaic axes (see module docstring)."""
+        c, s = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+        return c * dx - s * dy, s * dx + c * dy
+
+    def _verified(self, a32: np.ndarray, f32: np.ndarray, dx: float, dy: float, periodic: bool = False,
+                  derot: bool = True) -> tuple[float, float, float]:
+        """(dx, dy, NCC) of the overlap at the shift (full preview px); NCC is 0 when a translation cannot
+        describe the pair.
+
+        With track_rotation the measured rotation is removed and the pair matched again: the shift of the
+        derotated pair is the exact shift of the view centre (the translation of the rotated pair is biased by
+        the rotation) and replaces the first one. The rotation, in the angle_deg convention, is left in
+        self._last_rot; a rotation beyond ROT_CAPTURE_DEG gives q = 0 (not matched).
 
         Under a rotation the NCC stays high enough to pass the gates (3 deg: NCC 0.59-0.69; on main 73/96 such
         pairs were tracked with up to 2.2 px error, 26/96 loop-closed), so a match that could be accepted also gets
@@ -215,9 +302,28 @@ class Mosaic:
         the affine one is unconstrained along the stripes (see registration.deformation), and its scale is not
         checked."""
         q = self._ncc(a32, f32, dx, dy)
-        if q >= self.WEAK_NCC and not within_envelope(deformation(a32, f32, dx / 2, dy / 2, rotation_only=periodic)):
-            return 0.0
-        return q
+        self._last_rot = 0.0
+        derotated = False
+        if self.track_rotation and derot:
+            d = deformation(a32, f32, dx / 2, dy / 2, rotation_only=True)
+            if d is not None and abs(d[1]) > self.ROT_MIN_DEG:
+                if abs(d[1]) > self.ROT_CAPTURE_DEG:
+                    return dx, dy, 0.0
+                h, w = f32.shape
+                M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0), float(d[1]), 1.0)
+                f_derot = cv2.warpAffine(f32, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                dx2, dy2, q2 = self._match(a32, a32, f_derot, f_derot, None, derot=False)
+                if q2 > q:
+                    dx, dy, q = dx2, dy2, q2
+                    self._last_rot = -float(d[1])  # the one sign conversion (module docstring)
+                    derotated = True
+        if (
+            q >= self.WEAK_NCC
+            and not derotated
+            and not within_envelope(deformation(a32, f32, dx / 2, dy / 2, rotation_only=periodic))
+        ):
+            return dx, dy, 0.0
+        return dx, dy, q
 
     def _accept(self, dx, dy, q, base_xy, h, w) -> bool:
         """Strong matches are accepted; weaker ones (motion blur) only if they agree with the constant-velocity
@@ -234,18 +340,21 @@ class Mosaic:
     WEAK_NCC = 0.25  # accepted only when consistent with the predicted motion
     LOOP_NCC = 0.65
 
-    def track(self, frame: np.ndarray) -> tuple[bool, float]:
+    def track(self, frame: np.ndarray, rgb: np.ndarray | None = None) -> tuple[bool, float]:
         """Update the camera position; add a keyframe when it has moved far enough over steady, sharp views.
 
         Returns (added_keyframe, match quality). Positions come from the current reference keyframe when it
         still overlaps, else from the previous frame (dead reckoning); every match must pass the NCC check.
+        `rgb`, when given, is the colour image matching `frame` and is stored with the new keyframe and
+        blended into the colour canvas when blending is active.
         """
         f = frame.astype(np.float32)
         fb = self._bp(f)
         b = brenner(f)
         h, w = f.shape
+        rgb_u8 = np.clip(rgb + 0.5, 0, 255).astype(np.uint8) if rgb is not None else None
         if not self.keyframes:
-            self._add_keyframe(f, fb, b, self.x, self.y, None, (0.0, 0.0))
+            self._add_keyframe(f, fb, b, self.x, self.y, None, (0.0, 0.0), rgb=rgb_u8)
             self.ref = 0
             self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
             return True, 1.0
@@ -259,43 +368,55 @@ class Mosaic:
             pred = (self.prev_xy[0] + vx, self.prev_xy[1] + vy)
         expect = (lambda x0, y0: {"predict": (x0 - pred[0], y0 - pred[1]), "gate": gate}) if pred else \
             (lambda x0, y0: {})
-        dx, dy, q = self._match(kf.image, kf.bp, f, fb, win, **expect(kf.x, kf.y))
+        # keyframes are in the mosaic orientation: bring the frame to the current angle estimate first, so that the
+        # rotation to recover is the change since the last frame (ROT_CAPTURE_DEG), not the accumulated angle
+        fb_k = self._derotate(fb)
+        dx, dy, q = self._match(kf.image, kf.bp, f, fb_k, win, **expect(kf.x, kf.y))
+        rot = self.angle_deg + self._last_rot if self.track_rotation else 0.0
         old_xy = (self.x, self.y)
+        pm = None
         if self._accept(dx, dy, q, (kf.x, kf.y), h, w):
             self.x, self.y = kf.x - dx, kf.y - dy  # anchored to the reference keyframe
             rel = (-dx, -dy)
-        elif self.prev_frame is not None and self._accept(*(pm := self._match(self.prev_frame, self.prev_bp, f, fb, win,
-                                                                               **expect(*self.prev_xy))),
-                                                          self.prev_xy, h, w):
+        elif self.prev_frame is not None and self._accept(
+                *(pm := self._match_prev(f, fb, win, expect)), self.prev_xy, h, w):
             self.x, self.y = self.prev_xy[0] - pm[0], self.prev_xy[1] - pm[1]  # frame-to-frame dead reckoning
-            rel, q = None, pm[2]
+            rel, q, rot = None, pm[2], self._last_rot
         else:
             self.lost = True
             self.lost_frames += 1
             # the last frame with a KNOWN position (motion-blurred like the current one) is the best reference
             if self.last_good is not None:
-                gf, gb, gxy = self.last_good
+                gf, gb, gxy, gang = self.last_good
                 gdx, gdy, gq = self._match(gf, gb, f, fb, win)
+                if self.track_rotation:
+                    gdx, gdy = self._to_mosaic(gdx, gdy, gang)  # the last good frame is raw, at angle gang
                 if gq >= self.WEAK_NCC and math.hypot(gdx, gdy) < 0.5 * min(h, w):
                     self.x, self.y = gxy[0] - gdx, gxy[1] - gdy
+                    if self.track_rotation:
+                        self.angle_deg = gang + self._last_rot
                     self.lost, self.lost_frames, self.lost_view = False, 0, None
                     self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
                     self.velocity = None
-                    self.last_good = (f, fb, (self.x, self.y))
+                    self.last_good = (f, fb, (self.x, self.y), self.angle_deg)
                     return False, gq
             if self.lost_frames % 3 == 0 and self._relocalize(f, fb, win):
                 self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
-                self.last_good = (f, fb, (self.x, self.y))
+                self.last_good = (f, fb, (self.x, self.y), self.angle_deg)
             elif self.lost_frames >= self.NEW_AREA_AFTER and self._steady_view(f, fb, win, b):
-                self._new_area(f, fb, b)
+                self._new_area(f, fb, b, rgb_u8)
                 return True, q
             # the position of a lost frame is unknown: it must not seed dead reckoning, only the steady-view test
             self.prev_frame, self.prev_bp = None, None
             self.velocity = None
             self.lost_view = (f, fb)
             return False, q
+        if self.track_rotation:
+            # a keyframe is stored in the mosaic orientation, so matching against it measures the absolute angle;
+            # matching against the previous raw frame measures an increment
+            self.angle_deg = rot if rel is not None else self.angle_deg + rot
         self.velocity = (self.x - old_xy[0], self.y - old_xy[1])
-        self.last_good = (f, fb, (self.x, self.y))
+        self.last_good = (f, fb, (self.x, self.y), self.angle_deg)
         speed = math.hypot(self.x - self.prev_xy[0], self.y - self.prev_xy[1]) if self.prev_frame is not None else 0.0
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (self.x, self.y)
@@ -307,13 +428,30 @@ class Mosaic:
         if moved > 0.2 * min(h, w) and sharp_enough and (steady or moved > 0.45 * min(h, w)):
             # edge to the reference keyframe: measured if anchored, else implied by dead reckoning (weaker)
             rel_xy = rel if rel is not None else (self.x - kf.x, self.y - kf.y)
-            self._add_keyframe(f, fb, b, self.x, self.y, self.ref, rel_xy, weight=1.0 if rel is not None else 0.3)
+            self._add_keyframe(f, fb, b, self.x, self.y, self.ref, rel_xy,
+                               weight=1.0 if rel is not None else 0.3, rgb=rgb_u8)
             self.ref = len(self.keyframes) - 1
             self._loop_closure(win)
             return True, q
         if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe
             self.ref = self._nearest(self.x, self.y)
         return False, q
+
+    def _derotate(self, bp: np.ndarray) -> np.ndarray:
+        """A band-pass view turned back by the current angle estimate (into the mosaic orientation)."""
+        if not self.track_rotation or abs(self.angle_deg) <= self.ROT_MIN_DEG:
+            return bp
+        h, w = bp.shape
+        M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0), -self.angle_deg, 1.0)
+        return cv2.warpAffine(bp, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    def _match_prev(self, f, fb, win, expect):
+        """Match against the previous raw frame; the shift is returned in mosaic axes (the previous frame is at
+        self.angle_deg, the angle estimate not yet updated for the current frame)."""
+        dx, dy, q = self._match(self.prev_frame, self.prev_bp, f, fb, win, **expect(*self.prev_xy))
+        if self.track_rotation:
+            dx, dy = self._to_mosaic(dx, dy, self.angle_deg)
+        return dx, dy, q
 
     NEW_AREA_AFTER = 40  # lost frames (about 3 s at 12.5 fps) before starting a separate mosaic area
 
@@ -326,15 +464,18 @@ class Mosaic:
         self.recent_b.append(b)
         return q > 0.8 and math.hypot(dx, dy) < 2.0 and b >= 0.8 * float(np.median(self.recent_b))
 
-    def _new_area(self, f, fb, b) -> None:
+    def _new_area(self, f, fb, b, rgb=None) -> None:
         """Place an unconnected view to the right of everything mapped so far (its true position is unknown)."""
-        h, w = f.shape
+        w = f.shape[1]
         x = max(k.x for k in self.keyframes) + 1.3 * w
         y = min(k.y for k in self.keyframes)
-        self._add_keyframe(f, fb, b, x, y, None, (0.0, 0.0))
+        self.current_area += 1
+        self.angle_deg = 0.0  # the orientation of an unconnected view is unknown: it defines its own
+        self._add_keyframe(f, fb, b, x, y, None, (0.0, 0.0), rgb=rgb)
         self.ref = len(self.keyframes) - 1
         self.x, self.y = x, y
         self.areas += 1
+        self.current_area = self.areas - 1
         self.lost_view = None
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (x, y)
@@ -347,36 +488,51 @@ class Mosaic:
     def _relocalize(self, f, fb, win) -> bool:
         """After losing track, try the keyframes nearest the last known position (bounded work per attempt)."""
         best = None
+        fb_k = self._derotate(fb)
         for i in self._nearest(self.x, self.y, k=8):
             k = self.keyframes[i]
-            dx, dy, q = self._match(k.image, k.bp, f, fb, win)
+            dx, dy, q = self._match(k.image, k.bp, f, fb_k, win)
             if q >= self.LOOP_NCC and (best is None or q > best[0]):
-                best = (q, i, dx, dy)
+                best = (q, i, dx, dy, self.angle_deg + self._last_rot)
         if best is None:
             return False
-        _, i, dx, dy = best
+        _, i, dx, dy, rot = best
         k = self.keyframes[i]
         self.ref = i
         self.x, self.y = k.x - dx, k.y - dy
+        if self.track_rotation:  # keyframes are in the mosaic orientation: the measured rotation is absolute
+            self.angle_deg = rot
         self.lost, self.lost_frames, self.lost_view = False, 0, None
         return True
 
-    def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0):
+    def _add_keyframe(self, f, fb, b, x, y, parent, rel, weight=1.0, rgb=None):
         # 8-bit image and half-precision band-pass: ~0.35 MB per keyframe instead of ~1.2 MB
-        kf = Keyframe(x, y, np.clip(f + 0.5, 0, 255).astype(np.uint8), b, fb.astype(np.float16))
+        if self.track_rotation and abs(self.angle_deg) > 0.1:
+            # store the frame derotated into the mosaic orientation (angle_deg is the view's rotation, so the
+            # inverse rotation brings it back; module docstring) and take the matching band-pass from it
+            hh, ww = f.shape
+            M = cv2.getRotationMatrix2D(((ww - 1) / 2.0, (hh - 1) / 2.0), -self.angle_deg, 1.0)
+            f = cv2.warpAffine(f, M, (ww, hh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            fb = self._bp(f)
+            if rgb is not None:
+                rgb = cv2.warpAffine(rgb, M, (ww, hh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        u8 = np.clip(f + 0.5, 0, 255).astype(np.uint8)
+        rgb_u8 = np.clip(rgb + 0.5, 0, 255).astype(np.uint8) if rgb is not None else None
+        kf = Keyframe(x, y, u8, b, fb.astype(np.float16), area=self.current_area,
+                      angle_deg=self.angle_deg, rgb=rgb_u8)
         kf_idx = len(self.keyframes)
         kf_yields, older_yields = self._sharper_overlaps(kf)
         kf.yields = kf_yields
         self.keyframes.append(kf)
         for k_idx, grid in older_yields:
             k = self.keyframes[k_idx]
-            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k))
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
             k.yields.append((kf_idx, grid))
-            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k))
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
         if parent is not None:
             self.edges.append((parent, kf_idx, rel[0], rel[1], weight))
         # splat the STORED 8-bit image: a later correction subtracts exactly the same contribution
-        self._splat(kf.image, x, y, mask=self._yield_mask(kf))
+        self._splat(kf.image, x, y, mask=self._yield_mask(kf), rgb=kf.rgb)
 
     @staticmethod
     def _relative_sharpness(img: np.ndarray) -> float:
@@ -406,7 +562,7 @@ class Mosaic:
         kf_out, older_out = [], []
         for k_idx, k in enumerate(self.keyframes):
             kh, kw = k.image.shape
-            ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
+            ox, oy = round(k.x - kf.x), round(k.y - kf.y)
             x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
             if x1 - x0 < w / 4 or y1 - y0 < h / 4:
                 continue
@@ -451,7 +607,7 @@ class Mosaic:
         for k_idx, grid in kf.yields:
             k = self.keyframes[k_idx]
             kh, kw = k.image.shape
-            ox, oy = int(round(k.x - kf.x)), int(round(k.y - kf.y))
+            ox, oy = round(k.x - kf.x), round(k.y - kf.y)
             x0, y0, x1, y1 = max(0, ox), max(0, oy), min(w, ox + kw), min(h, oy + kh)
             if x1 > x0 and y1 > y0:
                 t = cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -469,19 +625,54 @@ class Mosaic:
         cur = self.keyframes[j]
         h, w = cur.image.shape
         linked = {e[0] for e in self.edges if e[1] == j}
+        cur_area0 = cur.area
         new = []
+        merged = False
         for i, k in enumerate(self.keyframes[:-1]):
-            if i in linked or math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
+            if i in linked:
                 continue
-            # predicted from the current estimate, within the drift this test tolerates
-            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win, predict=(k.x - cur.x, k.y - cur.y),
-                                    gate=0.1 * min(h, w))
-            if q < self.LOOP_NCC:
+            same_area = k.area == cur.area
+            if same_area and math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
                 continue
-            ex, ey = -dx, -dy  # measured position of j relative to i
-            if math.hypot(ex - (cur.x - k.x), ey - (cur.y - k.y)) > 0.1 * min(h, w):
-                continue
-            new.append((i, j, ex, ey, 1.0))
+            if same_area:
+                # predicted from the current estimate, within the drift this test tolerates
+                dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win,
+                                        predict=(k.x - cur.x, k.y - cur.y),
+                                        gate=0.1 * min(h, w))
+                if q < self.LOOP_NCC:
+                    continue
+                ex, ey = -dx, -dy  # measured position of j relative to i
+                if math.hypot(ex - (cur.x - k.x), ey - (cur.y - k.y)) > 0.1 * min(h, w):
+                    continue
+                new.append((i, j, ex, ey, 1.0))
+            else:
+                # cross-area bridge: the stage re-connected two previously disconnected areas
+                if cur.area != cur_area0 or merged:
+                    continue
+                dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
+                if q < max(self.LOOP_NCC, 0.72):
+                    continue
+                ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k)
+                shift_x = (k.x + ex) - cur.x
+                shift_y = (k.y + ey) - cur.y
+                old_area = cur.area
+                target_area = k.area
+                for kf2 in self.keyframes:
+                    if kf2.area == old_area:
+                        kf2.x += shift_x
+                        kf2.y += shift_y
+                        kf2.area = target_area
+                for p in self.patches:
+                    if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
+                        p.x = self.keyframes[p.kf].x + p.rel[0]
+                        p.y = self.keyframes[p.kf].y + p.rel[1]
+                self._shift_tracker(shift_x, shift_y)
+                self.current_area = target_area
+                merged = True
+                new.append((i, j, ex, ey, 1.0))
+        if merged:
+            self.areas = len({kf.area for kf in self.keyframes})
+            self._rebuild_canvas()
         if not new:
             return
         self.edges += new
@@ -551,13 +742,13 @@ class Mosaic:
         # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
         for idx in resplat:
             k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k))
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
         for idx in moved_kfs:
             k = self.keyframes[idx]
             k.x, k.y = float(sx[idx]), float(sy[idx])
         for idx in resplat:
             k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k))
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -571,39 +762,265 @@ class Mosaic:
                 moved = True
         if moved:
             self._solve_offsets()
-        self.x, self.y = self.x + dxc, self.y + dyc
-        self.prev_xy = (self.prev_xy[0] + dxc, self.prev_xy[1] + dyc)
+        self._shift_tracker(dxc, dyc)
+
+    def _shift_tracker(self, dx: float, dy: float) -> None:
+        """The graph moved under the camera (relaxation, or a bridge that joined two areas): move every position the
+        tracker holds by the same amount. `last_good` is the reference for re-acquiring a lost track; left behind,
+        the first frame after a loss would be placed where the graph used to be."""
+        self.x, self.y = self.x + dx, self.y + dy
+        self.prev_xy = (self.prev_xy[0] + dx, self.prev_xy[1] + dy)
+        if self.last_good is not None:
+            gf, gb, gxy, gang = self.last_good
+            self.last_good = (gf, gb, (gxy[0] + dx, gxy[1] + dy), gang)
 
     # ---------------------------------------------------------------- canvas
-    def _splat(self, img: np.ndarray, x: float, y: float, weight: float = 1.0, mask: np.ndarray | None = None) -> None:
+    def _splat(
+        self,
+        img: np.ndarray,
+        x: float,
+        y: float,
+        weight: float = 1.0,
+        mask: np.ndarray | None = None,
+        rgb: np.ndarray | None = None,
+    ) -> None:
         h, w = img.shape
-        feather = _feather(h, w) * weight
+        base_f = _feather(h, w)
         if mask is not None:
-            feather = feather * mask
-        x0, y0 = int(round(x)), int(round(y))
+            base_f = base_f * mask
+        feather = base_f * weight
+        if self.blending == "multiband":
+            img_f = img.astype(np.float32)
+            low = cv2.GaussianBlur(img_f, (0, 0), 8.0)
+            high = img_f - low
+            sharp_w = (base_f**4) * weight
+        x0, y0 = round(x), round(y)
         t = self.tile
         for ty in range(y0 // t, (y0 + h - 1) // t + 1):
             for tx in range(x0 // t, (x0 + w - 1) // t + 1):
-                num, den = self.tiles.setdefault((tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)])
                 ax0, ay0 = max(x0, tx * t), max(y0, ty * t)
                 ax1, ay1 = min(x0 + w, (tx + 1) * t), min(y0 + h, (ty + 1) * t)
                 if ax1 <= ax0 or ay1 <= ay0:
                     continue
                 src = (slice(ay0 - y0, ay1 - y0), slice(ax0 - x0, ax1 - x0))
                 dst = (slice(ay0 - ty * t, ay1 - ty * t), slice(ax0 - tx * t, ax1 - tx * t))
-                num[dst] += img[src] * feather[src]
-                den[dst] += feather[src]
+                fea = feather[src]
+                if self.blending == "multiband":
+                    num, den = self.tiles.setdefault(
+                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
+                    )
+                    low_num, sharp_den = self.tiles_low.setdefault(
+                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
+                    )
+                    num[dst] += high[src] * sharp_w[src]
+                    low_num[dst] += low[src] * fea
+                    den[dst] += fea
+                    sharp_den[dst] += sharp_w[src]
+                else:
+                    num, den = self.tiles.setdefault(
+                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
+                    )
+                    num[dst] += img[src] * fea
+                    den[dst] += fea
+                if rgb is not None and rgb.ndim == 3:
+                    rnum, rden = self.tiles_rgb.setdefault(
+                        (tx, ty), [np.zeros((t, t, 3), np.float32), np.zeros((t, t), np.float32)]
+                    )
+                    rnum[dst] += rgb[src].astype(np.float32) * fea[..., None]
+                    rden[dst] += fea
+
+    def _rebuild_canvas(self) -> None:
+        """Re-splat every keyframe into the tile canvas after the graph or blending mode changed.
+
+        The canvas is a pure function of the state: every keyframe at its pose with its yield mask, plus every
+        height patch's all-in-focus image at its pose with weight 4 (what add_height_patch splats and _relax
+        moves), so a rebuilt canvas equals the incrementally built one up to float32 summation order.
+        """
+        self.tiles.clear()
+        self.tiles_low.clear()
+        self.tiles_rgb.clear()
+        for k in self.keyframes:
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
+        for p in self.patches:
+            self._splat(p.edf, p.x, p.y, weight=4.0)
 
     def image(self) -> tuple[np.ndarray, tuple[int, int]]:
         """Assembled full-resolution mosaic (NaN where empty) and the mosaic coordinate of its top-left pixel."""
-        img, origin, _ = render_tiles(self.tiles, self.tile, 1)
+        img, origin, _ = render_tiles(
+            self.tiles, self.tile, 1, self.tiles_low if self.blending == "multiband" else None
+        )
         return img, origin
+
+    def image_rgb(self, d: int = 1) -> np.ndarray | None:
+        """Assembled full-resolution colour mosaic (RGBA uint8; alpha marks valid area), or None when no colour
+        keyframes have been added."""
+        if not self.tiles_rgb:
+            return None
+        return render_tiles_rgb(self.tiles_rgb, self.tile, d)
 
     def preview(self, max_px: int = 1600) -> tuple[np.ndarray, tuple[int, int], int]:
         """Mosaic rendered at a power-of-two reduction d so that its larger side is <= max_px (bounded memory).
 
         Returns (image, origin in full-resolution mosaic pixels, d)."""
-        return render_tiles(self.tiles, self.tile, preview_factor(self.tiles, self.tile, max_px))
+        return render_tiles(
+            self.tiles,
+            self.tile,
+            preview_factor(self.tiles, self.tile, max_px),
+            self.tiles_low if self.blending == "multiband" else None,
+        )
+
+    # ---------------------------------------------------------------- session persistence
+    def to_state_arrays(self):
+        """Serialize the full pose graph: keyframes (area, angle, rgb), edges, patches and insets."""
+        meta = {
+            "tile": self.tile,
+            "blending": self.blending,
+            "track_rotation": self.track_rotation,
+            "angle_deg": self.angle_deg,
+            "current_area": self.current_area,
+            "areas": self.areas,
+            "x": self.x,
+            "y": self.y,
+            "ref": self.ref,
+            # tracker state, so that tracking continues exactly where it stopped
+            "tracking": {
+                "prev_xy": [float(self.prev_xy[0]), float(self.prev_xy[1])],
+                "velocity": None if self.velocity is None else [float(self.velocity[0]), float(self.velocity[1])],
+                "lost": bool(self.lost),
+                "lost_frames": int(self.lost_frames),
+                "recent_b": [float(v) for v in self.recent_b],
+                "last_good_xy": None if self.last_good is None else [float(v) for v in self.last_good[2]],
+                "last_good_angle": None if self.last_good is None else float(self.last_good[3]),
+            },
+            "keyframes": [
+                {
+                    "x": k.x,
+                    "y": k.y,
+                    "sharpness": float(k.sharpness),
+                    "area": int(k.area),
+                    "angle_deg": float(k.angle_deg),
+                    "yields": [[int(i), np.asarray(g, np.float32).tolist()] for i, g in k.yields],
+                    "has_rgb": k.rgb is not None,
+                }
+                for k in self.keyframes
+            ],
+            "edges": [[int(i), int(j), float(ex), float(ey), float(wt)] for i, j, ex, ey, wt in self.edges],
+            "patches": [
+                {
+                    "x": float(p.x),
+                    "y": float(p.y),
+                    "z_unit": p.z_unit,
+                    "offset": float(p.offset),
+                    "kf": None if p.kf is None else int(p.kf),
+                    "rel": [float(p.rel[0]), float(p.rel[1])],
+                    "z_key": p.z_key,
+                    "rid": p.rid,
+                }
+                for p in self.patches
+            ],
+            "insets": [
+                {
+                    "objective": it.objective,
+                    "um_per_px": float(it.um_per_px),
+                    "x_um": float(it.x_um),
+                    "y_um": float(it.y_um),
+                }
+                for it in self.insets
+            ],
+        }
+        arrays: dict[str, np.ndarray] = {}
+        for i, k in enumerate(self.keyframes):
+            arrays[f"kf_img_{i}"] = k.image
+            if k.bp is not None:
+                arrays[f"kf_bp_{i}"] = k.bp.astype(np.float32)
+            if k.rgb is not None:
+                arrays[f"kf_rgb_{i}"] = k.rgb
+        for i, p in enumerate(self.patches):
+            arrays[f"patch_edf_{i}"] = p.edf
+            arrays[f"patch_h_{i}"] = p.height
+        for i, it in enumerate(self.insets):
+            arrays[f"inset_img_{i}"] = it.image
+        for name, v in (("prev_frame", self.prev_frame), ("prev_bp", self.prev_bp)):
+            if v is not None:
+                arrays[name] = np.asarray(v, np.float32)
+        if self.last_good is not None:
+            arrays["last_good_f"] = np.asarray(self.last_good[0], np.float32)
+            arrays["last_good_bp"] = np.asarray(self.last_good[1], np.float32)
+        if self.lost_view is not None:
+            arrays["lost_view_f"] = np.asarray(self.lost_view[0], np.float32)
+            arrays["lost_view_bp"] = np.asarray(self.lost_view[1], np.float32)
+        return meta, arrays
+
+    def load_state_arrays(self, meta: dict, arrays: dict) -> None:
+        """Restore a serialized pose graph onto this mosaic and rebuild its canvas.
+
+        All-or-nothing: the state is built on a scratch mosaic and only taken over when it is complete, so a
+        damaged state raises and leaves this mosaic (the live one) untouched. After the call the mosaic keeps
+        tracking exactly where the saved one stopped (previous frame, velocity, last good and lost views are
+        part of the state); a state saved without them (older sessions) continues from the reference keyframe.
+        """
+        new = Mosaic()
+        new._load_state(meta, arrays)
+        self.__dict__.update(new.__dict__)
+
+    def _load_state(self, meta: dict, arrays: dict) -> None:
+        self.reset()
+        self.tile = int(meta.get("tile", self.tile))
+        self.blending = str(meta.get("blending", "feather"))
+        self.track_rotation = bool(meta.get("track_rotation", False))
+        self.angle_deg = float(meta.get("angle_deg", 0.0))
+        self.current_area = int(meta.get("current_area", 0))
+        self.areas = int(meta.get("areas", 1))
+        self.x = float(meta.get("x", 0.0))
+        self.y = float(meta.get("y", 0.0))
+        n = len(meta.get("keyframes", []))
+        self.ref = min(int(meta.get("ref", 0)), n - 1) if n else 0
+        for i in range(n):
+            km = meta["keyframes"][i]
+            img = arrays[f"kf_img_{i}"]
+            bp = arrays.get(f"kf_bp_{i}")
+            if bp is not None:
+                bp = bp.astype(np.float16)
+            rgb = arrays.get(f"kf_rgb_{i}")
+            kf = Keyframe(float(km["x"]), float(km["y"]), img, float(km["sharpness"]), bp,
+                          [(int(j), np.asarray(g, np.float32)) for j, g in km.get("yields", [])],
+                          int(km.get("area", 0)), float(km.get("angle_deg", 0.0)), rgb)
+            self.keyframes.append(kf)
+        for e in meta.get("edges", []):
+            self.edges.append((int(e[0]), int(e[1]), float(e[2]), float(e[3]), float(e[4])))
+        for i, pm in enumerate(meta.get("patches", [])):
+            hgt = arrays[f"patch_h_{i}"]
+            edf = arrays[f"patch_edf_{i}"]
+            p = HeightPatch(float(pm["x"]), float(pm["y"]), edf.astype(np.float32),
+                            hgt.astype(np.float32), str(pm.get("z_unit", "um")),
+                            float(pm.get("offset", 0.0)),
+                            None if pm.get("kf") is None else int(pm["kf"]),
+                            (float(pm["rel"][0]), float(pm["rel"][1])),
+                            str(pm.get("z_key", "um")), str(pm.get("rid", "")))
+            self.patches.append(p)
+        for i, im in enumerate(meta.get("insets", [])):
+            self.insets.append(MosaicInset(str(im["objective"]), float(im["um_per_px"]),
+                                           float(im["x_um"]), float(im["y_um"]),
+                                           arrays[f"inset_img_{i}"]))
+        if self.keyframes:
+            self.prev_frame = self.keyframes[self.ref].image.astype(np.float32)
+            self.prev_bp = self.keyframes[self.ref].bp
+            self.prev_xy = (self.x, self.y)
+        tr = meta.get("tracking")
+        if tr is not None:  # state written by this version: the exact tracker state
+            self.prev_xy = (float(tr["prev_xy"][0]), float(tr["prev_xy"][1]))
+            self.velocity = None if tr["velocity"] is None else (float(tr["velocity"][0]), float(tr["velocity"][1]))
+            self.lost, self.lost_frames = bool(tr["lost"]), int(tr["lost_frames"])
+            self.recent_b.extend(float(v) for v in tr["recent_b"])
+            self.prev_frame = arrays.get("prev_frame")
+            self.prev_bp = arrays.get("prev_bp")
+            if tr["last_good_xy"] is not None:
+                self.last_good = (arrays["last_good_f"], arrays["last_good_bp"],
+                                  (float(tr["last_good_xy"][0]), float(tr["last_good_xy"][1])),
+                                  float(tr["last_good_angle"]))
+            if "lost_view_f" in arrays:
+                self.lost_view = (arrays["lost_view_f"], arrays["lost_view_bp"])
+        self._rebuild_canvas()
 
     # ---------------------------------------------------------------- 2.5D
     def add_height_patch(self, x: float, y: float, edf: np.ndarray, height: np.ndarray, z_unit: str,
@@ -646,7 +1063,7 @@ class Mosaic:
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = P[i], P[j]
-                ax, ay, bx, by = int(round(a.x)), int(round(a.y)), int(round(b.x)), int(round(b.y))
+                ax, ay, bx, by = round(a.x), round(a.y), round(b.x), round(b.y)
                 x0, y0 = max(ax, bx), max(ay, by)
                 x1 = min(ax + a.height.shape[1], bx + b.height.shape[1])
                 y1 = min(ay + a.height.shape[0], by + b.height.shape[0])
@@ -720,8 +1137,8 @@ def height_mosaic(patches: list, key: str | None = None) -> tuple[np.ndarray, tu
     P = [p for p in patches if p.z_key == key]
     if not P:
         return None
-    xs = [int(round(p.x)) for p in P]
-    ys = [int(round(p.y)) for p in P]
+    xs = [round(p.x) for p in P]
+    ys = [round(p.y) for p in P]
     X0, Y0 = min(xs), min(ys)
     W = max(x + p.height.shape[1] for x, p in zip(xs, P)) - X0
     H = max(y + p.height.shape[0] for y, p in zip(ys, P)) - Y0
@@ -774,9 +1191,13 @@ def preview_factor(tiles: dict, tile: int, max_px: int) -> int:
     return d
 
 
-def render_tiles(tiles: dict, tile: int, d: int = 1) -> tuple[np.ndarray, tuple[int, int], int]:
-    """Assemble tiles reduced by d (weighted: num and den are reduced separately). Works on a shallow copy of the
-    tile dict, so the engine can render outside its lock. Returns (image, full-resolution origin, d)."""
+def render_tiles(tiles: dict, tile: int, d: int = 1,
+                 tiles_low: dict | None = None) -> tuple[np.ndarray, tuple[int, int], int]:
+    """Assemble tiles reduced by d (weighted: num and den are reduced separately). When tiles_low is given
+    ("multiband" mode, a two-band blend), each tile's high-frequency band is divided by sharp_den and added to the
+    feathered low-frequency band; empty canvas is NaN and the result is cropped to the valid bounding box, exactly
+    as in feather mode. Works on a shallow copy of the tile dict, so the engine can render outside its lock.
+    Returns (image, full-resolution origin, d)."""
     if not tiles:
         return np.full((8, 8), np.nan, np.float32), (0, 0), d
     t = tile
@@ -790,10 +1211,41 @@ def render_tiles(tiles: dict, tile: int, d: int = 1) -> tuple[np.ndarray, tuple[
             num = cv2.resize(num, (td, td), interpolation=cv2.INTER_AREA)
             den = cv2.resize(den, (td, td), interpolation=cv2.INTER_AREA)
         sl = (slice((ty - Y0) * td, (ty - Y0 + 1) * td), slice((tx - X0) * td, (tx - X0 + 1) * td))
-        out[sl] = np.where(den > 1e-3, num / np.maximum(den, 1e-6), np.nan)
+        if tiles_low is not None:
+            low_num, sharp_den = tiles_low[(tx, ty)]
+            if d > 1:
+                low_num = cv2.resize(low_num, (td, td), interpolation=cv2.INTER_AREA)
+                sharp_den = cv2.resize(sharp_den, (td, td), interpolation=cv2.INTER_AREA)
+            # empty canvas (no feather weight) is NaN exactly as in the feather render, so that the bounding-box
+            # crop below and every consumer of the NaN mask behave identically in both modes
+            out[sl] = np.where(den > 1e-3,
+                               np.where(sharp_den > 1e-6, num / np.maximum(sharp_den, 1e-6), 0.0)
+                               + low_num / np.maximum(den, 1e-6),
+                               np.nan)
+        else:
+            out[sl] = np.where(den > 1e-3, num / np.maximum(den, 1e-6), np.nan)
     rows = np.where(np.isfinite(out).any(1))[0]
     cols = np.where(np.isfinite(out).any(0))[0]
     if rows.size == 0:
         return out, (X0 * t, Y0 * t), d
     out = out[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
     return out, (X0 * t + int(cols[0]) * d, Y0 * t + int(rows[0]) * d), d
+
+
+def render_tiles_rgb(tiles_rgb: dict, tile: int, d: int = 1) -> np.ndarray | None:
+    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d."""
+    if not tiles_rgb:
+        return None
+    td = tile // d
+    txs = [k[0] for k in tiles_rgb]
+    tys = [k[1] for k in tiles_rgb]
+    X0, Y0 = min(txs), min(tys)
+    out = np.full(((max(tys) - Y0 + 1) * td, (max(txs) - X0 + 1) * td, 4), np.nan, np.float32)
+    for (tx, ty), (num, den) in tiles_rgb.items():
+        if d > 1:
+            num = cv2.resize(num, (td, td), interpolation=cv2.INTER_AREA)
+            den = cv2.resize(den, (td, td), interpolation=cv2.INTER_AREA)
+        sl = (slice((ty - Y0) * td, (ty - Y0 + 1) * td), slice((tx - X0) * td, (tx - X0 + 1) * td))
+        out[sl][..., :3] = np.clip(np.where(den[..., None] > 1e-3, num / np.maximum(den[..., None], 1e-6), np.nan), 0, 255)
+        out[sl][..., 3] = np.where(den > 1e-3, 255.0, 0.0)
+    return np.clip(np.nan_to_num(out, nan=0.0), 0, 255).astype(np.uint8)

@@ -3,6 +3,7 @@ all-in-focus fusion and the experimental depth-of-field ruler."""
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 
 import cv2
@@ -18,7 +19,7 @@ def monotonic_segments_from_z(z: np.ndarray, min_len: int = 5) -> list[tuple[int
         if dz[i] == 0:
             dz[i] = dz[i - 1]
     cuts = [0] + [i + 1 for i in range(1, len(dz)) if dz[i] * dz[i - 1] < 0] + [len(z)]
-    segs = [(a, b) for a, b in zip(cuts[:-1], cuts[1:]) if b - a >= min_len]
+    segs = [(a, b) for a, b in itertools.pairwise(cuts) if b - a >= min_len]
     return sorted(segs, key=lambda s: s[1] - s[0], reverse=True) or [(0, len(z))]
 
 
@@ -73,7 +74,7 @@ def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5) -> int | None:
     if agree.mean() < 0.6:
         return find_optical_reversal(tiles)
     v = (lt - lt.mean(0)) / (lt.std(0) + 1e-6)
-    best, best_s = int(round(med)), np.inf
+    best, best_s = round(med), np.inf
     for t in range(max(2, int(med) - 6), min(n - 2, int(med) + 7)):
         arm = min(t, n - 1 - t, 15)
         m = np.arange(1, arm + 1)
@@ -106,6 +107,7 @@ class DepthFit:
     confidence: np.ndarray  # 0..1
     peak_index: np.ndarray
     fwhm_z_median: float  # median focus-curve FWHM in z units (from the Gaussian fit)
+    fwhm_z_samples: np.ndarray | None = None  # the per-pixel FWHMs that median is taken over (strip-wise stitching)
 
 
 def _gather(fv, idx):
@@ -168,9 +170,10 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
     conf = (conf * peak_ok).astype(np.float32)
 
     sig = np.sqrt(-1.0 / (2 * a[peak_ok & (conf > 0.5)])) if np.any(peak_ok & (conf > 0.5)) else np.array([np.nan])
-    fwhm = float(np.nanmedian(2.3548 * sig)) if sig.size else float("nan")
+    fwhm_samples = (2.3548 * sig).astype(np.float64)
+    fwhm = float(np.nanmedian(fwhm_samples)) if sig.size else float("nan")
     zm = np.where(conf >= conf_threshold, z_raw, np.nan).astype(np.float32)
-    return DepthFit(zm, z_raw, conf, k.astype(np.int32), fwhm)
+    return DepthFit(zm, z_raw, conf, k.astype(np.int32), fwhm, fwhm_samples)
 
 
 # ---------------------------------------------------------------------------------------------- refinement
@@ -201,20 +204,26 @@ def weighted_guided_filter(p: np.ndarray, w: np.ndarray, guide: np.ndarray, radi
     return np.where(support > 0.15, out, np.nan).astype(np.float32)
 
 
-def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int) -> np.ndarray:
-    """Edge-aware smoothing guided by the all-in-focus image, with one round of outlier rejection."""
+def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int,
+                 *, backend: str = "cpu") -> np.ndarray:
+    """Edge-aware smoothing guided by the all-in-focus image, with one round of outlier rejection.
+
+    backend selects "cpu" (reference) or "opencl" for the guided filter (CPU fallback if OpenCL is
+    unavailable or fails); see backend.guided_filter_backend.
+    """
+    from .backend import guided_filter_backend
     g = guide.astype(np.float32)
     g = (g - g.mean()) / (g.std() + 1e-6)
     zr = np.nanstd(z) if np.any(np.isfinite(z)) else 1.0
     eps = (0.1) ** 2
     zn = z / (zr + 1e-9)
-    sm = weighted_guided_filter(zn, conf, g, radius, eps)
+    sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
     resid = np.abs(zn - sm)
     r_ok = resid[np.isfinite(resid)]
     if r_ok.size:
         thr = 4.0 * 1.4826 * np.median(r_ok) + 1e-6
         zn = np.where(resid > thr, np.nan, zn)
-        sm = weighted_guided_filter(zn, conf, g, radius, eps)
+        sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
     out = np.where(np.isfinite(zn), sm, np.nan) * (zr + 1e-9)
     return out.astype(np.float32)
 
@@ -246,6 +255,8 @@ class EDFAccumulator:
         lap = [g[i] - cv2.pyrUp(g[i + 1], dstsize=(g[i].shape[1], g[i].shape[0])) for i in range(self.levels)]
         lap.append(g[-1])
         wp = self._gauss(weight.astype(np.float32))
+        if frame.ndim == 3:  # colour frame fused with a luma weight: each pyramid level (H,W) -> (H,W,1)
+            wp = [level[..., None] for level in wp]
         if self.acc is None:
             self.acc = [np.zeros_like(x) for x in lap]
             self.wsum = [np.zeros_like(x) for x in wp]
@@ -284,30 +295,65 @@ def softmax_weights_inplace(fv: np.ndarray, temperature: float = 0.25) -> np.nda
 
 
 def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.ndarray) -> float | None:
-    """FWHM (in um of defocus) of the focus measure's response for this objective and this specimen.
+    """A THEORETICAL ESTIMATE of the FWHM (um of defocus) of the focus measure's response curve for this
+    objective and this specimen. It is a model prediction, not a calibration: nothing is measured against a
+    reference, and it carries the model's own error (the DOF ruler built on it was off by -34 % to +13 % on
+    simulated sweeps).
 
-    The all-in-focus image is blurred with the optical defocus model at known defocus steps, so the
-    ruler has no hand-tuned factor. Assumes the all-in-focus image is close to the true in-focus texture.
-    Returns None when the response carries no focus information (zero or non-finite energy, or a half-maximum
-    that is not bracketed inside the search range): a blank crop must not yield the search width.
+    Method: the (already in-focus-ish) all-in-focus texture is blurred with the objective's defocus model at
+    defocus steps of dof/3 over +-4 dof, `measure_fn` is applied to every blurred copy, and the width at half of
+    the maximum is read off by linear interpolation. Hand-checkable limit: for a pure sinusoid of spatial
+    frequency f (cycles/px) and a measure that is its peak-to-peak amplitude, the response is the Gaussian
+    exp(-2 pi^2 f^2 s^2) with s = |dz| tan(theta) / (2 um_per_px), so FWHM = 2 sqrt(2 ln 2) um_per_px /
+    (pi f tan(theta)) (tests/test_feat_zstack_backend.py checks this to 1 % for two objectives).
+
+    Heuristics (not derived from the optics, and each moves the answer): the defocused PSF is a Gaussian
+    (Airy sigma = 0.21 lambda / NA; geometric blur disc of radius |dz| tan(theta) approximated by a Gaussian of
+    sigma = R / 2, added in quadrature); the texture is taken as the true in-focus image (its own PSF blur is
+    only subtracted in quadrature); the centre 256 x 256 px is used and 20 px are cut from each border of the
+    response; the 75th percentile of the response map stands for the field; the sampling step is dof/3 and the
+    range +-4 dof; NA below 0.24 is refused (flat response). Returns None when the response carries no focus
+    information (objective not usable, zero or non-finite energy, or a half-maximum not bracketed inside the
+    search range): a blank crop must not yield the search width.
     """
+    if objective is None or not np.isfinite(objective.na) or objective.na <= 0:
+        return None
+    dof = objective.dof_um
+    if not np.isfinite(dof) or dof <= 0:
+        return None
+    # Below 0.24 NA the search range is huge and the response is flat: no meaningful ruler.
+    if objective.na < 0.24:
+        return None
+    step = dof / 3.0
+    search = np.arange(-4 * dof, 4 * dof + step, step)
+    if len(search) < 3:
+        return None
     h, w = texture.shape
     c = min(h, w, 256) // 2
     tex = texture[h // 2 - c:h // 2 + c, w // 2 - c:w // 2 + c].astype(np.float32)
-    dof = objective.dof_um
-    dz = np.linspace(-4 * dof, 4 * dof, 81)
+    airy = objective.airy_sigma_um
     resp = []
-    for d in dz:
+    for d in search:
         # extra blur on top of the in-focus PSF already present in the texture
-        s = float(np.sqrt(max(objective.defocus_sigma_um(d) ** 2 - objective.airy_sigma_um**2, 0))) / um_per_px
+        s = float(np.sqrt(max(objective.defocus_sigma_um(d) ** 2 - airy * airy, 0.0))) / um_per_px
         img = cv2.GaussianBlur(tex, (0, 0), s) if s > 0.05 else tex
-        resp.append(float(np.mean(measure_fn(img)[20:-20, 20:-20])))
-    resp = np.array(resp)
+        resp.append(float(np.percentile(measure_fn(img)[20:-20, 20:-20], 75)))
+    resp = np.array(resp, np.float64)
     if not np.all(np.isfinite(resp)) or resp.max() <= 1e-9:
         return None
-    lr = np.log(np.maximum(resp, 1e-30))
-    half = lr.max() - np.log(2)
-    above = np.nonzero(lr >= half)[0]
-    if above.size == 0 or above[0] == 0 or above[-1] == len(dz) - 1:  # not bracketed: no defined width
+    half = float(resp.max()) / 2.0
+    above = np.nonzero(resp >= half)[0]
+    if above.size < 2 or above[0] == 0 or above[-1] == len(resp) - 1:  # not bracketed: no defined width
         return None
-    return float(dz[above[-1]] - dz[above[0]])
+
+    def cross(i: int) -> float:
+        """Linear crossing of `half` between samples i and i+1 in defocus units."""
+        r0, r1 = resp[i], resp[i + 1]
+        den = r1 - r0
+        t = (half - r0) / den if abs(den) > 1e-9 else 0.5
+        return float(search[i] + t * (search[i + 1] - search[i]))
+
+    # above[0] is the first sample >= half: the upward crossing lies between above[0]-1 and above[0];
+    # above[-1] is the last sample >= half: the downward crossing lies between above[-1] and above[-1]+1.
+    fwhm = abs(cross(above[-1]) - cross(above[0] - 1))
+    return float(fwhm) if np.isfinite(fwhm) and fwhm > 0 else None

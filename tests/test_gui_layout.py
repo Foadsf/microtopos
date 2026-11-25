@@ -10,14 +10,13 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pg = pytest.importorskip("pyqtgraph")
-from PySide6.QtCore import QSettings, QStandardPaths  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QStandardPaths
+from PySide6.QtWidgets import QApplication
 
 
 @pytest.fixture(scope="module")
 def window(tmp_path_factory):
     QStandardPaths.setTestModeEnabled(True)  # calibration / objective files go to Qt's test location
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qsettings")))
     pg.setConfigOptions(imageAxisOrder="row-major")
     app = QApplication.instance() or QApplication([])
     from microtopos.gui.main_window import MainWindow
@@ -89,19 +88,20 @@ _SAVED_STATE = (
 
 _REOPEN_MAXIMISED = r"""
 import sys
-from PySide6.QtCore import QByteArray, QSettings, QStandardPaths
+import os
+from PySide6.QtCore import QByteArray, QStandardPaths
 QStandardPaths.setTestModeEnabled(True)
-QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, sys.argv[1])
+os.environ["MICROTOPOS_SETTINGS_DIR"] = sys.argv[1]
 import pyqtgraph as pg
 from PySide6.QtWidgets import QApplication, QWidget
 pg.setConfigOptions(imageAxisOrder="row-major")
 app = QApplication([])
-from microtopos.gui.main_window import MainWindow
+from microtopos.gui.main_window import MainWindow, app_settings
 def pump(n):
     import time
     for _ in range(n):
         app.processEvents(); time.sleep(0.02)
-s = QSettings("MicroTopos", "MicroTopos")  # as a real session left it: maximised on a second monitor, normal size 1560x940
+s = app_settings()  # as a real session left it: maximised on a second monitor, normal size 1560x940
 s.setValue("geometry", QByteArray.fromHex(sys.argv[2].encode())); s.setValue("state", QByteArray.fromHex(sys.argv[3].encode())); s.sync()
 w = MainWindow(simulator_only=True); w.show(); pump(100)
 edges = [w.dock_left.geometry().right() + 1, w.dock_right.geometry().left() - 1]
@@ -125,9 +125,9 @@ def test_reopening_a_maximised_window_leaves_no_stray_dock_separators(tmp_path):
     script.write_text(_REOPEN_MAXIMISED)
     env = {k: v for k, v in os.environ.items() if k != "QT_QPA_PLATFORM"}
     r = subprocess.run(["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "sh", "-c",
-                        f"metacity --replace >/dev/null 2>&1 & sleep 2; '{sys.executable}' '{script}' '{tmp_path}' "
-                        f"{_SAVED_GEOMETRY} {_SAVED_STATE}"],
-                       capture_output=True, text=True, timeout=180, env=env)
+                        (f"metacity --replace >/dev/null 2>&1 & sleep 2; '{sys.executable}' '{script}' '{tmp_path}' "
+                         f"{_SAVED_GEOMETRY} {_SAVED_STATE}")],
+                       capture_output=True, text=True, timeout=180, env=env, check=False)
     report = [line for line in r.stdout.splitlines() if line.startswith("maximised")]
     assert r.returncode != 3, f"the window manager did not maximise the window: {report}"
     assert r.returncode == 0, f"stray dock separators: {report or r.stderr[-1500:]}"

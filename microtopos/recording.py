@@ -16,6 +16,7 @@ import os
 import threading
 import zlib
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 
 import cv2
@@ -79,9 +80,11 @@ class RecordingWriter:
         with self._lock:
             self._add(raw, seq, t)
 
-    def _fail(self, message: str) -> None:
-        self.error = message
-        raise RecordingError(message)
+    def _fail(self, msg: str, cause: BaseException | None = None):
+        self.error = msg
+        if cause is not None:
+            raise RecordingError(msg) from cause
+        raise RecordingError(msg)
 
     def _add(self, raw: np.ndarray, seq: int, t: float) -> None:
         if self.closed:
@@ -115,8 +118,7 @@ class RecordingWriter:
             with open(self.folder / name, "wb") as f:
                 written = f.write(data)
         except OSError as e:  # disk full, permissions, unplugged drive: a visible failure, not a silent gap
-            self.error = f"could not write {name}: {e}"
-            raise RecordingError(self.error) from e
+            self._fail(f"could not write {name}: {e}", e)
         if written != len(data):
             self._fail(f"short write for {name}")
         self.entries.append({"file": name, "seq": int(seq), "t": round(float(t), 4), "bytes": len(data),
@@ -193,25 +195,31 @@ def load_manifest(folder: Path | str) -> Manifest:
         mode = "mjpeg-raw"
     if not files:
         raise ValueError(f"{folder}: the recording contains no usable frames")
-    back = sum(1 for a, b in zip(stamps, stamps[1:]) if b < a)
+    back = sum(1 for a, b in pairwise(stamps) if b < a)
     if back:
         warnings.append(f"timestamps go backwards {back} time(s); playback keeps file order")
     return Manifest(folder, files, stamps, seqs, mode, meta, warnings)
 
 
 def decode(path: Path) -> np.ndarray | None:
-    """Decoded BGR frame, or None when the file is damaged.
-
-    Recordings made before the single-row fix (v0.8.1 and earlier, on cameras that deliver MJPEG as (1, N))
-    hold each frame's JPEG bytes as a one-pixel-tall grey PNG. Those bytes are intact, so such a strip is
-    decoded as the JPEG it carries instead of being returned as a 1 x N image."""
+    """Decoded BGR frame (or 16-bit PNG if recorded in 16-bit), or None when the file is damaged."""
     try:
         buf = np.fromfile(path, np.uint8)
     except OSError:
         return None
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR) if buf.size else None
-    if img is not None and img.shape[0] == 1:
-        strip = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
-        if strip is not None and strip.dtype == np.uint8 and strip.ndim == 2 and is_jpeg(strip.tobytes()):
-            return cv2.imdecode(strip.reshape(-1), cv2.IMREAD_COLOR)  # None when the carried JPEG is damaged
-    return img
+    if not buf.size:
+        return None
+    raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)  # the one decode of this file; the rest is conversion
+    if raw is None:
+        return None
+    if raw.dtype == np.uint16:
+        return raw
+    if raw.dtype != np.uint8:  # an exotic depth: let OpenCV reduce it to 8-bit BGR
+        return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if raw.ndim == 2:
+        if raw.shape[0] == 1 and is_jpeg(raw.tobytes()):  # MJPEG bytes stored as a 1xN PNG strip: decode the JPEG inside
+            return cv2.imdecode(raw.reshape(-1), cv2.IMREAD_COLOR)
+        return cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+    if raw.shape[2] == 4:
+        return cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+    return raw

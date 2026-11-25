@@ -14,11 +14,38 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QStyle,
-                               QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDockWidget,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QStackedWidget,
+    QStyle,
+    QTabWidget,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .. import __version__, export, metrology, units, zstack
 from .. import objectives as objlib
@@ -28,11 +55,11 @@ from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
+from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, capture_z_sweep, list_serial_ports
 from ..superres import dwell_superres
-from .theme import DARK, LIGHT, hex_rgb, stylesheet
 from .objectives_dialog import ObjectivesDialog
-from .widgets import (DARK_P99_DN, Banner, Chip, FlowWidget, ImagePanel, Toast, frame_percentile, section,
-                      stretch_levels)
+from .theme import DARK, LIGHT, hex_rgb, stylesheet
+from .widgets import DARK_P99_DN, Banner, Chip, FlowWidget, ImagePanel, Toast, frame_percentile, section, stretch_levels
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -54,8 +81,10 @@ pattern projected through the field diaphragm.</p>
 spherical aberration and lack of light; an oil objective also needs oil on the specimen. Objectives engraved 0 or
 ∞/0 are made for uncovered specimens in reflected light; "-" means either. Deconvolution cannot replace missing
 illumination.</p>
-<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected: it could not be measured
-reliably from defocused frames. Its effect is limited to the far-defocused frames at the image edges.</p>
+<p><b>Focus breathing</b> (a small magnification change with focus) is not corrected by default. An experimental
+correction (3D tab, "Correct focus breathing") measures it from the frame pairs and improves the lateral alignment of
+the frames; on simulated sweeps it did not change the height error measurably. A drift larger than 1.5 % over the
+sweep is limited to 1.5 % and reported as a warning.</p>
 """
 
 STEPS = ["Camera", "Objective", "Dark && flat", "Lateral scale", "Z scale", "Inspect"]
@@ -85,14 +114,14 @@ class Job(QThread):
             self.done.emit(res)
         except zstack.Cancelled:
             self.failed.emit("Cancelled.")
-        except Exception as e:  # surfaced to the user, never silently dropped
+        except Exception as e:  # surfaced to the user, never silently dropped  # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-def _sr_job(frames, psf, progress=None, cancelled=None):
+def _sr_job(frames, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True):
     if progress:
         progress(0.1, "Registering dwell frames and drizzling...")
-    return dwell_superres(frames, psf)
+    return dwell_superres(frames, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve)
 
 
 def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
@@ -100,6 +129,13 @@ def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
         progress(0.2, "Recomputing metrology...")
     return metrology.analyze(r["height"], r["edf_proc"], r["um_per_px"], r["z_unit"],
                              resolve_result(r).lateral_cutoff_um, form_order, lam_s, lam_c)
+
+
+def _feature_job(r, progress=None, cancelled=None):
+    """Spd/Spc/S5p/S5v/S10z and the topographic hills of the filtered surface (seconds per megapixel)."""
+    if progress:
+        progress(0.2, "Finding significant peaks and hills...")
+    return metrology.feature_set(r["sl_surface"], r["um_per_px"], r["z_unit"])
 
 
 def _rescale_job(r, factor, unit, progress=None, cancelled=None):
@@ -127,11 +163,27 @@ def z_status_text(r: dict) -> str:
     return f"Z {r.get('z_status', '?')} ({unit}{o})"
 
 
+SETTINGS_DIR_ENV = "MICROTOPOS_SETTINGS_DIR"
+
+
+def app_settings() -> QSettings:
+    """The window's saved settings (theme, objective, layout): the one place that decides where they live.
+
+    By default the platform's native store. On Windows that is the registry, which QSettings.setPath cannot
+    redirect, so a test or smoke run that only set a path read and wrote the user's real settings. When
+    MICROTOPOS_SETTINGS_DIR names a folder, the settings are an ini file in that folder instead (the test suite,
+    the GUI smoke run, a portable copy)."""
+    folder = os.environ.get(SETTINGS_DIR_ENV)
+    if folder:
+        return QSettings(str(Path(folder) / "MicroTopos.ini"), QSettings.Format.IniFormat)
+    return QSettings("MicroTopos", "MicroTopos")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, simulator_only: bool = False, replay: str | None = None, verbose: bool = False):
         super().__init__()
         opencv_threads()
-        self.settings = QSettings("MicroTopos", "MicroTopos")
+        self.settings = app_settings()
         self.dark = self.settings.value("dark", True, type=bool)
         self.t = DARK if self.dark else LIGHT
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation) or Path.home() / ".microtopos")
@@ -157,6 +209,18 @@ class MainWindow(QMainWindow):
         self.job: Job | None = None  # the reconstruction / metrology job (one at a time)
         self.sr_job: Job | None = None
         self.jobs: list[Job] = []  # every job still owned by the window (joined on close)
+        self.sr_scale = 2          # super-resolution linear scale (SR control strip)
+        self.sr_pixfrac = 0.7      # drizzle drop size (fraction of an input pixel)
+        self.sr_deconvolve = True  # Richardson-Lucy deconvolution after the drizzle step
+        self.color_mode = False          # colour (RGB) preview through the engine
+        self.mosaic_rgb = False          # render the mosaic tab in colour from tiles_rgb
+        self.track_rotation = False      # mosaic tracks small in-plane rotations between keyframes
+        self.stage_driver: StageDriver | None = None
+        self.stage_job: Job | None = None  # the running stage operation (serial I/O never blocks the GUI thread)
+        self.stage_jog_buttons: list = []
+        self.level_picking = False       # 3-point level mode armed on the height view
+        self.level_pts: list[tuple[float, float]] = []
+        self.zst = zstack.ZSettings()    # 3D reconstruction settings edited from the 3D page
         self.sr_result = None
         self.last_mosaic_version = -1
         self.history: list[dict] = []
@@ -307,13 +371,26 @@ class MainWindow(QMainWindow):
         self.prof_roi.hide()
         self.p_height.add_item(self.prof_roi)
         self.prof_roi.sigRegionChanged.connect(self._update_profile)
+        self.p_height.clicked_px.connect(self._on_height_clicked)
+        self.mask_roi = pg.RectROI([0, 0], [60, 60], pen=pg.mkPen("#ff1493", width=2, style=Qt.DashLine))
+        self.mask_roi.hide()
+        self.p_height.add_item(self.mask_roi)
+        self.step_roi_a = pg.RectROI([0, 0], [60, 22], pen=pg.mkPen("#ffa500", width=2, style=Qt.DashLine))
+        self.step_roi_a.hide()
+        self.p_height.add_item(self.step_roi_a)
+        self.step_roi_b = pg.RectROI([0, 0], [60, 22], pen=pg.mkPen("#ffa500", width=2, style=Qt.DashLine))
+        self.step_roi_b.hide()
+        self.p_height.add_item(self.step_roi_b)
         self.prof_plot = pg.PlotWidget()
         self.prof_plot.setMaximumHeight(180)
         self.prof_curve = self.prof_plot.plot()
         self.prof_label = QLabel("Drag the orange line on the height map to see a profile.")
         self.prof_label.setObjectName("muted")
 
-        self.tabs.addTab(self._wrap(self.p_live, self._live_bar()), "Live")
+        self.replay_widget = QWidget()
+        self.replay_widget.setLayout(self._replay_bar())
+        self.replay_widget.setVisible(False)
+        self.tabs.addTab(self._wrap(self.p_live, self._live_bar(), self.replay_widget), "Live")
         self.tabs.addTab(self._wrap(self.p_mosaic, self._mosaic_bar()), "Mosaic")
         self.tabs.addTab(self._wrap(self.p_edf, self._edf_bar()), "All-in-focus")
         self.tabs.addTab(self._wrap(self.p_height, self._height_bar(), self.prof_plot, self.prof_label), "Height")
@@ -384,6 +461,32 @@ class MainWindow(QMainWindow):
         self.chk_stretch.toggled.connect(lambda on: self.settings.setValue("live_stretch", on))
         self._stretch = None
         h.addWidget(self.chk_stretch)
+        self.chk_rgb = QCheckBox("Colour preview (RGB)")
+        self.chk_rgb.setToolTip("Render the camera's colour frame instead of the luma channel (needs a colour camera)")
+        self.chk_rgb.toggled.connect(self._set_color_mode)
+        h.addWidget(self.chk_rgb)
+        self.chk_hbd = QCheckBox("High bit depth")
+        self.chk_hbd.setToolTip("Request 12-/14-bit output from the camera when the driver reports it")
+        h.addWidget(self.chk_hbd)
+        h.addWidget(QLabel("SR scale"))
+        self.cmb_sr_scale = QComboBox()
+        self.cmb_sr_scale.addItems(["2×", "3×", "4×"])
+        self.cmb_sr_scale.setCurrentText("2×")
+        self.cmb_sr_scale.setFixedWidth(52)
+        self.cmb_sr_scale.currentTextChanged.connect(
+            lambda t: setattr(self, "sr_scale", int(t.replace("×", ""))))
+        h.addWidget(self.cmb_sr_scale)
+        h.addWidget(QLabel("pixfrac"))
+        self.sl_sr_pixfrac = QSlider(Qt.Horizontal)
+        self.sl_sr_pixfrac.setRange(3, 10)
+        self.sl_sr_pixfrac.setValue(7)
+        self.sl_sr_pixfrac.setFixedWidth(70)
+        self.sl_sr_pixfrac.valueChanged.connect(lambda v: setattr(self, "sr_pixfrac", v / 10))
+        h.addWidget(self.sl_sr_pixfrac)
+        self.chk_sr_deconv = QCheckBox("SR deconvolve")
+        self.chk_sr_deconv.setChecked(True)
+        self.chk_sr_deconv.toggled.connect(lambda on: setattr(self, "sr_deconvolve", on))
+        h.addWidget(self.chk_sr_deconv)
         self.btn_rec = QPushButton("● Record raw stream")
         self.btn_rec.setCheckable(True)
         self.btn_rec.setFocusPolicy(Qt.TabFocus)
@@ -412,12 +515,31 @@ class MainWindow(QMainWindow):
         self.sl_hop.setFixedWidth(110)
         self.sl_hop.valueChanged.connect(lambda: setattr(self, "last_mosaic_version", -1))
         h.addWidget(self.sl_hop)
+        self.cmb_mblend = QComboBox()
+        self.cmb_mblend.addItems(["feather", "multiband"])
+        self.cmb_mblend.setCurrentText("feather")
+        self.cmb_mblend.currentTextChanged.connect(self._mosaic_blend)
+        h.addWidget(QLabel("Blend"))
+        h.addWidget(self.cmb_mblend)
+        self.chk_rot_track = QCheckBox("Track rotation")
+        self.chk_rot_track.toggled.connect(self._mosaic_track_rotation)
+        h.addWidget(self.chk_rot_track)
+        self.chk_mosaic_rgb = QCheckBox("Colour mosaic")
+        self.chk_mosaic_rgb.toggled.connect(self._mosaic_rgb_mode)
+        h.addWidget(self.chk_mosaic_rgb)
         self.lbl_hlegend = QLabel()
         self.lbl_hlegend.setObjectName("mono")
         h.addWidget(self.lbl_hlegend, 1)
         h2 = QHBoxLayout()  # second row: actions and status, so nothing overlaps on narrow windows
         h2.addWidget(self._btn("Export height mosaic", self._export_height_mosaic,
                                "Stitched height mosaic as a Gwyddion .gsf"))
+        self.btn_mosaic_inset = self._btn("Add inset (current view)", self._mosaic_add_inset,
+                                          "Pin the current live view as a mosaic inset: a second objective "
+                                          "mapping the same area at higher magnification")
+        h2.addWidget(self.btn_mosaic_inset)
+        self.chk_keep_insets = QCheckBox("Keep insets on reset")
+        self.chk_keep_insets.setChecked(True)
+        h2.addWidget(self.chk_keep_insets)
         h2.addWidget(self._btn("Reset mosaic  (R)", self._reset_mosaic, "Start a new mosaic"))
         self.lbl_mosaic = QLabel()
         self.lbl_mosaic.setObjectName("muted")
@@ -458,6 +580,36 @@ class MainWindow(QMainWindow):
         self.lbl_height = QLabel()
         self.lbl_height.setObjectName("muted")
         h.addWidget(self.lbl_height, 1)
+        self.btn_level3 = QPushButton("Level: pick 3 points")
+        self.btn_level3.setCheckable(True)
+        self.btn_level3.setToolTip("Click 3 points on the height map; the measured height is levelled through them "
+                                   "and every layer and parameter is recomputed")
+        self.btn_level3.toggled.connect(self._level_mode)
+        h.addWidget(self.btn_level3)
+        self.btn_mask = QPushButton("Exclude ROI")
+        self.btn_mask.setToolTip("First press shows the pink rectangle to place; the next press excludes its pixels "
+                                 "from the measured height and recomputes every parameter")
+        self.btn_mask.clicked.connect(lambda: self._tool_pressed("mask"))
+        h.addWidget(self.btn_mask)
+        self.btn_step = QPushButton("Step height A→B")
+        self.btn_step.setToolTip("First press shows the two orange rectangles to place on the two terraces; the next "
+                                 "press measures the step between them (common-tilt removed)")
+        self.btn_step.clicked.connect(lambda: self._tool_pressed("step"))
+        h.addWidget(self.btn_step)
+        self.btn_tool_cancel = QPushButton("Cancel tool")
+        self.btn_tool_cancel.clicked.connect(self._disarm_tools)
+        self.btn_tool_cancel.hide()
+        h.addWidget(self.btn_tool_cancel)
+        self.btn_tools_reset = QPushButton("Reset height tools")
+        self.btn_tools_reset.setToolTip("Restore the reconstructed height (undo levelling and exclusions)")
+        self.btn_tools_reset.setEnabled(False)
+        self.btn_tools_reset.clicked.connect(self._reset_height_tools)
+        h.addWidget(self.btn_tools_reset)
+        self.chk_topo_grains = QCheckBox("Feature parameters")
+        self.chk_topo_grains.setToolTip("Compute Spd, Spc, S5p, S5v, S10z and the topographic hills (Wolf-pruned peaks, "
+                                        "5 % of Sz) of the filtered surface; takes seconds per megapixel")
+        self.chk_topo_grains.toggled.connect(self._show_result)
+        h.addWidget(self.chk_topo_grains)
         return h
 
     def _build_3d(self):
@@ -474,14 +626,14 @@ class MainWindow(QMainWindow):
                 def initializeGL(self):
                     try:
                         super().initializeGL()
-                    except Exception:
+                    except Exception:  # noqa: BLE001  # any OpenGL/pyqtgraph failure degrades to relief view
                         self.failed = True
 
                 def paintGL(self, *a, **k):
                     if not self.failed:
                         try:
                             super().paintGL(*a, **k)
-                        except Exception:
+                        except Exception:  # noqa: BLE001  # any OpenGL/pyqtgraph failure degrades to relief view
                             self.failed = True
 
             self.gl = SafeGL()
@@ -491,7 +643,7 @@ class MainWindow(QMainWindow):
             self.gl_surf.setVisible(False)  # an empty surface has no mesh: drawing it raises in pyqtgraph
             self.gl.addItem(self.gl_surf)
             lay.addWidget(self.gl, 1)
-        except Exception:
+        except Exception:  # noqa: BLE001  # OpenGL unavailable: fall back to a shaded relief view
             self.gl = None
         self.relief = ImagePanel(self.t, "No height map yet.")
         self.relief.setVisible(self.gl is None)
@@ -510,6 +662,23 @@ class MainWindow(QMainWindow):
         self.cmb_cmap.addItems(["viridis", "cividis", "inferno", "plasma", "magma", "turbo"])
         self.cmb_cmap.currentIndexChanged.connect(self._update_3d)
         bar.addWidget(self.cmb_cmap)
+        bar.addWidget(QLabel("Backend"))
+        self.cmb_3d_backend = QComboBox()
+        self.cmb_3d_backend.addItems(["CPU", "OpenCL"])
+        self.cmb_3d_backend.currentTextChanged.connect(lambda t: setattr(self.zst, "backend", t.lower()))
+        bar.addWidget(self.cmb_3d_backend)
+        self.chk_3d_breathing = QCheckBox("Correct focus breathing (experimental)")
+        self.chk_3d_breathing.setToolTip("Estimates the magnification change with focus from the frame pairs and folds it "
+                                         "into the frame alignment. Experimental: it improves the lateral alignment, but "
+                                         "did not change the simulated height error measurably.")
+        self.chk_3d_breathing.toggled.connect(lambda on: setattr(self.zst, "correct_breathing", on))
+        bar.addWidget(self.chk_3d_breathing)
+        self.chk_3d_tiling = QCheckBox("Strip-wise reconstruction")
+        self.chk_3d_tiling.setToolTip("Reconstruct in horizontal strips when the whole stack would not fit in free "
+                                      "memory: bounds peak memory, gives the same result.")
+        self.chk_3d_tiling.setChecked(True)
+        self.chk_3d_tiling.toggled.connect(lambda on: setattr(self.zst, "allow_tiling", on))
+        bar.addWidget(self.chk_3d_tiling)
         bar.addWidget(self.lbl_3d, 1)
         lay.addLayout(bar)
 
@@ -599,7 +768,7 @@ class MainWindow(QMainWindow):
         self.cmb_source.currentIndexChanged.connect(self._on_source)
         self.cmb_res = QComboBox()
         # 16:9 modes only: lateral calibration is scaled between modes, which assumes the same field of view
-        self.cmb_res.addItems(["1920x1080", "1280x720"])
+        self.cmb_res.addItems(["640x480", "1080x1080", "1280x720", "1920x1080"])
         self.cmb_res.setToolTip("Capture size. Full resolution is used for Z-stacks; live analysis uses a 640 px preview")
         self.cmb_res.currentIndexChanged.connect(lambda: self._on_source(self.cmb_source.currentIndex()))
         self.chk_autoexp = QCheckBox("Automatic exposure")
@@ -657,10 +826,194 @@ class MainWindow(QMainWindow):
                                  "Simulator: sweep that turns back through focus"), 1, 0, 1, 2)
         self.demo_box = section("Demo (simulator only)", demo,
                                 hint="Synthetic specimen. Its heights are simulation truth and are labelled SIMULATED.")
+        stg = QGridLayout()
+        stg.addWidget(QLabel("Stage driver"), 0, 0)
+        self.cmb_stg = QComboBox()
+        self.cmb_stg.addItems(["Simulated stage", "GRBL serial port", "None"])
+        self.cmb_stg.currentTextChanged.connect(self._stage_driver_changed)
+        stg.addWidget(self.cmb_stg, 0, 1)
+        stg.addWidget(QLabel("Serial port"), 1, 0)
+        self.cmb_stg_port = QComboBox()
+        self.cmb_stg_port.addItems(list_serial_ports())
+        self.cmb_stg_port.setEnabled(False)
+        stg.addWidget(self.cmb_stg_port, 1, 1)
+        self.btn_stg_connect = self._btn("Connect", self._stage_connect)
+        stg.addWidget(self.btn_stg_connect, 2, 0)
+        self.lbl_stg_pose = QLabel("stage: disconnected")
+        self.lbl_stg_pose.setObjectName("muted")
+        stg.addWidget(self.lbl_stg_pose, 2, 1)
+        jog = QHBoxLayout()
+        for name, dx, dy in (("X −10 µm", -10.0, 0.0), ("X +10 µm", 10.0, 0.0),
+                             ("Y −10 µm", 0.0, -10.0), ("Y +10 µm", 0.0, 10.0)):
+            # clicked(bool) passes `checked` as the first positional argument: it must not land in dx
+            b = self._btn(name, lambda _checked=False, dx=dx, dy=dy: self._stage_jog(dx, dy))
+            b.setEnabled(False)
+            self.stage_jog_buttons.append(b)
+            jog.addWidget(b)
+        self.btn_stg_zero = self._btn("Zero X/Y/Z", self._stage_zero)
+        self.btn_stg_zero.setEnabled(False)
+        jog.addWidget(self.btn_stg_zero)
+        stg.addLayout(jog, 3, 0, 1, 2)
+        sweep = QHBoxLayout()
+        self.sp_stg_z0, self.sp_stg_z1 = QDoubleSpinBox(), QDoubleSpinBox()
+        for sp, tip in ((self.sp_stg_z0, "Z where the sweep starts (µm, stage frame)"),
+                        (self.sp_stg_z1, "Z where the sweep ends (µm, stage frame)")):
+            sp.setRange(-50000.0, 50000.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(1.0)
+            sp.setSuffix(" µm")
+            sp.setToolTip(tip)
+            sweep.addWidget(sp)
+        self.sp_stg_z0.setValue(-5.0)
+        self.sp_stg_z1.setValue(5.0)
+        self.sp_stg_n = QSpinBox()
+        self.sp_stg_n.setRange(16, 240)
+        self.sp_stg_n.setValue(48)
+        self.sp_stg_n.setSuffix(" steps")
+        self.sp_stg_n.setToolTip("Stage positions in the sweep: one processed frame is captured at each")
+        sweep.addWidget(self.sp_stg_n)
+        self.btn_stg_zsweep = self._btn("Z sweep", self._stage_zsweep,
+                                        "Drive the stage Z from the first to the second height while the live engine "
+                                        "captures the sweep; every frame is labelled with the stage's Z (µm) and the "
+                                        "height map is reconstructed with those labels")
+        self.btn_stg_zsweep.setEnabled(False)
+        sweep.addWidget(self.btn_stg_zsweep)
+        stg.addLayout(sweep, 4, 0, 1, 2)
+        self.stage_box = section("Stage", stg,
+                                 hint="Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
+                                      "reported pose. Zero makes the current position the origin of a GRBL stage; the "
+                                      "simulated stage keeps the simulator's coordinates, so Zero moves it back to "
+                                      "their origin. Z sweep: the stage runs through the "
+                                      "Z range while the camera frames, labelled with the stage's Z, are captured "
+                                      "and reconstructed (the simulated stage drives the simulator's focus; the GRBL "
+                                      "path is verified against a simulated controller only).")
         return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
-                       self.lbl_readback, self.demo_box,
+                       self.lbl_readback, self.demo_box, self.stage_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
                             "because both would corrupt focus measurements.")
+
+    def _stage_driver_changed(self, text: str):
+        self.cmb_stg_port.setEnabled(text.startswith("GRBL"))
+        if text.startswith("None") and self.stage_driver is not None:
+            self._stage_disconnect()
+
+    def _stage_async(self, label: str, fn, on_done) -> bool:
+        """Run stage I/O (serial, waiting for motion) off the GUI thread. One stage operation at a time."""
+        if self.stage_job is not None and self.stage_job.isRunning():
+            self.notify("The stage is still busy; try again when it has finished.", "warning")
+            return False
+        job = Job(fn, label=label)
+        self.stage_job = job
+        self._stage_enable()
+        job.finished.connect(self._stage_enable)
+        return self._start_job(job, on_done)
+
+    def _stage_enable(self):
+        """Stage controls follow the connection and whether an operation is running."""
+        busy = self.stage_job is not None and self.stage_job.isRunning()
+        ready = self.stage_driver is not None and not busy
+        self.btn_stg_connect.setEnabled(not busy)
+        self.btn_stg_zero.setEnabled(ready)
+        self.btn_stg_zsweep.setEnabled(self.stage_driver is not None)  # doubles as Cancel while a sweep runs
+        for b in self.stage_jog_buttons:
+            b.setEnabled(ready)
+
+    def _stage_attach(self):
+        """Label the active source's frames with the stage's pose (None detaches)."""
+        if self.source is not None:
+            self.source.stage_driver = self.stage_driver
+
+    def _stage_connect(self):
+        if self.stage_driver is not None:
+            self._stage_disconnect()
+            return
+        text = self.cmb_stg.currentText()
+        if text.startswith("Simulated"):
+            if self.sim_source is None:
+                self.notify("The stage simulator needs the simulator source (pick it in Camera).", "warning")
+                return
+            drv: StageDriver = SimulatedStageDriver(self.sim_source)
+        elif text.startswith("GRBL"):
+            drv = GrblStageDriver(self.cmb_stg_port.currentText())
+        else:
+            return
+        # connect() can raise StageError (no answer, alarm), OSError (port busy or missing) or ImportError
+        # (pyserial not installed: its message says to pip install microtopos[serial]); the job reports any of
+        # them to the user through _on_failed instead of crashing the slot
+        self._stage_async("Stage connect", lambda **_: (drv.connect(), drv.pose())[1],
+                          lambda pose, d=drv: self._stage_connected(d, pose))
+
+    def _stage_connected(self, drv: StageDriver, pose):
+        self.stage_driver = drv
+        self._stage_attach()
+        self.btn_stg_connect.setText("Disconnect")
+        if isinstance(drv, SimulatedStageDriver) and self.sim_source is not None:
+            lo, hi = self.sim_source.relief_range_um()  # a sweep that passes the whole visible relief through focus
+            self.sp_stg_z0.setValue(math.floor(lo * 100) / 100)
+            self.sp_stg_z1.setValue(math.ceil(hi * 100) / 100)
+        else:
+            self.sp_stg_z0.setValue(round(pose.z_um - 5.0, 2))
+            self.sp_stg_z1.setValue(round(pose.z_um + 5.0, 2))
+        self._stage_show(pose)
+        self._stage_enable()
+
+    def _stage_disconnect(self):
+        if self.stage_job is not None and self.stage_job.isRunning():
+            self.stage_job.cancel = True  # a running sweep stops at its next position; disconnect afterwards
+            self.notify("The stage is still busy; try again when it has finished.", "warning")
+            return
+        drv, self.stage_driver = self.stage_driver, None
+        self._stage_attach()
+        if drv is not None:
+            self._stage_async("Stage disconnect", lambda **_: drv.close(), lambda _r: None)
+        self.btn_stg_connect.setText("Connect")
+        self.lbl_stg_pose.setText("stage: disconnected")
+        self._stage_enable()
+
+    def _stage_show(self, p):
+        self.lbl_stg_pose.setText(f"stage: X {p.x_um:+.2f} µm  Y {p.y_um:+.2f} µm  Z {p.z_um:+.2f} µm  "
+                                  f"({'busy' if p.moving else 'idle'})")
+
+    def _stage_jog(self, dx_um: float, dy_um: float):
+        drv = self.stage_driver
+        if drv is not None:
+            self._stage_async("Stage jog", lambda **_: drv.move_rel(dx_um=dx_um, dy_um=dy_um), self._stage_show)
+
+    def _stage_zero(self):
+        drv = self.stage_driver
+        if drv is not None:
+            self._stage_async("Stage zero", lambda **_: drv.zero(), self._stage_show)
+
+    def _stage_zsweep(self):
+        drv = self.stage_driver
+        if drv is None:
+            return
+        if self.stage_job is not None and self.stage_job.isRunning():
+            if getattr(self.stage_job, "is_sweep", False):
+                self.stage_job.cancel = True  # the second click on 'Cancel sweep'
+            return
+        if self.source is None or self.source.stage_driver is not drv:
+            self.notify("Attach the stage to the active source first (disconnect and connect again).", "warning")
+            return
+        zs = [float(z) for z in np.linspace(self.sp_stg_z0.value(), self.sp_stg_z1.value(), self.sp_stg_n.value())]
+        src = self.source
+
+        def run(progress=None, cancelled=None):
+            return capture_z_sweep(drv, src, self.engine, zs, cancelled=cancelled, progress=progress)
+
+        def done(poses):
+            self.btn_stg_zsweep.setText("Z sweep")
+            if not poses:
+                self.notify("Z sweep cancelled before the first stage position; nothing was captured.", "warning")
+                return
+            self._stage_show(poses[-1])
+            self.notify(f"Z sweep done: {len(poses)} stage positions, {poses[0].z_um:+.2f} to "
+                        f"{poses[-1].z_um:+.2f} µm. The capture is reconstructed when the engine has finished it.")
+
+        if self._stage_async("Stage Z sweep", run, done):
+            self.stage_job.is_sweep = True
+            self.btn_stg_zsweep.setText("Cancel sweep")
+            self.stage_job.finished.connect(lambda: self.btn_stg_zsweep.setText("Z sweep"))
 
     def _page_objective(self):
         self.cmb_obj = QComboBox()
@@ -796,7 +1149,10 @@ class MainWindow(QMainWindow):
         self.sp_lc.setDecimals(1)
         self.sp_lc.setSuffix(" µm")
         self.sp_lc.setSpecialValueText("off")
-        self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off")
+        self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off. "
+                              "Also the cut-off of the profile roughness on the Height tab "
+                              "(0 = a fifth of the profile length)")
+        self.sp_lc.valueChanged.connect(lambda _v: self._update_profile())
         f = QFormLayout()
         f.addRow("Mode", self.cmb_override)
         f.addRow("Focus measure", self.cmb_measure)
@@ -982,6 +1338,9 @@ class MainWindow(QMainWindow):
             self.source = CameraSource(info, w, h, 25)
         self.source.start()
         self.engine.set_source(self.source)
+        if isinstance(self.stage_driver, SimulatedStageDriver) and self.stage_driver.sim_source is not self.sim_source:
+            self._stage_disconnect()  # the simulated stage moves the simulator it was created for
+        self._stage_attach()
         if isinstance(self.source, CameraSource):
             rng = self.source.exposure_range()
             if rng:  # use the device's own limits (the defaults are the Bresser's)
@@ -994,6 +1353,10 @@ class MainWindow(QMainWindow):
         self.btn_autoexp_once.setEnabled(isinstance(self.source, CameraSource))
         self.demo_box.setVisible(self.sim_source is not None)
         self.cmb_res.setVisible(self.sim_source is None)
+        self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
+        if isinstance(self.source, ReplaySource):
+            self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
+            self._set_replay_transport_enabled(self.source.transport_supported)
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()
@@ -1206,7 +1569,7 @@ class MainWindow(QMainWindow):
 
     def _reset_mosaic(self):
         self._cancel_rotation_measure()
-        self.engine.reset_mosaic()
+        self.engine.reset_mosaic(keep_insets=self.chk_keep_insets.isChecked())
         self.notify("Mosaic cleared.")
 
     # ================================================================== calibration actions
@@ -1262,10 +1625,11 @@ class MainWindow(QMainWindow):
                                          f"The line spans {px:.1f} preview pixels.\nTrue distance (µm):", 100.0, 0.1, 1e5, 2)
         if not ok:
             return
-        prev_w = self.p_live.data.shape[1]
+        prev_h, prev_w = self.p_live.data.shape[:2]
         full = (val / px) * prev_w / 1920.0
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = full
+        c.lateral_frame = (int(prev_w), int(prev_h))  # the camera mode this scale covers (same aspect ratio)
         c.lateral_source = f"stage micrometer: {val:g} µm over {px:.1f} px"
         c.lateral_date = today()
         c.lateral_magnification = self.obj.magnification
@@ -1280,6 +1644,7 @@ class MainWindow(QMainWindow):
             return
         c = self.store.get(self.obj)
         c.lateral_um_per_px_full = None
+        c.lateral_frame = None
         c.lateral_magnification = None
         self.store.touch(self.obj)
         self.store.save()
@@ -1409,12 +1774,15 @@ class MainWindow(QMainWindow):
         sim = self.sim_source is not None
         rkey = radiometric_key(live.frame_shape, self.engine.exposure) if live.frame_shape[0] else None
         rad = rkey is not None and rkey in c.darks and rkey in c.flats
+        fh, fw = (live.frame_shape[0], live.frame_shape[1]) if live.frame_shape[0] else (None, 1920)
+        lat_status = c.lateral_status_for(fw, fh)  # CALIBRATED only where it covers the current camera mode
+        lat_ok = lat_status is CalStatus.CALIBRATED
         states = [
             ("Simulator" if sim else ("Live" if cam_ok else "No frames"), "info" if sim else ("success" if cam_ok else "danger")),
             (f"{self.obj.magnification:g}×", "success"),
             ("Done" if rad else ("Partial" if rkey in c.darks or rkey in c.flats else "Optional"),
              "success" if rad else "warning"),
-            ("Calibrated" if c.lateral_um_per_px_full else "Nominal", "success" if c.lateral_um_per_px_full else "warning"),
+            ("Calibrated" if lat_ok else "Nominal", "success" if lat_ok else "warning"),
             ("Estimate" if c.z_um_per_frame else "Frames", "warning"),
             ("Ready" if cam_ok else "Waiting", "success" if cam_ok else "neutral"),
         ]
@@ -1423,10 +1791,16 @@ class MainWindow(QMainWindow):
         nxt = next((i for i, (_, k) in enumerate(states) if k in ("danger",)), None)
         for i, b in enumerate(self.step_btns):
             b.setToolTip("Next step" if i == nxt else "")
-        um_full = c.um_per_px(1920, self.obj)
-        self.chip_xy.set(f"XY {'CAL' if c.lateral_um_per_px_full else 'NOMINAL'} {um_full:.3f} µm/px",
-                         "success" if c.lateral_um_per_px_full else "warning",
-                         c.lateral_source or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
+        um_full = c.um_per_px(fw, self.obj, fh) * fw / 1920.0  # per pixel at 1920 px width, for this camera mode
+        mode_note = ""
+        if c.lateral_um_per_px_full and not lat_ok:
+            mode_note = (f"Not calibrated for this camera mode ({fw}x{fh}): the calibration was measured at "
+                         f"{c.lateral_frame[0]}x{c.lateral_frame[1]}, a different aspect ratio. The nominal scale "
+                         "is used; calibrate again in this mode.")
+        self.chip_xy.set(f"XY {'CAL' if lat_ok else 'NOMINAL'} {um_full:.3f} µm/px",
+                         "success" if lat_ok else "warning",
+                         mode_note or c.lateral_source
+                         or "Nameplate optics only; calibrate with a stage micrometer (step 4)")
         self.chip_z.set(f"Z {'EST ' + format(c.z_um_per_frame, '.3f') + ' µm/f' if c.z_um_per_frame else 'FRAMES'}",
                         "warning", (c.z_source + " — an estimate for new sweeps (same knob speed assumed); state "
                                     "each sweep's travel for CALIBRATED heights") if c.z_um_per_frame
@@ -1439,12 +1813,13 @@ class MainWindow(QMainWindow):
             + f"{o.magnification:g}×  NA {o.na:.2f}{f'  immersion n={o.immersion_n:g}' if o.is_oil else '  dry'}"
             + (f"  cover {o.cover}" if o.cover else "") + f"\nRayleigh {o.rayleigh_um:.2f} µm\n"
             f"Optical cutoff λ/2NA {o.lateral_cutoff_um:.2f} µm\nDepth of field {o.dof_um:.2f} µm\n"
-            f"Pixel {um_full:.3f} µm at 1920 px ({c.lateral_status.value.lower()})")
+            f"Pixel {um_full:.3f} µm at 1920 px ({lat_status.value.lower()})")
         lines = [f"{k}: dark {'✓' if k in c.darks else '—'}, flat {'✓' if k in c.flats else '—'}"
                  for k in sorted(set(c.darks) | set(c.flats))]
         self.lbl_rad.setText("\n".join(lines) or "Nothing recorded for this objective.")
-        self.lbl_lat.setText(f"{c.lateral_status.value}: {c.lateral_source or 'nominal'}"
-                             + (f" ({c.lateral_date})" if c.lateral_date else ""))
+        self.lbl_lat.setText(f"{lat_status.value}: {c.lateral_source or 'nominal'}"
+                             + (f" ({c.lateral_date})" if c.lateral_date else "")
+                             + (f"\n{mode_note}" if mode_note else ""))
         self.lbl_z.setText(f"Stored for {self.obj.name}: {c.z_status.value}"
                            + (f", {c.z_um_per_frame:.4f} µm per frame — {c.z_source}" if c.z_um_per_frame else
                               " (new sweeps in camera frames)") + (f" ({c.z_date})" if c.z_date else ""))
@@ -1467,7 +1842,8 @@ class MainWindow(QMainWindow):
         cal = self.store.get(self.obj)
         # the preview covers the full field of view; the simulator's truth scale is the nominal one
         pw = s.preview.shape[1]
-        um_prev = self.obj.nominal_um_per_px(pw) if self.sim_source is not None else cal.um_per_px(pw)
+        um_prev = (self.obj.nominal_um_per_px(pw) if self.sim_source is not None
+                   else cal.um_per_px(pw, self.obj, s.preview.shape[0]))
         self.um_preview = um_prev
         if self.chk_stretch.isChecked():
             self._stretch = stretch_levels(s.preview, self._stretch)
@@ -1533,6 +1909,13 @@ class MainWindow(QMainWindow):
                               f"{s.frame_shape[1]}×{s.frame_shape[0]} capture · preview {um_prev:.3f} µm/px · "
                               f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}"
                               + self._brightness_note(s.preview))
+        if isinstance(self.source, ReplaySource):
+            paused = self.btn_replay_pause.isChecked()
+            self.btn_replay_pause.setText("▶ Play" if paused else "‖ Pause")
+            if not paused:
+                self.replay_seek.blockSignals(True)
+                self.replay_seek.setValue(min(self.replay_seek.maximum(), self.source.position))
+                self.replay_seek.blockSignals(False)
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))
         if s.brenner_hist:
@@ -1558,7 +1941,7 @@ class MainWindow(QMainWindow):
             self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
             if mode == 2 and parts:
-                key, hz, horig, n = parts[0]
+                key, hz, horig, _ = parts[0]
                 self.p_mosaic.set_image(hz, m_um, unit=self._key_unit(key))
                 self.p_mosaic.set_overlay(None)
                 self.mosaic_origin = horig
@@ -1567,6 +1950,10 @@ class MainWindow(QMainWindow):
                 valid = np.isfinite(img).astype(np.uint8)
                 g = np.clip(np.nan_to_num(img, nan=0.0), 0, 255).astype(np.uint8)
                 rgba = np.dstack([g, g, g, valid * 255])  # empty = transparent; at most ~1600 px: cheap to repaint
+                if self.mosaic_rgb:
+                    rgb = self.engine.mosaic.image_rgb(d)
+                    if rgb is not None:
+                        rgba = rgb
                 self.p_mosaic.set_image(rgba, m_um * d, rgb=True)
                 self.mosaic_origin = origin
                 self._draw_height_overlay(parts if mode == 1 else [], origin, m_um)
@@ -1756,27 +2143,33 @@ class MainWindow(QMainWindow):
         obj = cap.optics or resolve(cap.objective)  # the optics at capture, even if the list was edited since
         cal = self.store.get(obj)
         w = cap.shape[1]
-        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj)
+        um = obj.nominal_um_per_px(w) if cap.simulated else cal.um_per_px(w, obj, cap.shape[0])
         sign = DIRECTIONS.get(self.cmb_dir.currentText())
+        zsrc = ""
         if cap.z is not None and cap.simulated:
             z, unit, zstat, zcal = cap.z, units.UM, CalStatus.SIMULATED.value, None
+        elif cap.z is not None:  # labelled by a motorised stage (capture_z_sweep): um, but only as good as its steps/mm
+            z, unit, zstat, zcal = cap.z, units.UM, CalStatus.ESTIMATED.value, None
+            zsrc = "stage driver readout (not checked against a reference)"
         elif cal.z_um_per_frame:
             z, unit, zstat, zcal = None, units.UM, CalStatus.ESTIMATED.value, cal.z_um_per_frame
         else:
             z, unit, zstat, zcal = None, units.FRAMES, CalStatus.NOMINAL.value, None
         st = zstack.ZSettings(measure=self.cmb_measure.currentText(), form_order=self.sp_form.value(),
                               lam_s_um=self._lam_s(obj), lam_c_um=self.sp_lc.value(),
-                              workers=max(1, (os.cpu_count() or 2) - 1))
-        meta = {"z_status": zstat, "lateral_status": cal.lateral_status.value if not cap.simulated else "SIMULATED",
+                              workers=max(1, (os.cpu_count() or 2) - 1),
+                              backend=self.zst.backend, correct_breathing=self.zst.correct_breathing,
+                              allow_tiling=self.zst.allow_tiling)
+        meta = {"z_status": zstat, "lateral_status": cal.lateral_status_for(w, cap.shape[0]).value if not cap.simulated else "SIMULATED",
                 "pose": cap.pose, "capture_shape": cap.shape, "result_id": uuid.uuid4().hex[:12],
                 "source_id": cap.source_id, "source_generation": cap.source_generation,
                 "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
                 "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
-                "z_source": cal.z_source if zstat == CalStatus.ESTIMATED.value else "",
+                "z_source": zsrc or (cal.z_source if zstat == CalStatus.ESTIMATED.value else ""),
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
         job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
-                  sample_pos=sample_pos, z_sign=sign if z is None else None)
+                  sample_pos=sample_pos, z_sign=sign if z is None else None, color_frames=cap.color_frames)
         if self._start_job(job, lambda r: self._on_result({**r, **meta}), main=True):
             self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
 
@@ -1881,11 +2274,12 @@ class MainWindow(QMainWindow):
                   self.sp_lc.value(), label="Metrology")
         self._start_job(job, lambda m, r=r: self._on_recomputed(r, m), main=True)
 
-    def _on_recomputed(self, r, m):
-        new = dict(r)
+    def _on_recomputed(self, r, m, base=None, message="Metrology recomputed with the new filter settings."):
+        """Install the metrology `m` computed from `base` (a height-edited copy of `r`) or from `r` itself."""
+        new = dict(r if base is None else base)
         for k in metrology.PARAMETER_KEYS:
             new.pop(k, None)
-        new["warnings"] = [x for x in r.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
+        new["warnings"] = [x for x in new.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
         new.update(m)
         for i, h in enumerate(self.history):
             if h is r:
@@ -1895,7 +2289,35 @@ class MainWindow(QMainWindow):
         self.prog.setValue(1000)
         self.lbl_job.setText("Metrology recomputed.")
         self._show_result()
-        self.notify("Metrology recomputed with the new filter settings.", "success")
+        self.notify(message, "success")
+
+    def _ensure_features(self):
+        """Start the on-demand feature job for the current result when the box is ticked and they are missing."""
+        r = self.result
+        if (r is None or not self.chk_topo_grains.isChecked() or r.get("features_done")
+                or any(getattr(j, "feature_for", None) is r and j.isRunning() for j in self.jobs)
+                or "sl_surface" not in r):
+            return
+        job = Job(_feature_job, r, label="Feature parameters")
+        job.feature_for = r
+        self._start_job(job, lambda m, r=r: self._on_features(r, m))
+
+    def _on_features(self, r, m):
+        if not any(h is r for h in self.history) and self.result is not r:
+            return  # the result was replaced (height tool, recompute) while this ran: its features are stale
+        new = dict(r)
+        new.update(m)
+        new["features_done"] = True
+        for i, h in enumerate(self.history):
+            if h is r:
+                self.history[i] = new
+        if self.result is r:
+            self.result = new
+        el = dict(new.get("eligibility", {}))
+        el["feature"] = "ok"
+        new["eligibility"] = el
+        self.lbl_job.setText("Feature parameters computed.")
+        self._show_result()
 
     def _run_sr(self):
         if self.sr_job is not None and self.sr_job.isRunning():
@@ -1910,8 +2332,11 @@ class MainWindow(QMainWindow):
         y0, x0 = (h - c) // 2, (w - c) // 2
         crops = [f[y0:y0 + c, x0:x0 + c].astype(np.float32) for f in frames]
         cal = self.store.get(self.obj)
-        um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w)
-        job = Job(_sr_job, crops, self.obj.psf_sigma_px(um), label="Super-resolution")
+        um = (self.obj.nominal_um_per_px(w) if self.sim_source is not None
+              else cal.um_per_px(w, self.obj, h))
+        job = Job(_sr_job, crops, self.obj.psf_sigma_px(um),
+                  scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve,
+                  label="Super-resolution")
         self.sr_job = job
         self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / 2, "input": crops[0]}))
 
@@ -1957,7 +2382,11 @@ class MainWindow(QMainWindow):
                                  "image, not a measured resolution gain")
         elif r is not None:
             um_cap = r["um_per_px_capture"]
-            self.p_edf.set_image(r["edf"], um_cap, levels=(0, 255), unit="DN")
+            edf_rgb = r.get("edf_rgb")  # colour all-in-focus (fused with the grey weights) when the sweep was colour
+            if edf_rgb is not None:
+                self.p_edf.set_image(edf_rgb, um_cap, unit="DN", rgb=True)
+            else:
+                self.p_edf.set_image(r["edf"], um_cap, levels=(0, 255), unit="DN")
             if self.chk_grains.isChecked() and "watershed_labels" in r:
                 lab = r["watershed_labels"]
                 edges = (np.diff(lab, axis=0, prepend=lab[:1]) != 0) | (np.diff(lab, axis=1, prepend=lab[:, :1]) != 0)
@@ -1969,7 +2398,7 @@ class MainWindow(QMainWindow):
             else:
                 self.p_edf.set_overlay(None)
             self.lbl_edf.setText(f"{r['frames_used']} of {r['frames_in']} frames fused · {r.get('grain_count', 0)} "
-                                 "watershed regions (image-based)")
+                                 "watershed regions (image-based)" + (" · colour" if edf_rgb is not None else ""))
         if r is None:
             self._render_report()
             return
@@ -2003,6 +2432,8 @@ class MainWindow(QMainWindow):
             self.prof_roi.show()
         what = ["filtered height", "raw fitted height", "confidence (0–1)"][mode]
         self.lbl_height.setText(f"{what} · {r['valid_fraction']:.0%} reliable · {um:.3f} µm/px · {z_status_text(r)}")
+        self.btn_tools_reset.setEnabled(bool(r.get("height_tools")))
+        self._ensure_features()
         self._update_profile()
         self._update_3d()
         self._render_report()
@@ -2038,12 +2469,35 @@ class MainWindow(QMainWindow):
             self.prof_label.setText(f"Confidence along {dist[-1]:.1f} µm: mean {np.mean(v):.2f}" if v.size
                                     else "No confidence values along the line.")
         elif v.size > 4:
-            v = v - v.mean()
-            self.prof_label.setText(f"Profile over {dist[-1]:.1f} µm ({v.size} of {n} points valid):  "
-                                    f"Ra {np.mean(np.abs(v)):.4g} {zl}  ·  Rq {np.sqrt(np.mean(v * v)):.4g} {zl}  ·  "
-                                    f"peak-to-valley {np.ptp(v):.4g} {zl}  (unfiltered profile; for orientation only)")
+            self.prof_label.setText(self._roughness_text(r, xs, ys, ok, dist, n))
         else:
             self.prof_label.setText("Too few valid heights along the line for profile values.")
+
+    def _roughness_text(self, r, xs, ys, ok, dist, n) -> str:
+        """ISO 21920 roughness along the profile line, computed by metrology.profile_parameters from the MEASURED
+        height (not the display layer): line levelling, the applied S-filter, and a Gaussian L-filter at λc."""
+        zl = units.label(r["z_unit"])
+        prof = np.full(n, np.nan, np.float32)
+        prof[ok] = cv2.remap(r["height"].astype(np.float32), xs[ok].astype(np.float32).reshape(1, -1),
+                             ys[ok].astype(np.float32).reshape(1, -1), cv2.INTER_LINEAR).ravel()
+        step = float(dist[-1]) / (n - 1)
+        length = float(dist[-1])
+        lam_c = self.sp_lc.value()
+        origin = "L-filter setting"
+        if lam_c <= 0:
+            lam_c, origin = length / metrology.PROFILE_EVAL_CUTOFFS, "default: a fifth of the line"
+        lam_s = float(r.get("lambda_s_um") or 0.0)
+        why = metrology.profile_cutoff_problem(n, step, lam_c)
+        if why is not None:
+            return f"Profile too short for λc = {lam_c:.3g} µm ({origin}): {why}. No roughness reported."
+        p = metrology.profile_parameters(prof, step, lam_s_um=lam_s, lam_c_um=lam_c)
+        if not p:
+            return "Too few valid heights along the line for profile values."
+        s_txt = f"λs {p['lambda_s_applied_um']:.3g} µm" if p["lambda_s_applied_um"] else "no λs"
+        return (f"Roughness over {length:.1f} µm of measured height (ISO 21920 Gaussian filter: {s_txt}, "
+                f"λc {p['lambda_c_applied_um']:.3g} µm [{origin}], line levelled):  "
+                f"Ra {p['Ra']:.4g} {zl}  ·  Rq {p['Rq']:.4g} {zl}  ·  Rz {p['Rz']:.4g} {zl}  ·  "
+                f"Rp {p['Rp']:.4g} {zl}  ·  Rv {p['Rv']:.4g} {zl}")
 
     def _update_3d(self):
         r = self.result
@@ -2149,7 +2603,24 @@ class MainWindow(QMainWindow):
             ("Sv", "Sv", zu, "Maximum pit depth", "{:.4g}", "height"),
             ("Sz", "Sz", zu, "Maximum height (Sp + Sv)", "{:.4g}", "height"),
             ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
+            ("Sdq", "Sdq", "rad", "Mean surface slope (gradient magnitude)", "{:.4g}", "height"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])
+        vol_unit = "µm³/µm²" if units.is_um(r["z_unit"]) else f"{zu} (per unit area)"
+        body += table("Volume parameters (per unit area, p = 10 %, q = 80 %)", [
+            ("Vmp", "Vmp", vol_unit, "Material volume of the peaks: Vm(10 %)", "{:.4g}", "functional"),
+            ("Vmc", "Vmc", vol_unit, "Material volume of the core: Vm(80 %) − Vm(10 %)", "{:.4g}", "functional"),
+            ("Vvc", "Vvc", vol_unit, "Void volume of the core: Vv(10 %) − Vv(80 %)", "{:.4g}", "functional"),
+            ("Vvv", "Vvv", vol_unit, "Void volume of the valleys: Vv(80 %)", "{:.4g}", "functional")])
+        body += table("Feature / summit parameters", [
+            ("Sds", "Sds_per_mm2", "summits/mm²", "Density of ALL 8-neighbour maxima (unpruned, noise-sensitive)",
+             "{:.4g}", "feature"),
+            ("Ssc", "Ssc_per_um", "1/µm", "Mean curvature at those summits", "{:.4g}", "feature"),
+            ("Spd", "Spd_per_mm2", "peaks/mm²", "Density of significant peaks (Wolf pruning, 5 % of Sz)",
+             "{:.4g}", "feature"),
+            ("Spc", "Spc_per_um", "1/µm", "Mean curvature of the significant peaks", "{:.4g}", "feature"),
+            ("S5p", "S5p", zu, "Mean height of the five highest significant peaks", "{:.4g}", "feature"),
+            ("S5v", "S5v", zu, "Mean depth of the five deepest significant pits", "{:.4g}", "feature"),
+            ("S10z", "S10z", zu, "S5p + S5v", "{:.4g}", "feature")])
         body += table("Material ratio (functional)", [
             ("Sk", "Sk", zu, "Core height (40% secant of the material ratio curve)", "{:.4g}", "functional"),
             ("Spk", "Spk", zu, "Reduced peak height", "{:.4g}", "functional"),
@@ -2174,8 +2645,14 @@ class MainWindow(QMainWindow):
             ("Mean region area", "mean_grain_area_um2", "µm²", ""),
             ("Mean max Feret", "mean_max_feret_um", "µm", ""), ("Mean circularity", "mean_circularity", "", "4πA/P²"),
             ("Mean lineal intercept", "mean_intercept_um", "µm", "Heyn intercept on the region boundaries"),
-            ("ASTM E112-style G", "ASTM_E112_G", "", "From the mean intercept; needs calibrated X-Y and a real "
-             "grain structure")])
+            ("ASTM E112-style G", "ASTM_E112_G", "", ("From the mean intercept; needs calibrated X-Y and a real "
+             "grain structure"))])
+        if self.chk_topo_grains.isChecked() and r is not None:
+            body += table("Topographic hills", [
+                ("Hill count", "topo_grain_count", "", ("Significant hills (watershed of the pruned peaks) not "
+                 "touching the border"), "{:d}", "feature"),
+                ("Mean hill area", "topo_mean_grain_area_um2", "µm²", "Mean catchment area of those hills", "{:.4g}",
+                 "feature")])
         prov = [("Result", r.get("label", "")), ("Result id", r.get("result_id", "—")), ("Objective", r["objective"]),
                 ("Source", f"{r.get('source_id', '—')} (generation {r.get('source_generation', '—')})"),
                 ("Frames used", f"{r['frames_used']} of {r['frames_in']}"),
@@ -2280,6 +2757,8 @@ class MainWindow(QMainWindow):
         if not p:
             return
         extra = {"um_preview": getattr(self, "um_preview", None)}
+        if len(self.engine.mosaic.keyframes) >= 1:
+            extra["mosaic"] = self.engine.mosaic_state()  # under the engine lock: the engine thread mutates it
         if mosaic_ok:
             extra.update(mosaic_image=img, mosaic_origin=list(origin))
             if parts:
@@ -2307,7 +2786,8 @@ class MainWindow(QMainWindow):
         if not p:
             return
         try:
-            r, s = export.load_session(p)  # validated before anything in the window changes
+            r, _s = export.load_session(p)  # validated before anything in the window changes
+            mosaic = r.pop("mosaic", None)  # the saved pose graph; applied to the live engine only at the end
             has = "height" in r
             if has:  # pin the optics it was made with; an unknown objective fails here with a clear message
                 r["objective_spec"] = resolve_result(r).to_dict()
@@ -2320,8 +2800,8 @@ class MainWindow(QMainWindow):
                                       r.get("lambda_s_um"), r.get("lambda_c_um", 0.0))
                 kept = [w for w in r.get("warnings", []) if not metrology.is_metrology_warning(w)]
                 r["warnings"] = kept + m.pop("warnings") + [
-                    "Opened from an older session file: the processing image and the filtered surface were "
-                    "recomputed from the stored heights (the original processing image was not stored)."]
+                    ("Opened from an older session file: the processing image and the filtered surface were "
+                     "recomputed from the stored heights (the original processing image was not stored).")]
                 r.update({k: v for k, v in m.items() if k not in r or k in metrology.PARAMETER_KEYS})
             if isinstance(r.get("mosaic_image"), np.ndarray):
                 parts = []
@@ -2333,12 +2813,23 @@ class MainWindow(QMainWindow):
                     um_loaded = None
                     if has and isinstance(r.get("preview_shape"), (list, tuple)) and len(r["preview_shape"]) == 2 and r["preview_shape"][1]:
                         um_loaded = float(r["um_per_px"]) * float(r["height"].shape[1]) / float(r["preview_shape"][1])
-                self.loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
-                self.last_mosaic_version = -1
+                loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
+            else:
+                loaded_mosaic = None
             if has:
                 r.setdefault("result_id", uuid.uuid4().hex[:12])
                 r["mosaic_generation"] = -1  # never pinned into the live mosaic
                 r["label"] = f"{Path(p).name}: {r.get('label', '')}".strip(": ")
+            # everything is validated: apply. The live mosaic is replaced under the engine lock, in one step
+            # (load_mosaic_state is all-or-nothing); the saved mosaic is the loader's private copy.
+            if mosaic is not None:
+                mmeta, marrays = mosaic.to_state_arrays()
+                self.engine.load_mosaic_state(mmeta, marrays)
+                self.last_mosaic_version = -1
+            if loaded_mosaic is not None:
+                self.loaded_mosaic = loaded_mosaic
+                self.last_mosaic_version = -1
+            if has:
                 self.result = r
                 self._remember(r)
                 self._show_result()
@@ -2348,6 +2839,275 @@ class MainWindow(QMainWindow):
             self.notify(f"Opened {p}" + ("" if has else " (mosaic only)"), "success")
         except Exception as e:  # noqa: BLE001 - a damaged file is reported, the window is unchanged
             self.notify(f"Could not open session: {e}", "danger")
+
+    # ================================================================== Slice 5: capability wiring
+    def _set_color_mode(self, on: bool):
+        self.color_mode = bool(on)
+        self.engine.color_mode = bool(on)  # without this the engine never kept colour frames and the colour EDF was unreachable
+
+    # ---------------------------------------------------------------- replay transport bar
+    def _replay_bar(self):
+        h = QHBoxLayout(); h.setContentsMargins(6, 4, 6, 4)
+        self.btn_replay_pause = QPushButton("‖ Pause")
+        self.btn_replay_pause.setCheckable(True)
+        self.btn_replay_pause.clicked.connect(self._replay_toggle)
+        self.btn_replay_step_b = QPushButton("◀ Step −1")
+        self.btn_replay_step_b.clicked.connect(lambda: self._replay_step(-1))
+        self.btn_replay_step_f = QPushButton("Step +1 ▶")
+        self.btn_replay_step_f.clicked.connect(lambda: self._replay_step(1))
+        self.replay_seek = QSlider(Qt.Horizontal)
+        self.replay_seek.setRange(0, 0)
+        self.replay_seek.sliderReleased.connect(self._replay_seek_done)
+        h.addWidget(self.btn_replay_pause)
+        h.addWidget(self.btn_replay_step_b)
+        h.addWidget(self.btn_replay_step_f)
+        h.addWidget(self.replay_seek, 1)
+        h.addWidget(QLabel("Speed"))
+        self.cmb_replay_speed = QComboBox()
+        self.cmb_replay_speed.addItems(["0.25×", "0.5×", "1×", "2×", "4×"])
+        self.cmb_replay_speed.setCurrentText("1×")
+        self.cmb_replay_speed.setFixedWidth(56)
+        self.cmb_replay_speed.currentTextChanged.connect(self._replay_speed)
+        h.addWidget(self.cmb_replay_speed)
+        self.chk_replay_loop = QCheckBox("Loop")
+        self.chk_replay_loop.toggled.connect(self._replay_loop)
+        h.addWidget(self.chk_replay_loop)
+        return h
+
+    def _set_replay_transport_enabled(self, on: bool):
+        """Pause/step/seek/speed act only on a paced replay; an exhaustive (consumer-paced) one refuses them."""
+        for wdg in (self.btn_replay_pause, self.btn_replay_step_b, self.btn_replay_step_f, self.replay_seek,
+                    self.cmb_replay_speed):
+            wdg.setEnabled(on)
+            wdg.setToolTip("" if on else "Not available: this recording is replayed frame by frame as fast as it is processed")
+
+    def _replay_toggle(self, checked: bool):
+        s = self.source
+        if not isinstance(s, ReplaySource):
+            return
+        if checked:
+            s.pause()
+            self.btn_replay_pause.setText("▶ Play")
+        else:
+            s.resume()
+            self.btn_replay_pause.setText("‖ Pause")
+
+    def _replay_step(self, delta: int):
+        s = self.source
+        if isinstance(s, ReplaySource):
+            s.step_frames(delta)
+            self.btn_replay_pause.setChecked(True)
+            self.btn_replay_pause.setText("▶ Play")
+
+    def _replay_seek_done(self):
+        s = self.source
+        if isinstance(s, ReplaySource):
+            s.seek(self.replay_seek.value())
+            self.btn_replay_pause.setChecked(True)
+            self.btn_replay_pause.setText("▶ Play")
+
+    def _replay_speed(self, text: str):
+        s = self.source
+        if isinstance(s, ReplaySource):
+            s.set_speed(float(text.replace("×", "")))
+
+    def _replay_loop(self, on: bool):
+        s = self.source
+        if isinstance(s, ReplaySource):
+            s.set_loop(on)
+
+    # ---------------------------------------------------------------- mosaic bar
+    def _mosaic_blend(self, text: str):
+        self.engine.mosaic.set_blending(text)
+        self.last_mosaic_version = -1
+
+    def _mosaic_track_rotation(self, on: bool):
+        self.track_rotation = bool(on)
+        self.engine.mosaic.track_rotation = bool(on)
+        self.last_mosaic_version = -1
+
+    def _mosaic_rgb_mode(self, on: bool):
+        self.mosaic_rgb = bool(on)
+        self.last_mosaic_version = -1
+
+    def _mosaic_add_inset(self):
+        s = self.engine.snapshot()
+        if s.preview is None:
+            self.notify("No live image to inset yet.", "warning")
+            return
+        um = s.um_preview if (s.um_preview and s.um_preview > 0) else self.obj.lateral_um_per_px_full
+        if not (um and um > 0):
+            um = self.obj.nominal_um_per_px(s.preview.shape[1])
+        x_um, y_um = s.mosaic_origin
+        self.engine.mosaic.add_inset(self.obj.name, um, x_um, y_um, s.preview)
+        self.last_mosaic_version = -1
+        self.notify(f"Inset added: {s.preview.shape[1]}×{s.preview.shape[0]} px")
+
+    # ---------------------------------------------------------------- height interactive tools
+    # The tools act on the MEASURED height (result["height"]), whatever layer is displayed, and then the result's
+    # metrology is recomputed through the same job as a filter change (_metrology_job -> _on_recomputed), so the
+    # filtered surface, every displayed layer, every parameter and the report agree. The reconstructed height is
+    # kept in result["height_reconstructed"]; every edit is listed in result["height_tools"] and in the warnings.
+    TOOL_WARNING = "Height edited by the user"
+
+    def _tool_warning(self, rec: dict) -> str:
+        if rec["tool"] == "level3":
+            pts = ", ".join(f"({x:.0f}, {y:.0f})" for x, y in rec["points_px"])
+            return f"{self.TOOL_WARNING}: surface levelled through the 3 points {pts} px (plane subtracted)."
+        x0, y0, x1, y1 = rec["rect_px"]
+        return f"{self.TOOL_WARNING}: pixels x {x0}–{x1}, y {y0}–{y1} excluded (set to no data)."
+
+    def _commit_height_tool(self, new_height: np.ndarray, rec: dict, message: str):
+        """Replace the measured height by `new_height` and recompute all metrology from it (existing job)."""
+        r = self.result
+        base = dict(r)
+        if "height_reconstructed" not in base:
+            base["height_reconstructed"] = r["height"]
+            base["height_raw_at_edit"] = r.get("height_raw")
+        base["height"] = new_height
+        base["height_tools"] = list(r.get("height_tools", [])) + [rec]
+        base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
+        base["warnings"] += [self._tool_warning(x) for x in base["height_tools"]]
+        job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),
+                  label="Metrology")
+        self._start_job(job, lambda m, r=r, base=base: self._on_recomputed(r, m, base=base, message=message),
+                        main=True)
+
+    def _reset_height_tools(self):
+        r = self.result
+        if r is None or "height_reconstructed" not in r:
+            return
+        if r.get("height_raw") is not r.get("height_raw_at_edit"):
+            self.notify("The heights were rescaled after they were edited; reconstruct again to get the original.",
+                        "warning")
+            return
+        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_raw_at_edit", "height_tools")}
+        base["height"] = r["height_reconstructed"]
+        base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
+        job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),
+                  label="Metrology")
+        self._start_job(job, lambda m, r=r, base=base: self._on_recomputed(
+            r, m, base=base, message="Height tools reset: the reconstructed height is restored."), main=True)
+
+    def _disarm_tools(self):
+        """Hide every tool ROI and leave levelling mode."""
+        self._armed_tool = None
+        for roi in (self.mask_roi, self.step_roi_a, self.step_roi_b):
+            roi.hide()
+        self.btn_mask.setText("Exclude ROI")
+        self.btn_step.setText("Step height A→B")
+        self.btn_tool_cancel.hide()
+        if self.btn_level3.isChecked():
+            self.btn_level3.setChecked(False)  # leaves levelling mode through _level_mode
+
+    def _place_roi(self, roi, fx, fy, fw, fh):
+        """Position a tool ROI at a fraction of the height map (in µm group coordinates)."""
+        r = self.result
+        h, w = r["height"].shape
+        um = r["um_per_px"]
+        roi.setPos((fx * w * um, fy * h * um))
+        roi.setSize((fw * w * um, fh * h * um))
+
+    def _tool_pressed(self, which: str):
+        """First press arms the tool (its ROIs appear); the second press applies it."""
+        r = self.result
+        if r is None:
+            self.notify("No height map yet.", "warning")
+            return
+        if getattr(self, "_armed_tool", None) != which:
+            self._disarm_tools()
+            self._armed_tool = which
+            if which == "mask":
+                self._place_roi(self.mask_roi, 0.35, 0.35, 0.3, 0.3)
+                self.mask_roi.show()
+                self.btn_mask.setText("Apply exclusion")
+                self.notify("Move and resize the pink rectangle, then press “Apply exclusion”.")
+            else:
+                self._place_roi(self.step_roi_a, 0.1, 0.4, 0.3, 0.2)
+                self._place_roi(self.step_roi_b, 0.6, 0.4, 0.3, 0.2)
+                self.step_roi_a.show()
+                self.step_roi_b.show()
+                self.btn_step.setText("Measure step")
+                self.notify("Place the two orange rectangles on the two terraces, then press “Measure step”.")
+            self.btn_tool_cancel.show()
+            return
+        (self._apply_mask_roi if which == "mask" else self._measure_step_roi)()
+
+    def _level_mode(self, on: bool):
+        self.level_picking = bool(on)
+        self.level_pts = []
+        if on:
+            for roi in (self.mask_roi, self.step_roi_a, self.step_roi_b):
+                roi.hide()
+            self._armed_tool = None
+            self.btn_mask.setText("Exclude ROI")
+            self.btn_step.setText("Step height A→B")
+        self.btn_level3.setText("Finish: click 3 points" if on else "Level: pick 3 points")
+        self.notify("Click 3 points on the height map to level it (local plane fit around each)." if on
+                    else "3-point levelling cancelled.")
+
+    def _on_height_clicked(self, x_px: float, y_px: float):
+        if not self.level_picking:
+            return
+        r = self.result
+        if r is None:
+            return
+        self.level_pts.append((float(x_px), float(y_px)))
+        self.notify(f"Level point {len(self.level_pts)}/3 at ({x_px:.0f}, {y_px:.0f}) px")
+        if len(self.level_pts) < 3:
+            return
+        pts, self.level_pts = self.level_pts, []
+        self.level_picking = False
+        self.btn_level3.blockSignals(True)
+        self.btn_level3.setChecked(False)
+        self.btn_level3.setText("Level: pick 3 points")
+        self.btn_level3.blockSignals(False)
+        um = r.get("um_per_px", 1.0)
+        radius = max(3, round(10 / um))
+        try:
+            levelled = metrology.level_three_points(r["height"], pts, radius_px=radius)
+        except ValueError as e:
+            self.notify(f"3-point levelling failed: {e}", "warning")
+            return
+        self._commit_height_tool(levelled, {"tool": "level3", "points_px": [list(p) for p in pts],
+                                            "radius_px": radius},
+                                 "Height map levelled through the 3 picked points; all parameters recomputed.")
+
+    def _apply_mask_roi(self):
+        r = self.result
+        if r is None:
+            return
+        rect_px = self._roi_rect_px(self.mask_roi, r.get("um_per_px", 1.0))
+        masked = metrology.apply_exclusion_mask(r["height"], rect_px)
+        self._disarm_tools()
+        self._commit_height_tool(masked, {"tool": "exclude", "rect_px": list(rect_px)},
+                                 "Mask ROI excluded from the height map; all parameters recomputed.")
+
+    def _measure_step_roi(self):
+        r = self.result
+        if r is None:
+            return
+        um = r.get("um_per_px", 1.0)
+        ra = self._roi_rect_px(self.step_roi_a, um)
+        rb = self._roi_rect_px(self.step_roi_b, um)
+        try:
+            m = metrology.step_height_regions(r["height"], ra, rb)
+        except ValueError as e:
+            self.notify(str(e), "warning")
+            return
+        zl = units.label(r["z_unit"])
+        self.lbl_height.setText(f"Step A→B: {m['step_height']:+.4g} {zl}  (SE ±{m['standard_error']:.4g} {zl}, "
+                                f"{m['pixels_a']}/{m['pixels_b']} px)")
+        self.notify(f"Step height {m['step_height']:+.4g} {zl}.", "success")
+        self._disarm_tools()
+
+    @staticmethod
+    def _roi_rect_px(roi, um):
+        """ROI item rect (group/µm coords) converted to an integer pixel rect (x0, y0, x1, y1)."""
+        p = roi.pos()
+        s = roi.size()
+        return (round(p.x() / um), round(p.y() / um),
+                round((p.x() + s.x()) / um), round((p.y() + s.y()) / um))
 
     # ================================================================== shutdown
     def closeEvent(self, ev):
@@ -2369,4 +3129,7 @@ class MainWindow(QMainWindow):
         self.engine.stop()
         if self.source is not None:
             self.source.stop()
+        if self.stage_driver is not None:  # after the source: its thread reads the stage for every frame
+            self.stage_driver.close()
+            self.stage_driver = None
         super().closeEvent(ev)

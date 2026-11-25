@@ -22,6 +22,18 @@ import numpy as np
 
 from .optics import Objective
 from .simulator import SpecimenSimulator
+from .stage import StageError, StageReadout
+
+SUPPORTED_RESOLUTIONS = (
+    "1920x1080",
+    "1280x720",
+    "1600x1200",
+    "1440x1080",
+    "1080x1080",
+    "1024x768",
+    "640x480",
+    "3840x2160",
+)
 
 
 @dataclass
@@ -38,7 +50,8 @@ def list_cameras() -> list[CameraInfo]:
         for dev in sorted(glob.glob("/dev/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0)):
             idx = int(re.sub(r"\D", "", dev))
             try:
-                name = open(f"/sys/class/video4linux/video{idx}/name").read().strip()
+                with open(f"/sys/class/video4linux/video{idx}/name") as fh:
+                    name = fh.read().strip()
             except OSError:
                 name = dev
             if _v4l2_is_capture(dev):
@@ -53,22 +66,29 @@ def list_cameras() -> list[CameraInfo]:
 
 
 def _v4l2_is_capture(dev: str) -> bool:
+    """Whether `dev` lists at least one capture pixel format (metadata-only nodes list none).
+
+    Both layouts of `v4l2-ctl --list-formats` are accepted: current v4l-utils print `[0]: 'MJPG' ...`, older ones
+    print `Index : 0 / Type : Video Capture / Pixel Format: 'MJPG'`. The second form was added in 59a96f2 so such
+    systems do not show an empty camera list; checked against sample outputs only, NOT hardware-verified here.
+    """
     if shutil.which("v4l2-ctl"):
         try:
             out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats"], capture_output=True, text=True,
-                                 timeout=3).stdout
-            return "[0]:" in out
+                                 timeout=3, check=False).stdout
+            return "[0]:" in out or "Pixel Format" in out
         except (subprocess.SubprocessError, OSError):
             return False
     return True
 
 
 class V4L2Controls:
-    """Thin wrapper over `v4l2-ctl` for UVC controls OpenCV cannot reliably set (Linux only)."""
+    """Thin wrapper over `v4l2-ctl` for UVC controls and `gphoto2` for loopback DSLRs."""
 
     def __init__(self, path: str):
         self.path = path
         self.available = bool(path) and shutil.which("v4l2-ctl") is not None
+        self.gphoto_available = shutil.which("gphoto2") is not None
         self._lock = threading.Lock()
         self.last_error: str | None = None
 
@@ -78,7 +98,7 @@ class V4L2Controls:
         with self._lock:
             try:
                 out = subprocess.run(["v4l2-ctl", "-d", self.path, "--list-ctrls"], capture_output=True, text=True,
-                                     timeout=3).stdout
+                                     timeout=3, check=False).stdout
                 self.last_error = None
             except (subprocess.SubprocessError, OSError) as e:
                 self.last_error = str(e)
@@ -100,7 +120,7 @@ class V4L2Controls:
             for k, v in values.items():
                 try:
                     subprocess.run(["v4l2-ctl", "-d", self.path, f"--set-ctrl={k}={int(v)}"],
-                                   capture_output=True, timeout=3)
+                                   capture_output=True, timeout=3, check=False)
                 except (subprocess.SubprocessError, OSError) as e:
                     self.last_error = str(e)
                     return {}
@@ -121,8 +141,14 @@ class FrameSource:
         self.error: str | None = None
         self.warnings: list[str] = []
         self._consumed = 0  # last sequence number the engine finished (used by the ordered replay mode)
+        self.stage_driver = None  # optional StageDriver for live encoder / motorised Z readout
         FrameSource._ids += 1
         self.source_id = f"{type(self).__name__}-{FrameSource._ids}"
+
+    @property
+    def consumed_seq(self) -> int:
+        """Sequence number of the last frame the consumer reported as processed."""
+        return self._consumed
 
     def consumed(self, seq: int) -> None:
         """Called by the consumer after processing frame `seq` (back-pressure for lossless replay)."""
@@ -140,7 +166,19 @@ class FrameSource:
 
     def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1):
         """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
-        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps."""
+        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps.
+
+        When a StageDriver is attached (`stage_driver`) and the source supplies no truth of its own, the frame is
+        labelled with the stage's pose read now (`StageReadout`, z in um). A stage that fails or is
+        disconnected leaves the frame unlabelled: a missing label, never a made-up one.
+        """
+        if truth is None and self.stage_driver is not None:
+            try:
+                p = self.stage_driver.pose()
+                if p.connected:
+                    truth = StageReadout(p.x_um, p.y_um, p.z_um)
+            except (StageError, OSError):
+                pass  # no label for this frame; the driver reports its failure to whoever commands it
         with self._lock:
             self._seq += max(1, int(step))
             self._frame = (frame, time.perf_counter() if ts is None else ts, self._seq, truth)
@@ -154,7 +192,7 @@ class FrameSource:
 
 
 class CameraSource(FrameSource):
-    """UVC camera: MJPG at the requested size; on Linux, manual exposure and no in-camera sharpening."""
+    """UVC / DirectShow / AVFoundation / loopback camera."""
 
     def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25):
         super().__init__()
@@ -171,8 +209,21 @@ class CameraSource(FrameSource):
         self.applied_seq = 0  # incremented every time `applied` is replaced (the GUI refreshes its readback on it)
 
     def open(self) -> cv2.VideoCapture:
-        api = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
+        if sys.platform.startswith("linux"):
+            api = cv2.CAP_V4L2
+        elif sys.platform == "win32":
+            # DirectShow rather than OpenCV's default (MSMF) on Windows: the manual-exposure fallback in
+            # _apply_controls writes CAP_PROP_EXPOSURE as log2(seconds), the DirectShow convention, and falls back
+            # to CAP_ANY just below if the device cannot be opened that way. Introduced in 59a96f2 without a
+            # recorded measurement; NOT hardware-verified here (no camera was attached when this was reviewed).
+            api = cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            api = cv2.CAP_AVFOUNDATION
+        else:
+            api = cv2.CAP_ANY
         cap = cv2.VideoCapture(self.info.index, api)
+        if not cap.isOpened() and api != cv2.CAP_ANY:
+            cap = cv2.VideoCapture(self.info.index, cv2.CAP_ANY)
         if not cap.isOpened():
             raise RuntimeError(f"cannot open camera {self.info.name}")
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -181,7 +232,7 @@ class CameraSource(FrameSource):
         cap.set(cv2.CAP_PROP_FPS, self.req[2])
         fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
         self.readback = {
-            "fourcc": "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)),
+            "fourcc": "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip() or "RAW",
             "size": f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
             "fps_nominal": cap.get(cv2.CAP_PROP_FPS), "backend": cap.getBackendName(),
         }
@@ -233,35 +284,39 @@ class CameraSource(FrameSource):
         if self.controls.available:
             vals = {}
             ctrls = self.controls.list()
-            if "auto_exposure" in ctrls:
-                vals["auto_exposure"] = 3 if exposure is None else 1
-            if exposure is not None and "exposure_time_absolute" in ctrls:
-                c = ctrls["exposure_time_absolute"]
-                vals["exposure_time_absolute"] = int(np.clip(exposure, c.get("min", 1), c.get("max", 10000)))
-            if sharpness_off and "sharpness" in ctrls:
-                vals["sharpness"] = ctrls["sharpness"].get("min", 0)
-            if "backlight_compensation" in ctrls:
-                vals["backlight_compensation"] = 0
-            # anything else that changes brightness or colour between frames is locked during measurement
-            if exposure is not None:
-                for k in ("exposure_dynamic_framerate", "exposure_auto_priority", "white_balance_automatic",
-                          "white_balance_temperature_auto", "gain_automatic", "autogain"):
-                    if k in ctrls:
-                        vals[k] = 0
-            return self.controls.set(**vals)
-        if cap is not None:  # no v4l2-ctl (Windows, macOS): best-effort OpenCV properties, from the capture thread
+            if ctrls:
+                if "auto_exposure" in ctrls:
+                    vals["auto_exposure"] = 3 if exposure is None else 1
+                if exposure is not None and "exposure_time_absolute" in ctrls:
+                    c = ctrls["exposure_time_absolute"]
+                    vals["exposure_time_absolute"] = int(np.clip(exposure, c.get("min", 1), c.get("max", 10000)))
+                if sharpness_off and "sharpness" in ctrls:
+                    vals["sharpness"] = ctrls["sharpness"].get("min", 0)
+                if "backlight_compensation" in ctrls:
+                    vals["backlight_compensation"] = 0
+                if exposure is not None:
+                    for k in ("exposure_dynamic_framerate", "exposure_auto_priority", "white_balance_automatic",
+                              "white_balance_temperature_auto", "gain_automatic", "autogain"):
+                        if k in ctrls:
+                            vals[k] = 0
+                return self.controls.set(**vals)
+        # Cross-platform OpenCV property fallback (Windows DirectShow/MSMF, macOS AVFoundation, Linux loopback)
+        if cap is not None:
             got = {}
             if exposure is None:
                 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if sys.platform.startswith("linux") else 1)
             else:
                 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if sys.platform.startswith("linux") else 0)
-                # DirectShow / MSMF take log2 seconds; 100 us units -> seconds
                 v = math.log2(max(exposure, 1) * 1e-4) if sys.platform == "win32" else float(exposure)
                 cap.set(cv2.CAP_PROP_EXPOSURE, v)
                 cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                # Gain is deliberately left to the device: 59a96f2 forced CAP_PROP_GAIN=0 here, which silently darkens
+                # the image on cameras whose gain 0 is not "unity" and is not reported in the read-back. The V4L2 path
+                # only switches automatic gain off (it keeps the current value); this path cannot do even that.
             if sharpness_off:
                 cap.set(cv2.CAP_PROP_SHARPNESS, 0)
-            got["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE)
+            got["exposure"] = round(float(cap.get(cv2.CAP_PROP_EXPOSURE)), 3)
+            got["sharpness"] = round(float(cap.get(cv2.CAP_PROP_SHARPNESS)), 3)
             return got
         return {}
 
@@ -297,7 +352,7 @@ class CameraSource(FrameSource):
         except RuntimeError as e:
             self.error = str(e)
             return
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here (and record them if asked)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)  # ask for MJPEG bytes; decode here
         self.recording = False
         self.rec_writer = None
         t0, n, n_total = time.perf_counter(), 0, 0
@@ -323,7 +378,7 @@ class CameraSource(FrameSource):
             if self._apply_pending or n_total == 0:
                 self._apply_now(cap)
             n_total += 1
-            if raw.ndim == 3:  # the backend decoded already: raw MJPEG is not available from this camera
+            if raw.ndim == 3:
                 frame = raw
                 self.readback["delivery"] = "decoded by the backend"
             else:
@@ -337,8 +392,8 @@ class CameraSource(FrameSource):
             if self.recording and w is not None:
                 try:
                     w.add(raw, n_total, time.perf_counter() - self.rec_t0)
-                except Exception as e:  # noqa: BLE001 - disk full etc.: stop and say so
-                    if not (w.closed and w.error is None):  # a frame in flight when Stop landed is no error
+                except Exception as e:  # noqa: BLE001
+                    if not (w.closed and w.error is None):
                         self.rec_error = str(e)
                         self.stop_recording()
                         self.rec_error = str(e)
@@ -390,10 +445,18 @@ class SimulatorSource(FrameSource):
             zs = s.sweep_trajectory(reversal=reversal)
             # move to the start smoothly (as a hand would), pause briefly, then sweep
             approach = np.linspace(s.focus_z_um, zs[0], 25)
-            p = lambda z: (s.stage_x_um, s.stage_y_um, float(z))  # noqa: E731
+            p = lambda z: (s.stage_x_um, s.stage_y_um, float(z))
             back = np.linspace(zs[-1], self._best_focus(), 30)  # refocus afterwards, as a user would
             self.script = [p(z) for z in approach] + [p(zs[0])] * 6 + [p(z) for z in zs] + [p(zs[-1])] * 25 \
                 + [p(z) for z in back]
+
+    def relief_range_um(self) -> tuple[float, float]:
+        """Focus heights (um) that bracket the visible relief by 3 DOF each side: a stage Z sweep over this
+        range passes every pixel through focus (the same bracket as `SpecimenSimulator.sweep_trajectory`)."""
+        with self.lock:
+            _, hz = self.sim.truth_patch()
+            dof = self.sim.objective.dof_um
+        return float(hz.min()) - 3 * dof, float(hz.max()) + 3 * dof
 
     def busy(self) -> bool:
         return bool(self.script)
@@ -420,12 +483,7 @@ def opencv_threads(n: int | None = None) -> None:
 
 
 class ReplaySource(FrameSource):
-    """Plays back a recording (see recording.py).
-
-    Real-time mode (default) follows the recorded timing; a slow consumer skips frames, as with a camera.
-    Ordered mode (exhaustive=True) publishes each frame only after the consumer has finished the previous one,
-    so every frame is analysed in order regardless of load (deterministic offline processing).
-    """
+    """Plays back a recording with full transport controls (pause, resume, seek, frame-step, speed, loop)."""
 
     def __init__(self, folder: str, speed: float = 1.0, loop: bool = False, exhaustive: bool = False):
         super().__init__()
@@ -436,11 +494,89 @@ class ReplaySource(FrameSource):
         self.files = self.manifest.files
         self.stamps = self.manifest.stamps
         self.warnings = list(self.manifest.warnings)
-        self.speed, self.loop, self.exhaustive = speed, loop, exhaustive
+        self.speed = max(0.05, float(speed))
+        self.loop = bool(loop)
+        self.exhaustive = exhaustive
         self.readback = {"replay": str(self.folder), "frames": len(self.files), "mode": self.manifest.mode,
                          **self.manifest.meta.get("readback", {})}
         self.done = False
         self.corrupt = 0
+        self.paused = False
+        self.position = 0
+        self._seek_target: int | None = None
+        self._ctrl_lock = threading.Lock()
+        self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
+
+    @property
+    def total_frames(self) -> int:
+        return len(self.files)
+
+    @property
+    def transport_supported(self) -> bool:
+        """False in exhaustive (lossless) mode: the consumer paces that playback, so pause, seek, step and speed
+        have no meaning and are refused (RuntimeError) instead of being silently ignored."""
+        return not self.exhaustive
+
+    def _need_transport(self, what: str) -> None:
+        if self.exhaustive:
+            raise RuntimeError(f"{what} is not available in exhaustive replay mode (the consumer paces the playback)")
+
+    def pause(self) -> None:
+        self._need_transport("pause")
+        with self._ctrl_lock:
+            self.paused = True
+
+    def resume(self) -> None:
+        self._need_transport("resume")
+        with self._ctrl_lock:
+            self.paused = False
+            if self.done:
+                self._seek_target = 0
+                self.done = False
+
+    def toggle_pause(self) -> bool:
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
+        return self.paused
+
+    def seek(self, index: int) -> None:
+        """Jump to frame `index` (0 .. total_frames - 1) and publish it immediately."""
+        self._need_transport("seek")
+        with self._ctrl_lock:
+            self._seek_target = int(np.clip(index, 0, max(0, len(self.files) - 1)))
+            self.done = False
+
+    def step_frames(self, delta: int = 1) -> None:
+        """Pause and step by `delta` frames from the last published position.
+
+        The step bases on ``self.position`` (the frame the playback thread has
+        actually published), never on a pending ``_seek_target``: ``resume()`` at
+        EOF may leave ``_seek_target == 0`` until the thread wakes up to consume
+        it, and ``pause()`` can arrive before that consumption. A step must never
+        restart from that stale target. Consequently two steps issued before the
+        thread has published the first one are one step (the second is computed from
+        the same published position), and a frame the thread was already decoding when
+        the step arrived is dropped rather than shown after it.
+        """
+        self._need_transport("step")
+        with self._ctrl_lock:
+            self.paused = True
+            base = self.position
+            self._seek_target = int(np.clip(base + delta, 0, max(0, len(self.files) - 1)))
+            self.done = False
+
+    def set_speed(self, speed: float) -> None:
+        """Playback speed multiplier. The schedule is re-anchored on the next loop pass, so the new speed applies
+        from the frame published last: no stall when slowing down, no burst of catch-up frames when speeding up."""
+        self._need_transport("speed change")
+        with self._ctrl_lock:
+            self.speed = max(0.05, float(speed))
+
+    def set_loop(self, loop: bool) -> None:
+        with self._ctrl_lock:
+            self.loop = bool(loop)
 
     def frames(self):
         """Every decodable frame in order (damaged files are counted in self.corrupt and skipped)."""
@@ -453,32 +589,113 @@ class ReplaySource(FrameSource):
                 continue
             yield img
 
+    def _commit(self, idx: int, img, ts: float, step: int, *, seek: bool) -> bool:
+        """Publish frame `idx` unless a newer transport request arrived while it was being decoded.
+
+        The check and the publication are one step under the control lock, so a pause or a seek/step that returned
+        before this call can never be followed by a frame decoded before it (a stale frame). A dropped frame is not
+        lost: the thread comes back to it on resume, or the seek replaces it.
+        """
+        with self._ctrl_lock:
+            if self._seek_target is not None or (self.paused and not seek):
+                return False
+            self.position = idx
+            self._publish(img, ts=ts, step=step)
+            self._last_pub = (time.perf_counter(), ts)
+            return True
+
     def _run(self):
         from .recording import decode
 
-        prev_seq = None
-        while self._running:
-            t0 = time.perf_counter()
-            for f, ts, rseq in zip(self.files, self.stamps, self.manifest.seqs):
-                if not self._running:
-                    return
-                step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
-                if self.exhaustive:
+        if self.exhaustive:
+            prev_seq = None
+            while self._running:
+                for idx, (f, ts, rseq) in enumerate(zip(self.files, self.stamps, self.manifest.seqs)):
+                    if not self._running:
+                        return
+                    step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
                     while self._running and self._consumed < self._seq:
                         time.sleep(0.002)
+                    img = decode(f)
+                    if img is None:
+                        self.corrupt += 1
+                        self.error = f"{self.corrupt} damaged frame(s) skipped (last: {f.name})"
+                        continue
+                    self.position = idx
+                    self._publish(img, ts=ts, step=step)
+                    prev_seq = rseq
+                    self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
+                if not self.loop:
+                    self.done = True
+                    return
+                prev_seq = None
+            return
+
+        idx = 0  # the next frame to publish
+        prev_seq = None
+        t_anchor = time.perf_counter()  # wall time that corresponds to media time ts_anchor
+        ts_anchor = self.stamps[0] if self.stamps else 0.0
+        anchor_speed = self.speed
+        while self._running:
+            with self._ctrl_lock:
+                seek_to = self._seek_target
+                self._seek_target = None
+                paused = self.paused
+                spd = self.speed
+            if spd != anchor_speed:
+                # The schedule (t_anchor, ts_anchor) was laid out at the old speed. Re-anchor it on the frame published
+                # last, so the new speed counts from there: elapsed wall time is not re-read as media time at the new rate.
+                anchor_speed = spd
+                last = self._last_pub
+                if last is not None and idx < len(self.stamps) and self.stamps[idx] >= last[1]:
+                    t_anchor, ts_anchor = last
                 else:
-                    wait = ts / self.speed - (time.perf_counter() - t0)
-                    if wait > 0:
-                        time.sleep(wait)
+                    t_anchor = time.perf_counter()
+                    ts_anchor = self.stamps[min(idx, len(self.stamps) - 1)] if self.stamps else 0.0
+            if seek_to is not None:
+                idx = seek_to
+                prev_seq = None
+                f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
                 img = decode(f)
-                if img is None:
-                    self.corrupt += 1
-                    self.error = f"{self.corrupt} damaged frame(s) skipped (last: {f.name})"
+                if img is not None:
+                    if not self._commit(idx, img, ts, 1, seek=True):
+                        continue  # a newer seek or step arrived while decoding: serve that one only
+                    prev_seq = rseq
+                t_anchor = time.perf_counter()
+                ts_anchor = ts
+                idx += 1  # the shown frame is not published again on resume
+                continue
+            if paused:
+                time.sleep(0.02)
+                t_anchor = time.perf_counter()
+                if 0 < idx <= len(self.stamps):
+                    ts_anchor = self.stamps[idx - 1]  # resume continues from the frame shown, one interval later
+                continue
+            if idx >= len(self.files):
+                if self.loop:
+                    idx = 0
+                    prev_seq = None
+                    t_anchor = time.perf_counter()
+                    ts_anchor = self.stamps[0] if self.stamps else 0.0
                     continue
-                self._publish(img, ts=ts, step=step)  # recorded time and gaps, not playback time
-                prev_seq = rseq  # a damaged frame is not published, so it shows up as a gap in the sequence
-                self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
-            if not self.loop:
                 self.done = True
-                return
-            prev_seq = None
+                time.sleep(0.05)
+                continue
+            f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
+            wait = (ts - ts_anchor) / spd - (time.perf_counter() - t_anchor)
+            if wait > 0:
+                time.sleep(min(wait, 0.05))
+                if wait > 0.05:
+                    continue
+            img = decode(f)
+            if img is None:
+                self.corrupt += 1
+                self.error = f"{self.corrupt} damaged frame(s) skipped (last: {f.name})"
+                idx += 1
+                continue
+            step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
+            if not self._commit(idx, img, ts, step, seek=False):
+                continue  # paused or seeked while decoding: this frame is stale now
+            prev_seq = rseq
+            self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd
+            idx += 1

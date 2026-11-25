@@ -163,11 +163,27 @@ def z_status_text(r: dict) -> str:
     return f"Z {r.get('z_status', '?')} ({unit}{o})"
 
 
+SETTINGS_DIR_ENV = "MICROTOPOS_SETTINGS_DIR"
+
+
+def app_settings() -> QSettings:
+    """The window's saved settings (theme, objective, layout): the one place that decides where they live.
+
+    By default the platform's native store. On Windows that is the registry, which QSettings.setPath cannot
+    redirect, so a test or smoke run that only set a path read and wrote the user's real settings. When
+    MICROTOPOS_SETTINGS_DIR names a folder, the settings are an ini file in that folder instead (the test suite,
+    the GUI smoke run, a portable copy)."""
+    folder = os.environ.get(SETTINGS_DIR_ENV)
+    if folder:
+        return QSettings(str(Path(folder) / "MicroTopos.ini"), QSettings.Format.IniFormat)
+    return QSettings("MicroTopos", "MicroTopos")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, simulator_only: bool = False, replay: str | None = None, verbose: bool = False):
         super().__init__()
         opencv_threads()
-        self.settings = QSettings("MicroTopos", "MicroTopos")
+        self.settings = app_settings()
         self.dark = self.settings.value("dark", True, type=bool)
         self.t = DARK if self.dark else LIGHT
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation) or Path.home() / ".microtopos")

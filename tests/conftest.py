@@ -57,6 +57,27 @@ def require_opencl() -> None:
     pytest.skip("no OpenCL device")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _settings_away_from_the_user(tmp_path_factory):
+    """No test may read or write the user's saved MicroTopos settings (on Windows: the registry, which
+    QSettings.setPath does not redirect). The application reads MICROTOPOS_SETTINGS_DIR (main_window.app_settings);
+    it is set for the whole session, subprocesses included, before any module- or session-scoped window exists."""
+    previous = os.environ.get("MICROTOPOS_SETTINGS_DIR")
+    os.environ["MICROTOPOS_SETTINGS_DIR"] = str(tmp_path_factory.mktemp("settings-session"))
+    yield
+    if previous is None:
+        os.environ.pop("MICROTOPOS_SETTINGS_DIR", None)
+    else:
+        os.environ["MICROTOPOS_SETTINGS_DIR"] = previous
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings(tmp_path_factory, monkeypatch):
+    """Every test starts from empty settings, so what one test's window saved (objective, exposure, layout) cannot
+    change the result of another."""
+    monkeypatch.setenv("MICROTOPOS_SETTINGS_DIR", str(tmp_path_factory.mktemp("settings")))
+
+
 @pytest.fixture
 def opencl():
     """Fixture form of require_opencl(): the test runs only on a machine with an OpenCL device."""

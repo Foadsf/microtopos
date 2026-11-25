@@ -386,11 +386,10 @@ def test_find_reversal_ignores_boundary_zero_padding_artifact():
 def test_gui_fixes_offscreen(tmp_path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     pg = pytest.importorskip("pyqtgraph")
-    from PySide6.QtCore import QSettings, QStandardPaths
+    from PySide6.QtCore import QStandardPaths
     from PySide6.QtWidgets import QApplication
 
     QStandardPaths.setTestModeEnabled(True)
-    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(tmp_path / "qs"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     pg.setConfigOptions(imageAxisOrder="row-major")

@@ -23,6 +23,8 @@ def test_package_version_is_the_same_in_pyproject_init_and_lock():
     assert pyproject == microtopos.__version__ == lock.group(1)
 
 
+@pytest.mark.characterization("tests_bite swaps only the microtopos package; it fails against the old release.yml and spec "
+                              "(checked by hand: restoring both made it fail)")
 def test_the_release_build_installs_the_serial_extra_and_bundles_it():
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert re.search(r"uv sync [^\n]*--extra serial", workflow), "release binaries would have no Grbl driver"
@@ -32,6 +34,8 @@ def test_the_release_build_installs_the_serial_extra_and_bundles_it():
     assert any(req.startswith("pyserial") for req in extras["serial"])
 
 
+@pytest.mark.characterization("tests_bite swaps only the microtopos package; it fails against the old release.yml "
+                              "(checked by hand: restoring it made it fail)")
 def test_the_release_job_fails_when_the_executable_has_no_serial_library():
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert ".pyserial != null" in workflow

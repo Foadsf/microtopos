@@ -85,6 +85,12 @@ class SweepBuffer:
         for name in ("frames", "color_frames", "z", "tiles", "seqs", "stamps"):
             setattr(self, name, getattr(self, name)[::2])
 
+    def drop_from(self, seq: int) -> None:
+        """Remove every frame whose source sequence number is `seq` or later."""
+        n = sum(1 for q in self.seqs if q < seq)
+        for name in ("frames", "color_frames", "z", "tiles", "seqs", "stamps"):
+            setattr(self, name, getattr(self, name)[:n])
+
     def __len__(self):
         return len(self.frames)
 
@@ -144,6 +150,7 @@ class LiveEngine:
         self.error: str | None = None
         self.errors = 0
         self._preroll = collections.deque(maxlen=PREROLL)
+        self._seq_hist = collections.deque(maxlen=8)  # sequence numbers of the newest frames given to the state machine
         self._buf = SweepBuffer()
         self._sweep_pose = (0.0, 0.0)
         self._sweep_simulated = False
@@ -252,6 +259,7 @@ class LiveEngine:
         self.sm.reset()
         self._held = None
         self._preroll.clear()
+        self._seq_hist.clear()
         self._buf = SweepBuffer()
         self._sweep_simulated = False
         self._sweep_manual = False
@@ -472,6 +480,7 @@ class LiveEngine:
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
         if self.sm.state == State.Z_SWEEP:
             self.sm.sweep_complete = _completeness(self._buf.tiles + [tiles]) >= MIN_COMPLETENESS
+        self._seq_hist.append(seq)
         state, feat, events = self.sm.update(prev)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
@@ -498,14 +507,25 @@ class LiveEngine:
                     self._cov = None
                 self._stride, self._zcount = 1, 0
             elif ev.kind == "sweep_ended":
+                aborted = bool(ev.detail.get("aborted"))
+                if aborted:
+                    # the frames that showed the motion are not part of the sweep; everything before them is one view
+                    k = min(int(ev.detail.get("moving_frames", 1)), len(self._seq_hist))
+                    self._buf.drop_from(self._seq_hist[-k])
                 comp = _completeness(self._buf.tiles)
                 manual = bool(ev.detail.get("manual"))
                 self.log(f"sweep ended: {len(self._buf)} frames ({self._n_preroll} pre-roll), completeness "
-                         f"{comp:.2f}{', ABORTED by motion' if ev.detail.get('aborted') else ''}"
+                         f"{comp:.2f}{', ABORTED by motion' if aborted else ''}"
                          f"{', manual' if manual else ''}", seq)
                 sim_sweep = self._sweep_simulated or simulated
-                if ev.detail.get("aborted"):
+                if aborted:
+                    # a sweep that had already passed the field through focus is a sweep whatever happened next
+                    # (the user moved on at once, or the fully defocused image stopped matching itself); an
+                    # incomplete one is dropped, since after motion it cannot be continued
                     self._held = None
+                    if comp >= MIN_COMPLETENESS:
+                        self.log("the frames before the motion are a complete sweep: kept", seq)
+                        self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape)
                 elif manual or comp >= MIN_COMPLETENESS:
                     self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape,
                                manual=manual)

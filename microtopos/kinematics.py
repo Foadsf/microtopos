@@ -169,7 +169,7 @@ class StateMachine:
             self.cut_before = before
             self.centroid_before = float(np.median(self.centroid_hist)) if self.centroid_hist else None
             if self.state == State.Z_SWEEP:
-                events.append(Event("sweep_ended", {"aborted": True}))
+                events.append(Event("sweep_ended", {"aborted": True, "moving_frames": 1}))  # this frame is the cut
             self.state, self.exit_count = State.OBJECTIVE_CHANGE, 0
             return self.state, feats, events
         if self.state == State.OBJECTIVE_CHANGE:
@@ -207,7 +207,8 @@ class StateMachine:
         elif self.state == State.Z_SWEEP:
             self.enter_count = self.enter_count + 1 if moving else 0
             if self.enter_count >= 3:  # the stage really moved during the sweep: abort it
-                events.append(Event("sweep_ended", {"aborted": True}))
+                # moving_frames: how many of the newest frames, this one included, showed the motion
+                events.append(Event("sweep_ended", {"aborted": True, "moving_frames": self.enter_count}))
                 self.state, self.exit_count, self.enter_count = State.PAN, 0, 0
             elif not moving:
                 self.exit_count = self.exit_count + 1 if abs(dlb) < 3 * sd_db + 0.01 else 0

@@ -128,6 +128,9 @@ class V4L2Controls:
         return {k: cur.get(k, {}).get("value") for k in values}
 
 
+CAPTURE_THREAD_PREFIX = "capture:"  # a source's thread is named after it, so a thread left running is traceable
+
+
 class FrameSource:
     _ids = 0
 
@@ -156,7 +159,7 @@ class FrameSource:
 
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"{CAPTURE_THREAD_PREFIX}{self.source_id}")
         self._thread.start()
 
     def stop(self):

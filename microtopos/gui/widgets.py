@@ -351,6 +351,44 @@ def section(title: str, *widgets, hint: str | None = None) -> QWidget:
     return box
 
 
+class FlowBar:
+    """A tool bar built like a QHBoxLayout (`addWidget`) that wraps onto further rows instead of widening the window.
+
+    A plain QHBoxLayout of N controls asks for the sum of their widths as the window's MINIMUM width, so a tab with a
+    dozen controls made the whole window (and with it every screen narrower than the sum) unusable: it could not be
+    narrowed, and a maximised window had its right panel pushed off the screen. Here the minimum is the widest single
+    control. `addLabelled` keeps a caption with its control on the same row; a widget added with a stretch is the
+    bar's status text, shown on its own row below (a wrapped, right-aligned line that never sets a minimum width)."""
+
+    def __init__(self, spacing: int = 8):
+        self._flow = FlowWidget(spacing)
+        self._status: QWidget | None = None
+
+    def addWidget(self, w: QWidget, stretch: int = 0):
+        if stretch:
+            self._status = w
+        else:
+            self._flow.addWidget(w)
+
+    def addLabelled(self, caption: str, w: QWidget):
+        group = QWidget()
+        lay = QHBoxLayout(group)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(QLabel(caption))
+        lay.addWidget(w)
+        self._flow.addWidget(group)
+
+    def layout(self) -> QVBoxLayout:
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addWidget(self._flow)
+        if self._status is not None:
+            lay.addWidget(self._status)
+        return lay
+
+
 class FlowWidget(QWidget):
     """Row of widgets that wraps onto further rows when the width runs out (the header chips).
 

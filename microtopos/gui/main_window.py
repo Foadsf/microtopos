@@ -59,7 +59,21 @@ from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, capture_
 from ..superres import dwell_superres
 from .objectives_dialog import ObjectivesDialog
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
-from .widgets import DARK_P99_DN, Banner, Chip, FlowWidget, ImagePanel, Toast, frame_percentile, section, stretch_levels
+from .widgets import (
+    DARK_P99_DN,
+    Banner,
+    Chip,
+    FlowBar,
+    FlowWidget,
+    ImagePanel,
+    Toast,
+    frame_percentile,
+    section,
+    stretch_levels,
+)
+
+DEFAULT_LEFT_DOCK_WIDTH = 420  # the session panel and the telemetry panel keep these widths (never below their
+DEFAULT_RIGHT_DOCK_WIDTH = 340  # minimum); the middle panel, which shows the image, gets all the rest
 
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
@@ -239,6 +253,10 @@ class MainWindow(QMainWindow):
         self._fill_sources()
         self._set_rotation(self.sp_rot.value())
         self._apply_theme()
+        # without this Qt sizes the docks by their size hints (the telemetry panel's is 600+ px), which left the live
+        # image 480 px on a 1536 px wide screen
+        self.resizeDocks([self.dock_left, self.dock_right], [DEFAULT_LEFT_DOCK_WIDTH, DEFAULT_RIGHT_DOCK_WIDTH],
+                         Qt.Horizontal)
         self._default_state = self.saveState()  # for "Reset layout"
         # dock layout first, window geometry second: restoring the docks into a window that restoreGeometry() has
         # already marked maximised (but not yet shown) leaves stale dock-separator widgets from the unmaximised
@@ -444,7 +462,7 @@ class MainWindow(QMainWindow):
         return b
 
     def _live_bar(self):
-        h = QHBoxLayout()
+        h = FlowBar()
         self.chk_focus = QCheckBox("Outline in-focus regions")
         self.chk_focus.setToolTip("During a focus sweep, outlines the areas that are currently at (or near) their sharpest")
         self.chk_focus.setChecked(False)
@@ -468,21 +486,19 @@ class MainWindow(QMainWindow):
         self.chk_hbd = QCheckBox("High bit depth")
         self.chk_hbd.setToolTip("Request 12-/14-bit output from the camera when the driver reports it")
         h.addWidget(self.chk_hbd)
-        h.addWidget(QLabel("SR scale"))
         self.cmb_sr_scale = QComboBox()
         self.cmb_sr_scale.addItems(["2×", "3×", "4×"])
         self.cmb_sr_scale.setCurrentText("2×")
         self.cmb_sr_scale.setFixedWidth(52)
         self.cmb_sr_scale.currentTextChanged.connect(
             lambda t: setattr(self, "sr_scale", int(t.replace("×", ""))))
-        h.addWidget(self.cmb_sr_scale)
-        h.addWidget(QLabel("pixfrac"))
+        h.addLabelled("SR scale", self.cmb_sr_scale)
         self.sl_sr_pixfrac = QSlider(Qt.Horizontal)
         self.sl_sr_pixfrac.setRange(3, 10)
         self.sl_sr_pixfrac.setValue(7)
         self.sl_sr_pixfrac.setFixedWidth(70)
         self.sl_sr_pixfrac.valueChanged.connect(lambda v: setattr(self, "sr_pixfrac", v / 10))
-        h.addWidget(self.sl_sr_pixfrac)
+        h.addLabelled("pixfrac", self.sl_sr_pixfrac)
         self.chk_sr_deconv = QCheckBox("SR deconvolve")
         self.chk_sr_deconv.setChecked(True)
         self.chk_sr_deconv.toggled.connect(lambda on: setattr(self, "sr_deconvolve", on))
@@ -497,10 +513,10 @@ class MainWindow(QMainWindow):
         self.lbl_live = QLabel()
         self.lbl_live.setObjectName("muted")
         h.addWidget(self.lbl_live, 1)
-        return h
+        return h.layout()
 
     def _mosaic_bar(self):
-        h = QHBoxLayout()
+        h = FlowBar()
         self.cmb_mview = QComboBox()
         self.cmb_mview.addItems(["Image", "Image + height overlay", "Height only"])
         self.cmb_mview.setCurrentIndex(1)
@@ -508,19 +524,17 @@ class MainWindow(QMainWindow):
                                   "levelled to each other (least squares) and blended")
         self.cmb_mview.currentIndexChanged.connect(lambda: setattr(self, "last_mosaic_version", -1))
         h.addWidget(self.cmb_mview)
-        h.addWidget(QLabel("Opacity"))
         self.sl_hop = QSlider(Qt.Horizontal)
         self.sl_hop.setRange(10, 100)
         self.sl_hop.setValue(55)
         self.sl_hop.setFixedWidth(110)
         self.sl_hop.valueChanged.connect(lambda: setattr(self, "last_mosaic_version", -1))
-        h.addWidget(self.sl_hop)
+        h.addLabelled("Opacity", self.sl_hop)
         self.cmb_mblend = QComboBox()
         self.cmb_mblend.addItems(["feather", "multiband"])
         self.cmb_mblend.setCurrentText("feather")
         self.cmb_mblend.currentTextChanged.connect(self._mosaic_blend)
-        h.addWidget(QLabel("Blend"))
-        h.addWidget(self.cmb_mblend)
+        h.addLabelled("Blend", self.cmb_mblend)
         self.chk_rot_track = QCheckBox("Track rotation")
         self.chk_rot_track.toggled.connect(self._mosaic_track_rotation)
         h.addWidget(self.chk_rot_track)
@@ -530,7 +544,7 @@ class MainWindow(QMainWindow):
         self.lbl_hlegend = QLabel()
         self.lbl_hlegend.setObjectName("mono")
         h.addWidget(self.lbl_hlegend, 1)
-        h2 = QHBoxLayout()  # second row: actions and status, so nothing overlaps on narrow windows
+        h2 = FlowBar()  # second bar: actions and status
         h2.addWidget(self._btn("Export height mosaic", self._export_height_mosaic,
                                "Stitched height mosaic as a Gwyddion .gsf"))
         self.btn_mosaic_inset = self._btn("Add inset (current view)", self._mosaic_add_inset,
@@ -545,12 +559,12 @@ class MainWindow(QMainWindow):
         self.lbl_mosaic.setObjectName("muted")
         h2.addWidget(self.lbl_mosaic, 1)
         v = QVBoxLayout()
-        v.addLayout(h)
-        v.addLayout(h2)
+        v.addLayout(h.layout())
+        v.addLayout(h2.layout())
         return v
 
     def _edf_bar(self):
-        h = QHBoxLayout()
+        h = FlowBar()
         self.chk_grains = QCheckBox("Overlay grain boundaries")
         self.chk_grains.toggled.connect(self._show_result)
         h.addWidget(self.chk_grains)
@@ -561,10 +575,10 @@ class MainWindow(QMainWindow):
         self.lbl_edf = QLabel()
         self.lbl_edf.setObjectName("muted")
         h.addWidget(self.lbl_edf, 1)
-        return h
+        return h.layout()
 
     def _height_bar(self):
-        h = QHBoxLayout()
+        h = FlowBar()
         self.cmb_height = QComboBox()
         self.cmb_height.addItems(["Height (form removed, S/L filtered)", "Height (raw fit)", "Confidence"])
         self.cmb_height.currentIndexChanged.connect(self._show_result)
@@ -610,7 +624,7 @@ class MainWindow(QMainWindow):
                                         "5 % of Sz) of the filtered surface; takes seconds per megapixel")
         self.chk_topo_grains.toggled.connect(self._show_result)
         h.addWidget(self.chk_topo_grains)
-        return h
+        return h.layout()
 
     def _build_3d(self):
         lay = QVBoxLayout(self.tab3d)
@@ -650,23 +664,21 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.relief, 1)
         self.lbl_3d = QLabel("3D view needs OpenGL; showing a shaded relief instead." if self.gl is None else "")
         self.lbl_3d.setObjectName("muted")
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel("Z exaggeration"))
+        bar = FlowBar()
         self.sl_exag = QSlider(Qt.Horizontal)
         self.sl_exag.setRange(1, 100)
         self.sl_exag.setValue(10)
+        self.sl_exag.setMinimumWidth(120)
         self.sl_exag.valueChanged.connect(self._update_3d)
-        bar.addWidget(self.sl_exag, 1)
-        bar.addWidget(QLabel("Colour map"))
+        bar.addLabelled("Z exaggeration", self.sl_exag)
         self.cmb_cmap = QComboBox()
         self.cmb_cmap.addItems(["viridis", "cividis", "inferno", "plasma", "magma", "turbo"])
         self.cmb_cmap.currentIndexChanged.connect(self._update_3d)
-        bar.addWidget(self.cmb_cmap)
-        bar.addWidget(QLabel("Backend"))
+        bar.addLabelled("Colour map", self.cmb_cmap)
         self.cmb_3d_backend = QComboBox()
         self.cmb_3d_backend.addItems(["CPU", "OpenCL"])
         self.cmb_3d_backend.currentTextChanged.connect(lambda t: setattr(self.zst, "backend", t.lower()))
-        bar.addWidget(self.cmb_3d_backend)
+        bar.addLabelled("Backend", self.cmb_3d_backend)
         self.chk_3d_breathing = QCheckBox("Correct focus breathing (experimental)")
         self.chk_3d_breathing.setToolTip("Estimates the magnification change with focus from the frame pairs and folds it "
                                          "into the frame alignment. Experimental: it improves the lateral alignment, but "
@@ -680,7 +692,7 @@ class MainWindow(QMainWindow):
         self.chk_3d_tiling.toggled.connect(lambda on: setattr(self.zst, "allow_tiling", on))
         bar.addWidget(self.chk_3d_tiling)
         bar.addWidget(self.lbl_3d, 1)
-        lay.addLayout(bar)
+        lay.addLayout(bar.layout())
 
 
     def _check_gl(self):
@@ -842,7 +854,7 @@ class MainWindow(QMainWindow):
         self.lbl_stg_pose = QLabel("stage: disconnected")
         self.lbl_stg_pose.setObjectName("muted")
         stg.addWidget(self.lbl_stg_pose, 2, 1)
-        jog = QHBoxLayout()
+        jog = FlowBar()  # wraps: five buttons side by side set the left panel's minimum width
         for name, dx, dy in (("X −10 µm", -10.0, 0.0), ("X +10 µm", 10.0, 0.0),
                              ("Y −10 µm", 0.0, -10.0), ("Y +10 µm", 0.0, 10.0)):
             # clicked(bool) passes `checked` as the first positional argument: it must not land in dx
@@ -853,8 +865,8 @@ class MainWindow(QMainWindow):
         self.btn_stg_zero = self._btn("Zero X/Y/Z", self._stage_zero)
         self.btn_stg_zero.setEnabled(False)
         jog.addWidget(self.btn_stg_zero)
-        stg.addLayout(jog, 3, 0, 1, 2)
-        sweep = QHBoxLayout()
+        stg.addLayout(jog.layout(), 3, 0, 1, 2)
+        sweep = FlowBar()
         self.sp_stg_z0, self.sp_stg_z1 = QDoubleSpinBox(), QDoubleSpinBox()
         for sp, tip in ((self.sp_stg_z0, "Z where the sweep starts (µm, stage frame)"),
                         (self.sp_stg_z1, "Z where the sweep ends (µm, stage frame)")):
@@ -878,7 +890,7 @@ class MainWindow(QMainWindow):
                                         "height map is reconstructed with those labels")
         self.btn_stg_zsweep.setEnabled(False)
         sweep.addWidget(self.btn_stg_zsweep)
-        stg.addLayout(sweep, 4, 0, 1, 2)
+        stg.addLayout(sweep.layout(), 4, 0, 1, 2)
         self.stage_box = section("Stage", stg,
                                  hint="Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
                                       "reported pose. Zero makes the current position the origin of a GRBL stage; the "
@@ -2847,7 +2859,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- replay transport bar
     def _replay_bar(self):
-        h = QHBoxLayout(); h.setContentsMargins(6, 4, 6, 4)
+        h = FlowBar()  # the seek slider gets its own row above (below); the buttons wrap
         self.btn_replay_pause = QPushButton("‖ Pause")
         self.btn_replay_pause.setCheckable(True)
         self.btn_replay_pause.clicked.connect(self._replay_toggle)
@@ -2861,18 +2873,22 @@ class MainWindow(QMainWindow):
         h.addWidget(self.btn_replay_pause)
         h.addWidget(self.btn_replay_step_b)
         h.addWidget(self.btn_replay_step_f)
-        h.addWidget(self.replay_seek, 1)
-        h.addWidget(QLabel("Speed"))
+        self.replay_seek.setMinimumWidth(120)
         self.cmb_replay_speed = QComboBox()
         self.cmb_replay_speed.addItems(["0.25×", "0.5×", "1×", "2×", "4×"])
         self.cmb_replay_speed.setCurrentText("1×")
         self.cmb_replay_speed.setFixedWidth(56)
         self.cmb_replay_speed.currentTextChanged.connect(self._replay_speed)
-        h.addWidget(self.cmb_replay_speed)
+        h.addLabelled("Speed", self.cmb_replay_speed)
         self.chk_replay_loop = QCheckBox("Loop")
         self.chk_replay_loop.toggled.connect(self._replay_loop)
         h.addWidget(self.chk_replay_loop)
-        return h
+        v = QVBoxLayout()
+        v.setContentsMargins(6, 4, 6, 4)
+        v.setSpacing(4)
+        v.addWidget(self.replay_seek)
+        v.addLayout(h.layout())
+        return v
 
     def _set_replay_transport_enabled(self, on: bool):
         """Pause/step/seek/speed act only on a paced replay; an exhaustive (consumer-paced) one refuses them."""

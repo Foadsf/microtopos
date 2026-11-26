@@ -124,6 +124,10 @@ class Snapshot:
     raw_p995: float | None = None  # 99.5th percentile of uncorrected camera luma (for auto-exposure)
 
 
+ENGINE_THREAD_NAME = "live-engine"  # the names let the test suite find a thread nobody stopped (tests/conftest.py)
+SWEEP_THREAD_NAME = "sweep-consumer"
+
+
 class LiveEngine:
     def __init__(self, store: CalibrationStore, objective: Objective):
         self.store = store
@@ -179,7 +183,7 @@ class LiveEngine:
     # ------------------------------------------------------------------ control
     def start(self):
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True, name=ENGINE_THREAD_NAME)
         self._thread.start()
 
     def stop(self) -> bool:
@@ -311,7 +315,7 @@ class LiveEngine:
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
-            threading.Thread(target=self.on_sweep, args=(cap,), daemon=True).start()
+            threading.Thread(target=self.on_sweep, args=(cap,), daemon=True, name=SWEEP_THREAD_NAME).start()
 
     def log(self, text: str, seq: int = 0):
         line = f"{time.perf_counter() - self._t0:7.1f}s #{seq:<5d} {text}"

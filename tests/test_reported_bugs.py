@@ -383,7 +383,9 @@ def test_find_reversal_ignores_boundary_zero_padding_artifact():
 
 
 # ------------------------------------------------------------------------------------------------ GUI tests (A2, A4, B3, B5, B6, C6)
-@pytest.mark.characterization("edited only to stop redirecting QSettings by setPath (the settings-isolation fixture does it now)")
+@pytest.mark.characterization("edited only to stop redirecting QSettings by setPath (the settings-isolation fixture does it now) "
+                              "and to stop the simulator before swapping in a dummy camera (the module-level thread guard "
+                              "in conftest.py is what fails without that)")
 def test_gui_fixes_offscreen(tmp_path, monkeypatch):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import pyqtgraph as pg
@@ -453,6 +455,8 @@ def test_gui_fixes_offscreen(tmp_path, monkeypatch):
             def exposure_range(self):
                 return (50, 1000)
 
+        w.engine.set_source(None)  # as _on_source does: detach, then stop the running simulator; swapping w.source
+        w.source.stop()  # without stopping it left its render thread running until the interpreter exited
         w.source = DummyCam()
         w.sim_source = None
 

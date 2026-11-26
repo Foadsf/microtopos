@@ -103,6 +103,26 @@ def test_the_window_takes_the_size_it_is_given_and_keeps_both_panels_inside(wind
         left.getRect(), mid.getRect(), right.getRect())
 
 
+def test_the_image_panel_gets_the_width_the_side_panels_do_not_need():
+    """A fresh window (no saved layout) gives the session and telemetry panels fixed, modest widths. Left to their
+    size hints the telemetry panel took 600+ px and the image only 480 px of a 1536 px screen."""
+    from microtopos.gui.main_window import MainWindow
+
+    app = QApplication.instance()
+    w = MainWindow(simulator_only=True)
+    try:
+        w.timer.stop()
+        w.resize(1920, 1080)
+        w.show()
+        _settle(app, 30)
+        mid, total = w.centralWidget().width(), w.width()
+        assert mid >= 0.48 * total, (
+            f"image panel {mid} px of {total} px (session {w.dock_left.width()}, telemetry {w.dock_right.width()})")
+    finally:
+        w.close()
+        app.processEvents()
+
+
 def test_left_panel_pages_fit_their_panel(window):
     """The pages scroll vertically only, so each page must fit the panel's width; a long camera name must not
     widen the page past it (the Camera page's right side was cut off under the middle panel)."""

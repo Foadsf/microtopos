@@ -72,6 +72,9 @@ from .widgets import (
     stretch_levels,
 )
 
+DEFAULT_LEFT_DOCK_WIDTH = 420  # the session panel and the telemetry panel keep these widths (never below their
+DEFAULT_RIGHT_DOCK_WIDTH = 340  # minimum); the middle panel, which shows the image, gets all the rest
+
 OPTICS_NOTES = """
 <h3>What software can and cannot fix</h3>
 <p><b>Lateral scale.</b> The 3.0 µm pixel pitch and "no optics in the camera" are unverified assumptions, and old
@@ -250,6 +253,10 @@ class MainWindow(QMainWindow):
         self._fill_sources()
         self._set_rotation(self.sp_rot.value())
         self._apply_theme()
+        # without this Qt sizes the docks by their size hints (the telemetry panel's is 600+ px), which left the live
+        # image 480 px on a 1536 px wide screen
+        self.resizeDocks([self.dock_left, self.dock_right], [DEFAULT_LEFT_DOCK_WIDTH, DEFAULT_RIGHT_DOCK_WIDTH],
+                         Qt.Horizontal)
         self._default_state = self.saveState()  # for "Reset layout"
         # dock layout first, window geometry second: restoring the docks into a window that restoreGeometry() has
         # already marked maximised (but not yet shown) leaves stale dock-separator widgets from the unmaximised

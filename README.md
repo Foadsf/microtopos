@@ -43,7 +43,11 @@ uv run microtopos-bench        # CPU vs OpenCL focus-measure timing with a parit
 
 Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Python 3.11 the Qt bindings abort with a reference-count error, so 3.11 is not supported.
 
-## Status (v0.9, November 2026)
+## Status (v0.10, November 2026)
+
+v0.10.0 adds the capabilities listed under "New in v0.10.0" below (motorised stage drivers and a stage panel, colour pipeline, replay bar, mosaic bridging and insets, more ISO 25178 parameters), and fixes defects that came out of a review of the code behind them: a Grbl driver that blocked cancel and status calls during a move, dead jog buttons, complete Z sweeps thrown away because the stage moved afterwards, repeated z labels from a settling stage that left 70–90 % of height-map pixels invalid, a colour all-in-focus image that was shown but never saved, and an unsigned-integer overflow in the focus measures `brenner` and `tile_scores`. Tests no longer read or write the real user settings. Contributors: see "Contributing".
+
+**The stage, Grbl, camera-mode and mosaic additions are experimental: they have been run against the simulator and a fake Grbl controller only, never against a real stage, controller or camera.** The release executables include the optional `pyserial` library, so the Grbl driver is present in them.
 
 v0.9.0 adds an optional brightness stretch for dim live views and fixes raw recordings from MJPEG cameras (saved
 as 1-pixel strips before; old recordings still replay). Stitching follows striped specimens again, five
@@ -60,10 +64,9 @@ quantitatively** (no calibrated reference sample measured so far), and stitching
 checked visually. The Windows and macOS builds pass their self-tests on the build servers but have not been run
 on a real desktop.
 
-### New capabilities (feat/missing-capabilities, in development)
+### New in v0.10.0
 
-The following are implemented on the `feat/missing-capabilities` branch and exercised by the offscreen GUI tests
-and the default test suite (`pytest`; `pytest -m ""` adds the slow tests). The tests use the simulator and a fake
+The following are exercised by the offscreen GUI tests and the default test suite (`pytest`; `pytest -m ""` adds the slow tests). The tests use the simulator and a fake
 Grbl controller: **no real camera, stage or Grbl hardware has been used with these features.**
 
 - **Motorised stage drivers**: `SimulatedStageDriver` (synthetic, for offline development) and `GrblStageDriver`

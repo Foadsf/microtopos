@@ -45,6 +45,8 @@ Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Pyth
 
 ## Status (v0.10, November 2026)
 
+v0.10.1 fixes a layout regression in v0.10.0: the main window could not be made narrower than 2361 px (device-independent pixels), so on a 1920 px screen it could not be resized and a maximised window lost its telemetry panel off the screen edge. The minimum width is now 1092 px and the tool bars wrap. Screens narrower than about 1092 px still overflow. This was checked from source on one Windows machine (125 % scaling) and in CI's offscreen tests; other screens and scalings have not been tried.
+
 v0.10.0 adds the capabilities listed under "New in v0.10.0" below (motorised stage drivers and a stage panel, colour pipeline, replay bar, mosaic bridging and insets, more ISO 25178 parameters), and fixes defects that came out of a review of the code behind them: a Grbl driver that blocked cancel and status calls during a move, dead jog buttons, complete Z sweeps thrown away because the stage moved afterwards, repeated z labels from a settling stage that left 70–90 % of height-map pixels invalid, a colour all-in-focus image that was shown but never saved, and an unsigned-integer overflow in the focus measures `brenner` and `tile_scores`. Tests no longer read or write the real user settings. Contributors: see "Contributing".
 
 **The stage, Grbl, camera-mode and mosaic additions are experimental: they have been run against the simulator and a fake Grbl controller only, never against a real stage, controller or camera.** The release executables include the optional `pyserial` library, so the Grbl driver is present in them.

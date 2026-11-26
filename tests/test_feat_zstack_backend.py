@@ -908,8 +908,9 @@ def test_live_engine_rgb_sweep_records_colour_frames_and_rgb_mosaic():
     snap = eng.snapshot()
     assert snap.preview_rgb is not None and snap.preview_rgb.shape == (120, 160, 3)
     eng._render_now()
-    view, _partitions, _nkf, _npatches = eng.mosaic_image()
-    assert view.ndim == 3 and view.shape[2] == 4  # RGBA preview
+    (grey, _origin, _d), _partitions, _nkf, _npatches = eng.mosaic_image()  # the GUI unpacks this form
+    view = eng.mosaic_image_rgb()
+    assert view.ndim == 3 and view.shape[2] == 4 and view.shape[:2] == grey.shape  # RGBA, same box as grey
     assert bool(view[..., 3].any())  # colour content was blended into the canvas
     assert bool(eng.mosaic.tiles_rgb)
 
@@ -958,8 +959,9 @@ def test_live_engine_load_mosaic_state_reloads_graph_and_insets():
     assert ins.objective == "10x / 0.25" and ins.um_per_px == 0.625
     assert np.asarray(ins.image).shape == (32, 32)
     eng2._render_now()
-    img = eng2.mosaic_image()[0]
-    assert img.ndim == 3 and img.shape[2] == 4 and bool(img[..., 3].any())
+    (grey, _origin, _d), *_ = eng2.mosaic_image()  # the grey view keeps its (image, origin, d) form in colour mode
+    rgb = eng2.mosaic_image_rgb()  # the colour view is separate and covers the same box
+    assert rgb.ndim == 3 and rgb.shape[2] == 4 and rgb.shape[:2] == grey.shape and bool(rgb[..., 3].any())
 
 
 def test_live_engine_reset_mosaic_keeps_insets_only_when_requested():

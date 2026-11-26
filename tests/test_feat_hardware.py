@@ -1115,6 +1115,8 @@ def test_capture_z_sweep_needs_a_stage_attached_to_the_source():
     assert eng.sm.override == Override.AUTO  # the capture was ended again after the failure
 
 
+@pytest.mark.characterization("a failing or closed stage already left frames unlabelled; the test now sets the "
+                              "motorised-sweep flag that labelling requires (tests/test_gui_regressions.py)")
 def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
     class _Broken(SimulatedStageDriver):
         def pose(self):
@@ -1122,6 +1124,7 @@ def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
 
     src = FrameSource()
     src.stage_driver = _Broken()
+    src.label_with_stage = True  # inside a motorised Z sweep (stage.capture_z_sweep), where frames get stage labels
     src._publish(np.zeros((4, 4, 3), np.uint8))
     assert src.latest()[3] is None
     ok = SimulatedStageDriver()

@@ -50,7 +50,15 @@ from PySide6.QtWidgets import (
 from .. import __version__, export, metrology, units, zstack
 from .. import objectives as objlib
 from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
-from ..camera import CameraSource, ReplaySource, SimulatorSource, list_cameras, opencv_threads
+from ..camera import (
+    CameraSource,
+    ReplaySource,
+    SimulatorSource,
+    camera_modes,
+    list_cameras,
+    opencv_threads,
+    pick_resolution,
+)
 from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
@@ -149,7 +157,9 @@ def _feature_job(r, progress=None, cancelled=None):
     """Spd/Spc/S5p/S5v/S10z and the topographic hills of the filtered surface (seconds per megapixel)."""
     if progress:
         progress(0.2, "Finding significant peaks and hills...")
-    return metrology.feature_set(r["sl_surface"], r["um_per_px"], r["z_unit"])
+    # the summit/peak noise floor comes from the measured heights before form removal, as in analyze()
+    return metrology.feature_set(r["sl_surface"], r["um_per_px"], r["z_unit"],
+                                 noise_floor=metrology.height_noise_floor(r["height"]))
 
 
 def _rescale_job(r, factor, unit, progress=None, cancelled=None):
@@ -483,9 +493,6 @@ class MainWindow(QMainWindow):
         self.chk_rgb.setToolTip("Render the camera's colour frame instead of the luma channel (needs a colour camera)")
         self.chk_rgb.toggled.connect(self._set_color_mode)
         h.addWidget(self.chk_rgb)
-        self.chk_hbd = QCheckBox("High bit depth")
-        self.chk_hbd.setToolTip("Request 12-/14-bit output from the camera when the driver reports it")
-        h.addWidget(self.chk_hbd)
         self.cmb_sr_scale = QComboBox()
         self.cmb_sr_scale.addItems(["2×", "3×", "4×"])
         self.cmb_sr_scale.setCurrentText("2×")
@@ -779,10 +786,10 @@ class MainWindow(QMainWindow):
         self.cmb_source = QComboBox()
         self.cmb_source.currentIndexChanged.connect(self._on_source)
         self.cmb_res = QComboBox()
-        # 16:9 modes only: lateral calibration is scaled between modes, which assumes the same field of view
-        self.cmb_res.addItems(["640x480", "1080x1080", "1280x720", "1920x1080"])
+        # Filled per camera in _on_source with the sizes that camera offers (camera.camera_modes); a lateral
+        # calibration applies only to the camera mode it was made in (LateralCalibration.covers).
         self.cmb_res.setToolTip("Capture size. Full resolution is used for Z-stacks; live analysis uses a 640 px preview")
-        self.cmb_res.currentIndexChanged.connect(lambda: self._on_source(self.cmb_source.currentIndex()))
+        self.cmb_res.currentIndexChanged.connect(self._on_resolution)
         self.chk_autoexp = QCheckBox("Automatic exposure")
 
         self.sl_exp = QSlider(Qt.Horizontal)
@@ -838,17 +845,26 @@ class MainWindow(QMainWindow):
                                  "Simulator: sweep that turns back through focus"), 1, 0, 1, 2)
         self.demo_box = section("Demo (simulator only)", demo,
                                 hint="Synthetic specimen. Its heights are simulation truth and are labelled SIMULATED.")
-        stg = QGridLayout()
-        stg.addWidget(QLabel("Stage driver"), 0, 0)
+        drv_row = QHBoxLayout()
+        drv_row.addWidget(QLabel("Stage driver"))
         self.cmb_stg = QComboBox()
-        self.cmb_stg.addItems(["Simulated stage", "GRBL serial port", "None"])
+        # "None" first: most setups focus and pan by hand, and the stage controls only appear once a driver is chosen
+        self.cmb_stg.addItems(["None", "Simulated stage", "GRBL serial port"])
         self.cmb_stg.currentTextChanged.connect(self._stage_driver_changed)
-        stg.addWidget(self.cmb_stg, 0, 1)
+        drv_row.addWidget(self.cmb_stg, 1)
+        self.stage_details = QWidget()
+        stg = QGridLayout(self.stage_details)
+        stg.setContentsMargins(0, 0, 0, 0)
         stg.addWidget(QLabel("Serial port"), 1, 0)
+        port_row = QHBoxLayout()
         self.cmb_stg_port = QComboBox()
-        self.cmb_stg_port.addItems(list_serial_ports())
         self.cmb_stg_port.setEnabled(False)
-        stg.addWidget(self.cmb_stg_port, 1, 1)
+        port_row.addWidget(self.cmb_stg_port, 1)
+        self.btn_stg_rescan = self._btn("Rescan", self._stage_rescan_ports, "List the serial ports again (a "
+                                        "controller plugged in after MicroTopos started)")
+        self.btn_stg_rescan.setEnabled(False)
+        port_row.addWidget(self.btn_stg_rescan)
+        stg.addLayout(port_row, 1, 1)
         self.btn_stg_connect = self._btn("Connect", self._stage_connect)
         stg.addWidget(self.btn_stg_connect, 2, 0)
         self.lbl_stg_pose = QLabel("stage: disconnected")
@@ -891,23 +907,40 @@ class MainWindow(QMainWindow):
         self.btn_stg_zsweep.setEnabled(False)
         sweep.addWidget(self.btn_stg_zsweep)
         stg.addLayout(sweep.layout(), 4, 0, 1, 2)
-        self.stage_box = section("Stage", stg,
-                                 hint="Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
-                                      "reported pose. Zero makes the current position the origin of a GRBL stage; the "
-                                      "simulated stage keeps the simulator's coordinates, so Zero moves it back to "
-                                      "their origin. Z sweep: the stage runs through the "
-                                      "Z range while the camera frames, labelled with the stage's Z, are captured "
-                                      "and reconstructed (the simulated stage drives the simulator's focus; the GRBL "
-                                      "path is verified against a simulated controller only).")
+        stage_hint = QLabel("Move a real (GRBL) or simulated stage. Jog moves are relative to the last "
+                            "reported pose. Zero makes the current position the origin of a GRBL stage; the "
+                            "simulated stage keeps the simulator's coordinates, so Zero moves it back to "
+                            "their origin. Z sweep: the stage runs through the "
+                            "Z range while the camera frames, labelled with the stage's Z, are captured "
+                            "and reconstructed (the simulated stage drives the simulator's focus; the GRBL "
+                            "path is verified against a simulated controller only).")
+        stage_hint.setObjectName("muted")
+        stage_hint.setWordWrap(True)
+        stg.addWidget(stage_hint, 0, 0, 1, 2)
+        self.stage_details.setVisible(False)
+        self.stage_box = section("Stage", drv_row, self.stage_details)
         return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
                        self.lbl_readback, self.demo_box, self.stage_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
                             "because both would corrupt focus measurements.")
 
     def _stage_driver_changed(self, text: str):
-        self.cmb_stg_port.setEnabled(text.startswith("GRBL"))
+        grbl = text.startswith("GRBL")
+        self.cmb_stg_port.setEnabled(grbl)
+        self.btn_stg_rescan.setEnabled(grbl)
+        if grbl:
+            self._stage_rescan_ports()
         if text.startswith("None") and self.stage_driver is not None:
             self._stage_disconnect()
+        self.stage_details.setVisible(not text.startswith("None") or self.stage_driver is not None)
+
+    def _stage_rescan_ports(self):
+        """Fill the serial-port list now (ports appear and disappear as controllers are plugged in)."""
+        keep = self.cmb_stg_port.currentText()
+        self.cmb_stg_port.clear()
+        self.cmb_stg_port.addItems(list_serial_ports())
+        if keep:
+            self.cmb_stg_port.setCurrentText(keep)
 
     def _stage_async(self, label: str, fn, on_done) -> bool:
         """Run stage I/O (serial, waiting for motion) off the GUI thread. One stage operation at a time."""
@@ -1331,6 +1364,13 @@ class MainWindow(QMainWindow):
         self.cmb_source.blockSignals(False)
         self._on_source(pick)
 
+    def _on_resolution(self, _idx: int):
+        """The user picked a capture size: remember it for the next launch and reopen the camera at that size."""
+        size = self.cmb_res.currentText()
+        if size:
+            self.settings.setValue("resolution", size)
+            self._on_source(self.cmb_source.currentIndex())
+
     def _on_source(self, idx: int):
         self._ae_active = False
         self._cancel_rotation_measure()
@@ -1345,6 +1385,12 @@ class MainWindow(QMainWindow):
             self.sim_source = None
             self.source = ReplaySource(self.replay)
         else:
+            modes = camera_modes(info)
+            self.cmb_res.blockSignals(True)
+            self.cmb_res.clear()
+            self.cmb_res.addItems(modes)
+            self.cmb_res.setCurrentText(pick_resolution(modes, self.settings.value("resolution", None)))
+            self.cmb_res.blockSignals(False)
             w, h = (int(v) for v in self.cmb_res.currentText().split("x"))
             self.sim_source = None
             self.source = CameraSource(info, w, h, 25)
@@ -1352,6 +1398,12 @@ class MainWindow(QMainWindow):
         self.engine.set_source(self.source)
         if isinstance(self.stage_driver, SimulatedStageDriver) and self.stage_driver.sim_source is not self.sim_source:
             self._stage_disconnect()  # the simulated stage moves the simulator it was created for
+        if self.stage_driver is None:  # offer the simulated stage with the simulator, no stage with a camera
+            cur = self.cmb_stg.currentText()
+            if self.sim_source is not None and cur == "None":
+                self.cmb_stg.setCurrentText("Simulated stage")
+            elif self.sim_source is None and cur == "Simulated stage":
+                self.cmb_stg.setCurrentText("None")
         self._stage_attach()
         if isinstance(self.source, CameraSource):
             rng = self.source.exposure_range()
@@ -1364,11 +1416,16 @@ class MainWindow(QMainWindow):
                 self.lbl_exp.setText(f"{self.sl_exp.value() / 10:.1f} ms")
         self.btn_autoexp_once.setEnabled(isinstance(self.source, CameraSource))
         self.demo_box.setVisible(self.sim_source is not None)
-        self.cmb_res.setVisible(self.sim_source is None)
+        self.cmb_res.setVisible(isinstance(self.source, CameraSource))  # a capture size means nothing to a replay
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
             self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
             self._set_replay_transport_enabled(self.source.transport_supported)
+            # a new player starts with the speed and looping the controls show, and playing
+            self.source.set_loop(self.chk_replay_loop.isChecked())
+            if self.source.transport_supported:
+                self.source.set_speed(float(self.cmb_replay_speed.currentText().replace("×", "")))
+            self._replay_sync_button()
         self._apply_exposure()
         QTimer.singleShot(1500, self._show_readback)
         self._refresh_checklist()
@@ -1863,7 +1920,13 @@ class MainWindow(QMainWindow):
         else:
             self._stretch = None
             levels = (0, 255)
-        self.p_live.set_image(s.preview, um_prev, levels=levels, unit="DN")
+        if self.chk_rgb.isChecked() and s.preview_rgb is not None and s.preview_rgb.shape[:2] == s.preview.shape:
+            # colour view of the same preview; the stretch (display only) maps the same DN range onto 0-255
+            lo, hi = levels
+            rgb = np.clip((s.preview_rgb.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255)
+            self.p_live.set_image(rgb.astype(np.uint8), um_prev, unit="DN", rgb=True)
+        else:
+            self.p_live.set_image(s.preview, um_prev, levels=levels, unit="DN")
         ov = None
         if self.chk_focus.isChecked() and s.in_focus is not None:
             r, g, b = hex_rgb(self.t["overlay_focus"])
@@ -1922,9 +1985,8 @@ class MainWindow(QMainWindow):
                               f"{'averaging ' + str(min(s.dwell_frames, 8)) + ' frames' if s.state == State.DWELL else ''}"
                               + self._brightness_note(s.preview))
         if isinstance(self.source, ReplaySource):
-            paused = self.btn_replay_pause.isChecked()
-            self.btn_replay_pause.setText("▶ Play" if paused else "‖ Pause")
-            if not paused:
+            self._replay_sync_button()
+            if not self._replay_stopped() and not self.replay_seek.isSliderDown():
                 self.replay_seek.blockSignals(True)
                 self.replay_seek.setValue(min(self.replay_seek.maximum(), self.source.position))
                 self.replay_seek.blockSignals(False)
@@ -1962,8 +2024,8 @@ class MainWindow(QMainWindow):
                 valid = np.isfinite(img).astype(np.uint8)
                 g = np.clip(np.nan_to_num(img, nan=0.0), 0, 255).astype(np.uint8)
                 rgba = np.dstack([g, g, g, valid * 255])  # empty = transparent; at most ~1600 px: cheap to repaint
-                if self.mosaic_rgb:
-                    rgb = self.engine.mosaic.image_rgb(d)
+                if self.mosaic_rgb and not showing_loaded:
+                    rgb = self.engine.mosaic_image_rgb()  # same box and origin as the grey view
                     if rgb is not None:
                         rgba = rgb
                 self.p_mosaic.set_image(rgba, m_um * d, rgb=True)
@@ -2231,6 +2293,9 @@ class MainWindow(QMainWindow):
                         r["sigma_inst_lt_Sq_over_10"] = bool(rep["sigma_inst"] < r["Sq"] / 10)
             else:
                 r["warnings"] = r.get("warnings", []) + [f"Repeatability not computed: {why}."]
+        # height tools act on the displayed map: points and ROIs placed on the previous map must not carry over
+        self._disarm_tools()
+        self.level_pts = []
         self.prev_result, self.result = self.result, r
         self._result_t = time.perf_counter()
         self._remember(r)
@@ -2350,14 +2415,16 @@ class MainWindow(QMainWindow):
                   scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve,
                   label="Super-resolution")
         self.sr_job = job
-        self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / 2, "input": crops[0]}))
+        scale = int(self.sr_scale)  # the drizzle output grid is `scale` times finer in each direction
+        self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / scale, "scale": scale, "input": crops[0]}))
 
     def _on_sr(self, r):
         self.sr_result = r
         self.sr_count = getattr(self, "sr_count", 0) + 1
         if self.job is None or not self.job.isRunning():
             self.prog.setValue(1000)
-            self.lbl_job.setText(f"Super-resolution (2× linear, 4× pixels): {r['frames_used']} frames used, "
+            k = r.get("scale", 2)
+            self.lbl_job.setText(f"Super-resolution ({k}× linear, {k * k}× pixels): {r['frames_used']} frames used, "
                                  f"{r['frames_rejected']} rejected, {r['subpixel_bins']} sub-pixel phases, "
                                  f"RL {r['rl_iterations']} iterations, PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
         self.cmb_edf.setCurrentIndex(1)
@@ -2390,8 +2457,8 @@ class MainWindow(QMainWindow):
             sr = self.sr_result
             self.p_edf.set_image(np.clip(sr["image"], 0, 255), sr["um_per_px"], levels=(0, 255), unit="DN", autorange=True)
             self.p_edf.set_overlay(None)
-            self.lbl_edf.setText("Experimental: 2× (linear) drizzle + Richardson-Lucy of the centre crop; a display "
-                                 "image, not a measured resolution gain")
+            self.lbl_edf.setText(f"Experimental: {sr.get('scale', 2)}× (linear) drizzle + Richardson-Lucy of the centre "
+                                 "crop; a display image, not a measured resolution gain")
         elif r is not None:
             um_cap = r["um_per_px_capture"]
             edf_rgb = r.get("edf_rgb")  # colour all-in-focus (fused with the grey weights) when the sweep was colour
@@ -2497,7 +2564,8 @@ class MainWindow(QMainWindow):
         lam_c = self.sp_lc.value()
         origin = "L-filter setting"
         if lam_c <= 0:
-            lam_c, origin = length / metrology.PROFILE_EVAL_CUTOFFS, "default: a fifth of the line"
+            lam_c, origin = (length / metrology.PROFILE_TRAVERSE_CUTOFFS,
+                             "default: a sixth of the line (5 sections + λc/2 run-in and run-out)")
         lam_s = float(r.get("lambda_s_um") or 0.0)
         why = metrology.profile_cutoff_problem(n, step, lam_c)
         if why is not None:
@@ -2506,7 +2574,8 @@ class MainWindow(QMainWindow):
         if not p:
             return "Too few valid heights along the line for profile values."
         s_txt = f"λs {p['lambda_s_applied_um']:.3g} µm" if p["lambda_s_applied_um"] else "no λs"
-        return (f"Roughness over {length:.1f} µm of measured height (ISO 21920 Gaussian filter: {s_txt}, "
+        ev = p.get("evaluation_length_um") or length
+        return (f"Roughness over {ev:.1f} µm of {length:.1f} µm measured (ISO 21920 Gaussian filter: {s_txt}, "
                 f"λc {p['lambda_c_applied_um']:.3g} µm [{origin}], line levelled):  "
                 f"Ra {p['Ra']:.4g} {zl}  ·  Rq {p['Rq']:.4g} {zl}  ·  Rz {p['Rz']:.4g} {zl}  ·  "
                 f"Rp {p['Rp']:.4g} {zl}  ·  Rv {p['Rv']:.4g} {zl}")
@@ -2837,6 +2906,7 @@ class MainWindow(QMainWindow):
             if mosaic is not None:
                 mmeta, marrays = mosaic.to_state_arrays()
                 self.engine.load_mosaic_state(mmeta, marrays)
+                self._sync_mosaic_controls()
                 self.last_mosaic_version = -1
             if loaded_mosaic is not None:
                 self.loaded_mosaic = loaded_mosaic
@@ -2870,6 +2940,7 @@ class MainWindow(QMainWindow):
         self.replay_seek = QSlider(Qt.Horizontal)
         self.replay_seek.setRange(0, 0)
         self.replay_seek.sliderReleased.connect(self._replay_seek_done)
+        self.replay_seek.valueChanged.connect(self._replay_seek_moved)  # programmatic updates block signals
         h.addWidget(self.btn_replay_pause)
         h.addWidget(self.btn_replay_step_b)
         h.addWidget(self.btn_replay_step_f)
@@ -2897,30 +2968,46 @@ class MainWindow(QMainWindow):
             wdg.setEnabled(on)
             wdg.setToolTip("" if on else "Not available: this recording is replayed frame by frame as fast as it is processed")
 
-    def _replay_toggle(self, checked: bool):
+    # The play/pause button always shows the player's own state (ReplaySource.paused / .done), never a state of its
+    # own: seek keeps playing or paused as it was, a step pauses, and the end of a recording reads "Play" (which
+    # restarts it from the first frame).
+    def _replay_stopped(self) -> bool:
+        s = self.source
+        return isinstance(s, ReplaySource) and (s.paused or (s.done and not s.loop))
+
+    def _replay_sync_button(self):
+        stopped = self._replay_stopped()
+        self.btn_replay_pause.blockSignals(True)
+        self.btn_replay_pause.setChecked(stopped)
+        self.btn_replay_pause.blockSignals(False)
+        self.btn_replay_pause.setText("▶ Play" if stopped else "‖ Pause")
+
+    def _replay_toggle(self, _checked: bool = False):
         s = self.source
         if not isinstance(s, ReplaySource):
             return
-        if checked:
-            s.pause()
-            self.btn_replay_pause.setText("▶ Play")
+        if self._replay_stopped():
+            s.resume()  # at the end of the recording this restarts from frame 0
         else:
-            s.resume()
-            self.btn_replay_pause.setText("‖ Pause")
+            s.pause()
+        self._replay_sync_button()
 
     def _replay_step(self, delta: int):
         s = self.source
         if isinstance(s, ReplaySource):
             s.step_frames(delta)
-            self.btn_replay_pause.setChecked(True)
-            self.btn_replay_pause.setText("▶ Play")
+            self._replay_sync_button()
 
     def _replay_seek_done(self):
         s = self.source
         if isinstance(s, ReplaySource):
             s.seek(self.replay_seek.value())
-            self.btn_replay_pause.setChecked(True)
-            self.btn_replay_pause.setText("▶ Play")
+            self._replay_sync_button()
+
+    def _replay_seek_moved(self, _value: int):
+        """A click on the slider's track or a key press moves it without a drag: seek then too."""
+        if not self.replay_seek.isSliderDown():
+            self._replay_seek_done()
 
     def _replay_speed(self, text: str):
         s = self.source
@@ -2934,13 +3021,23 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- mosaic bar
     def _mosaic_blend(self, text: str):
-        self.engine.mosaic.set_blending(text)
+        self.engine.set_mosaic_blending(text)  # under the engine lock: the engine thread splats into the same tiles
         self.last_mosaic_version = -1
 
     def _mosaic_track_rotation(self, on: bool):
         self.track_rotation = bool(on)
-        self.engine.mosaic.track_rotation = bool(on)
+        self.engine.set_mosaic_track_rotation(on)
         self.last_mosaic_version = -1
+
+    def _sync_mosaic_controls(self):
+        """Show the mosaic's own blending and rotation tracking (an opened session restores both)."""
+        m = self.engine.mosaic
+        for wdg, setter, value in ((self.cmb_mblend, self.cmb_mblend.setCurrentText, m.blending),
+                                   (self.chk_rot_track, self.chk_rot_track.setChecked, bool(m.track_rotation))):
+            wdg.blockSignals(True)
+            setter(value)
+            wdg.blockSignals(False)
+        self.track_rotation = bool(m.track_rotation)
 
     def _mosaic_rgb_mode(self, on: bool):
         self.mosaic_rgb = bool(on)
@@ -2951,11 +3048,13 @@ class MainWindow(QMainWindow):
         if s.preview is None:
             self.notify("No live image to inset yet.", "warning")
             return
-        um = s.um_preview if (s.um_preview and s.um_preview > 0) else self.obj.lateral_um_per_px_full
-        if not (um and um > 0):
-            um = self.obj.nominal_um_per_px(s.preview.shape[1])
-        x_um, y_um = s.mosaic_origin
-        self.engine.mosaic.add_inset(self.obj.name, um, x_um, y_um, s.preview)
+        # The mosaic is in preview pixels, so the inset's scale is the preview's (the same one the Live view uses,
+        # calibrated for this camera mode or nominal) and its position is the live view's mosaic position.
+        pw = s.preview.shape[1]
+        um = (self.obj.nominal_um_per_px(pw) if self.sim_source is not None
+              else self.store.get(self.obj).um_per_px(pw, self.obj, s.preview.shape[0]))
+        mx, my = s.mosaic_xy
+        self.engine.add_mosaic_inset(self.obj.name, um, mx * um, my * um, s.preview)
         self.last_mosaic_version = -1
         self.notify(f"Inset added: {s.preview.shape[1]}×{s.preview.shape[0]} px")
 

@@ -426,6 +426,7 @@ def capture_z_sweep(driver: StageDriver, source, engine, z_um_list: list[float],
     # Approach the start with motion analysis paused (a jump in Z would otherwise be taken for a sweep that began
     # early), and let the engine's pre-roll fill with frames at the start Z only.
     engine.set_override(Override.PAUSE)
+    source.label_with_stage = True  # frames carry the stage's Z only while the stage drives the focus
     try:
         first = driver.move_to(z_um=z_um_list[0])
         _wait_processed_at(source, first.z_um, settle_s, frames=PREROLL)
@@ -440,6 +441,7 @@ def capture_z_sweep(driver: StageDriver, source, engine, z_um_list: list[float],
             _wait_processed_at(source, p.z_um, settle_s)
     finally:
         engine.set_override(Override.AUTO)
+        source.label_with_stage = False
     return poses
 
 

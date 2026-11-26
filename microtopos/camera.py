@@ -24,8 +24,11 @@ from .optics import Objective
 from .simulator import SpecimenSimulator
 from .stage import StageError, StageReadout
 
+# Capture sizes offered when the device cannot be asked for its own list (no v4l2-ctl: Windows, macOS). The driver
+# rounds a size it does not have to one it has; the GUI shows the size actually delivered in "Device reports".
+DEFAULT_RESOLUTION = "1920x1080"
 SUPPORTED_RESOLUTIONS = (
-    "1920x1080",
+    DEFAULT_RESOLUTION,
     "1280x720",
     "1600x1200",
     "1440x1080",
@@ -80,6 +83,48 @@ def _v4l2_is_capture(dev: str) -> bool:
         except (subprocess.SubprocessError, OSError):
             return False
     return True
+
+
+def camera_modes(info: CameraInfo) -> list[str]:
+    """Capture sizes ("WxH") the device offers for MJPG, largest first; MJPG is the format CameraSource requests.
+
+    Read from `v4l2-ctl --list-formats-ext` (Linux). A device that lists no MJPG contributes all of its sizes. When
+    the device cannot be asked (no v4l2-ctl, no device path, an error or an empty answer), SUPPORTED_RESOLUTIONS is
+    returned: those sizes are requests that the driver may round to a mode it has."""
+    if info.path and shutil.which("v4l2-ctl"):
+        try:
+            out = subprocess.run(["v4l2-ctl", "-d", info.path, "--list-formats-ext"], capture_output=True, text=True,
+                                 timeout=3, check=False).stdout
+        except (subprocess.SubprocessError, OSError):
+            out = ""
+        by_fmt: dict[str, list[str]] = {}
+        fmt = ""
+        for line in out.splitlines():
+            m = re.search(r"\[\d+\]:\s*'(\w+)'", line)
+            if m:
+                fmt = m.group(1)
+                continue
+            m = re.search(r"Size:\s*Discrete\s+(\d+)x(\d+)", line)
+            if m and fmt:
+                size = f"{int(m.group(1))}x{int(m.group(2))}"
+                if size not in by_fmt.setdefault(fmt, []):
+                    by_fmt[fmt].append(size)
+        sizes = by_fmt.get("MJPG") or sorted({s for v in by_fmt.values() for s in v})
+        if sizes:
+            def area(s: str) -> int:
+                w, h = s.split("x")
+                return int(w) * int(h)
+            return sorted(sizes, key=lambda s: (-area(s), s))
+    return list(SUPPORTED_RESOLUTIONS)
+
+
+def pick_resolution(modes: list[str], saved: str | None) -> str:
+    """The size to open: the user's saved choice if this camera offers it, else full HD, else the largest offered."""
+    if saved in modes:
+        return str(saved)
+    if DEFAULT_RESOLUTION in modes:
+        return DEFAULT_RESOLUTION
+    return modes[0]
 
 
 class V4L2Controls:
@@ -145,6 +190,10 @@ class FrameSource:
         self.warnings: list[str] = []
         self._consumed = 0  # last sequence number the engine finished (used by the ordered replay mode)
         self.stage_driver = None  # optional StageDriver for live encoder / motorised Z readout
+        # True only while stage.capture_z_sweep drives the stage: then, and only then, is the stage's Z the height
+        # of each frame. Outside a motorised sweep the focus is moved by hand (or the frames are a replay), and a
+        # stage label would replace the frame-index Z of a hand sweep with one constant stage Z.
+        self.label_with_stage = False
         FrameSource._ids += 1
         self.source_id = f"{type(self).__name__}-{FrameSource._ids}"
 
@@ -171,11 +220,12 @@ class FrameSource:
         """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
         published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps.
 
-        When a StageDriver is attached (`stage_driver`) and the source supplies no truth of its own, the frame is
-        labelled with the stage's pose read now (`StageReadout`, z in um). A stage that fails or is
-        disconnected leaves the frame unlabelled: a missing label, never a made-up one.
+        During a motorised Z sweep (`label_with_stage`, set by `stage.capture_z_sweep`) with a StageDriver attached
+        (`stage_driver`), a frame without truth of its own is labelled with the stage's pose read now
+        (`StageReadout`, z in um). A stage that fails or is disconnected leaves the frame unlabelled: a missing
+        label, never a made-up one.
         """
-        if truth is None and self.stage_driver is not None:
+        if truth is None and self.label_with_stage and self.stage_driver is not None:
             try:
                 p = self.stage_driver.pose()
                 if p.connected:

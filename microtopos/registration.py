@@ -292,7 +292,10 @@ def register_pair(template: np.ndarray, moving: np.ndarray, factor: int = 2, mod
             if near and np.isfinite(Ws).all() and float(cc_e) >= SNR_MIN_CORRELATION:
                 # last, as it costs a second (affine) ECC run: is a translation-only result valid for this pair?
                 d = deformation(th, mh, float(We[0, 2]), float(We[1, 2]), deform_max_side) if model == "translation" else (sc, rot)
-                scale_step = float(d[0])
+                # None: the affine fit failed, so the deformation is unknown; within_envelope rejects it and the
+                # phase-correlation fallback stays (as in v0.9.0), and the scale is not observed
+                if d is not None:
+                    scale_step = float(d[0])
                 if within_envelope(d, max_scale_dev, max_rot_deg):
                     W, cc, ok, method = Ws, float(cc_e), True, "ecc"
         except cv2.error:

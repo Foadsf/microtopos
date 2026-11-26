@@ -187,31 +187,72 @@ def gaussian_filter_1d_nan(prof: np.ndarray, lam_um: float, step_um: float) -> n
     return np.where(valid & (den > 1e-3), num / np.maximum(den, 1e-6), np.nan).astype(np.float32)
 
 
-PROFILE_EVAL_CUTOFFS = 5.0  # ISO 21920-2 evaluation length for roughness: 5 sampling lengths (= cut-offs lambda_c)
+PROFILE_EVAL_CUTOFFS = 5.0  # ISO 21920-2 default evaluation length for roughness: 5 section lengths (= λc)
+PROFILE_RUN_CUTOFFS = 1.0  # run-in + run-out: λc/2 at each end, where the Gaussian L-filter has not settled
+PROFILE_TRAVERSE_CUTOFFS = PROFILE_EVAL_CUTOFFS + PROFILE_RUN_CUTOFFS  # shortest profile that gives roughness
+_CUTOFF_RTOL = 1e-9  # a length computed as n * λc from a float step must count as n cut-offs, not n - 1e-15
+
+
+def _cutoffs_in(n_samples: int, step_um: float, lam_c_um: float) -> float:
+    """Number of cut-offs λc in a profile of `n_samples` points at `step_um`, rounding error forgiven."""
+    return (n_samples - 1) * step_um / lam_c_um * (1.0 + _CUTOFF_RTOL)
 
 
 def profile_cutoff_problem(n_samples: int, step_um: float, lam_c_um: float) -> str | None:
     """Why a profile of `n_samples` points at `step_um` cannot give roughness at cut-off `lam_c_um`, or None.
 
     The cut-off must span at least MIN_CUTOFF_PX samples (below that the sampled Gaussian is not the ISO 16610-21
-    filter) and the profile must hold PROFILE_EVAL_CUTOFFS cut-offs (the ISO 21920-2 evaluation length).
+    filter) and the profile must hold PROFILE_TRAVERSE_CUTOFFS cut-offs: the ISO 21920-2 evaluation length of
+    PROFILE_EVAL_CUTOFFS section lengths plus λc/2 run-in and λc/2 run-out (see profile_parameters).
     """
     if lam_c_um / step_um < MIN_CUTOFF_PX:
         return (f"λc = {lam_c_um:.3g} µm is {lam_c_um / step_um:.1f} px; the Gaussian filter needs at least "
                 f"{MIN_CUTOFF_PX:g} px per cut-off")
-    n_cut = (n_samples - 1) * step_um / lam_c_um
-    if n_cut < PROFILE_EVAL_CUTOFFS:
+    n_cut = _cutoffs_in(n_samples, step_um, lam_c_um)
+    if n_cut < PROFILE_TRAVERSE_CUTOFFS:
         return (f"the profile is {n_cut:.1f} cut-offs long at λc = {lam_c_um:.3g} µm; ISO 21920-2 evaluates "
-                f"{PROFILE_EVAL_CUTOFFS:g}")
+                f"{PROFILE_EVAL_CUTOFFS:g} after λc/2 run-in and run-out at each end, so it needs "
+                f"{PROFILE_TRAVERSE_CUTOFFS:g}")
     return None
+
+
+def _profile_sections(n_samples: int, step_um: float, lam_c_um: float) -> np.ndarray | None:
+    """Section index (0 .. n_sc - 1) of every sample inside the evaluation length, -1 outside; None if n_sc < 1.
+
+    The evaluation length is the largest whole number n_sc of section lengths λc that fits after removing λc/2
+    run-in and λc/2 run-out, centred on the profile.
+    """
+    n_sc = math.floor(_cutoffs_in(n_samples, step_um, lam_c_um)) - round(PROFILE_RUN_CUTOFFS)
+    if n_sc < 1:
+        return None
+    length = (n_samples - 1) * step_um
+    x0 = 0.5 * (length - n_sc * lam_c_um)
+    u = (np.arange(n_samples, dtype=np.float64) * step_um - x0) / lam_c_um  # position in section lengths
+    inside = (u >= -_CUTOFF_RTOL * n_sc) & (u <= n_sc * (1.0 + _CUTOFF_RTOL))
+    sec = np.clip(np.floor(u + _CUTOFF_RTOL * n_sc), 0, n_sc - 1).astype(int)
+    return np.where(inside, sec, -1)
 
 
 def profile_parameters(prof: np.ndarray, step_um: float, lam_s_um: float = 0.0, lam_c_um: float = 0.0) -> dict:
     """ISO 21920 1D profile filtering (F-operator line levelling -> S-filter -> L-filter) and Ra/Rq/Rz/Pt metrics.
 
-    Returns the primary profile (line levelled), waviness (L-filtered) and roughness profiles together with
-    Pa/Pq/Pt on the primary profile and Ra/Rq/Rp/Rv/Rz/Rsk/Rku on the roughness profile; Wa/Wq are added when
-    the waviness profile has enough samples.
+    Returns the primary profile (line levelled), waviness (L-filtered) and roughness profiles (full length)
+    together with Pa/Pq/Pt on the whole primary profile and Ra/Rq/Rp/Rv/Rz/Rsk/Rku on the roughness profile;
+    Wa/Wq are added when the waviness profile has enough samples.
+
+    When the L-filter is applied, the R and W parameters are evaluated over the evaluation length only: the
+    Gaussian filter has an end effect within about λc/2 of each end of the profile, so λc/2 run-in and λc/2
+    run-out are discarded (the traversing length exceeds the evaluation length by λc: the conventional
+    run-up / run-out allowance of ISO 4288 practice). The evaluation length is the largest whole number of
+    section lengths (each = λc) that fits in what remains, centred on the profile: a profile of 6 λc gives the
+    default 5 sections (PROFILE_EVAL_CUTOFFS); profile_cutoff_problem refuses anything shorter. `evaluation_length_um` and
+    `n_sections` report what was used. Rz is the ISO 21920-2 mean of the section maximum heights (peak-to-valley
+    within each λc section). Rp and Rv are the highest peak and the deepest valley within the whole evaluation
+    length (not averaged over sections), so Rz <= Rp + Rv. Heights are taken from the mean of the evaluated
+    samples. Returns {} if the L-filter is applied but no whole section fits.
+
+    Without an L-filter (λc off or below MIN_CUTOFF_PX) nothing is discarded and Rz is the mean peak-to-valley
+    of up to 5 equal parts of the profile; those values are primary-profile values under R names.
     """
     valid = np.isfinite(prof)
     if valid.sum() < 5:
@@ -232,15 +273,27 @@ def profile_parameters(prof: np.ndarray, step_um: float, lam_s_um: float = 0.0, 
         waviness = np.full_like(primary, np.nan)
         roughness = primary
     pv = primary[np.isfinite(primary)].astype(np.float64)
-    rv = roughness[np.isfinite(roughness)].astype(np.float64)
+    if lam_c_done:
+        sec = _profile_sections(len(prof), step_um, lam_c_done)
+        if sec is None:
+            return {}
+        n_sc = int(sec.max()) + 1
+        keep = (sec >= 0) & np.isfinite(roughness)
+        rv, rsec = roughness[keep].astype(np.float64), sec[keep]
+        wav_eval = np.where(sec >= 0, waviness, np.nan)
+    else:
+        rv = roughness[np.isfinite(roughness)].astype(np.float64)
+        rsec, n_sc = None, 0
+        wav_eval = waviness
     if rv.size < 4:
         return {}
     rv = rv - rv.mean()
     pv = pv - pv.mean()
     rq = float(np.sqrt(np.mean(rv * rv)))
-    # Rz over up to 5 sampling sections
-    n_sec = min(5, max(1, rv.size // 8))
-    chunks = np.array_split(rv, n_sec)
+    if rsec is not None:  # ISO 21920-2 Rz: mean peak-to-valley height of the λc sections
+        chunks = [rv[rsec == k] for k in range(n_sc)]
+    else:  # no L-filter, so no section length: up to 5 equal parts
+        chunks = np.array_split(rv, min(5, max(1, rv.size // 8)))
     rz = float(np.mean([c.max() - c.min() for c in chunks if c.size]))
     out = {
         "lambda_s_applied_um": lam_s_done,  # 0.0 = that filter was not applied (off, or below MIN_CUTOFF_PX)
@@ -259,7 +312,10 @@ def profile_parameters(prof: np.ndarray, step_um: float, lam_s_um: float = 0.0, 
         "Rsk": float(np.mean(rv**3) / rq**3) if rq > 0 else 0.0,
         "Rku": float(np.mean(rv**4) / rq**4) if rq > 0 else 0.0,
     }
-    wv = waviness[np.isfinite(waviness)].astype(np.float64)
+    if rsec is not None:
+        out["n_sections"] = n_sc
+        out["evaluation_length_um"] = n_sc * lam_c_done
+    wv = wav_eval[np.isfinite(wav_eval)].astype(np.float64)
     if wv.size >= 4:
         wv = wv - wv.mean()
         out["Wa"] = float(np.mean(np.abs(wv)))
@@ -336,13 +392,29 @@ def height_parameters(s: np.ndarray, um_per_px: float) -> dict:
 def _material_void_volume(z_desc: np.ndarray, mr: float) -> tuple[float, float]:
     """(Vm, Vv) at material ratio `mr` (fraction 0..1) per unit area, from heights sorted high to low.
 
-    Vm(mr) is the material volume above the height c(mr) that mr of the area exceeds; Vv(mr) is the void
-    volume below that height (ISO 25178-2, 4.4.x), both in height units (volume per unit area).
+    Vm(mr) = integral over q from 0 to mr of [c(q) - c(mr)] is the material volume above the height c(mr) that
+    mr of the area exceeds; Vv(mr) = integral over q from mr to 1 of [c(mr) - c(q)] is the void volume below it
+    (ISO 25178-2), both in height units (volume per unit area). c(q) is the areal material ratio curve with the
+    same convention as Sk in functional_parameters: the i-th highest of n heights sits at q = (i + 0.5) / n,
+    linear between those points and constant beyond the first and last, so its integral over 0..1 is the mean.
     """
     n = z_desc.size
-    k = min(n - 1, max(0, round(mr * n)))
-    c = z_desc[k]
-    return float((z_desc[:k] - c).sum() / n), float((c - z_desc[k:]).sum() / n)
+    t = mr * n - 0.5  # fractional index of mr on the (i + 0.5) / n grid
+    total = float(z_desc.sum()) / n  # integral of c over 0..1
+    if t <= 0.0:
+        c = float(z_desc[0])
+        upper = mr * c  # integral of c over 0..mr
+    elif t >= n - 1:
+        c = float(z_desc[-1])
+        upper = total - (1.0 - mr) * c
+    else:
+        k = math.floor(t)
+        f = t - k
+        c = float(z_desc[k] + f * (z_desc[k + 1] - z_desc[k]))
+        # integral up to grid point k (constant half step before point 0, then trapezoids), then the partial step
+        to_k = (float(z_desc[:k].sum()) + 0.5 * float(z_desc[k])) / n
+        upper = to_k + f / n * 0.5 * (float(z_desc[k]) + c)
+    return upper - mr * c, c * (1.0 - mr) - (total - upper)
 
 
 def functional_parameters(s: np.ndarray) -> dict:
@@ -390,7 +462,22 @@ def functional_parameters(s: np.ndarray) -> dict:
 
 
 WOLF_PRUNE = 0.05  # ISO 25178-2 default pruning: features with a dynamic below 5 % of Sz are merged away
+FLOAT32_ULPS_FLOOR = 4.0  # height differences below 4 float32 rounding steps of the input are numerical noise
 _NEIGHBOURS8 = np.ones((3, 3), bool)
+
+
+def height_noise_floor(height: np.ndarray) -> float:
+    """Numerical resolution of a float32 height map: FLOAT32_ULPS_FLOOR x eps x the largest |height|.
+
+    Storing heights as float32 rounds each by up to half a unit in the last place, so after form removal a
+    perfect plane keeps a residual of that size (about 1e-7 µm at a 3 µm offset). Height differences below this
+    floor carry no information; summits and peaks must rise above it. Pass the heights BEFORE form removal (what
+    was rounded), in the unit of the surface. 0 for an all-invalid map.
+    """
+    fin = height[np.isfinite(height)]
+    if not fin.size:
+        return 0.0
+    return FLOAT32_ULPS_FLOOR * float(np.finfo(np.float32).eps) * float(np.max(np.abs(fin)))
 
 
 def _centred(s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -415,22 +502,26 @@ def _window_valid(valid: np.ndarray) -> np.ndarray:
     return cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8))[1:-1, 1:-1] > 0
 
 
-def summit_parameters(s: np.ndarray, um_per_px: float) -> dict:
-    """Sds and Ssc: density and mean curvature of ALL summits (cheap; no pruning).
+def summit_parameters(s: np.ndarray, um_per_px: float, noise_floor: float | None = None) -> dict:
+    """Sds and Ssc: density and mean curvature of the summits (cheap; no Wolf pruning).
 
-    A summit is a pixel strictly higher than its 8 neighbours (EUR 15178N 'summit'; no minimum height or
-    separation criterion is applied). Sds = number of summits per mm² of valid area; Ssc = arithmetic mean of
-    the principal curvatures at the summits, -(z_xx + z_yy)/2, in 1/µm when z is in µm.
-    Because nothing is pruned, Sds counts every noise maximum: on a noisy surface it is far larger than
-    Spd (the density of Wolf-pruned significant peaks, see feature_parameters) and it depends on the pixel size
-    and on the S-filter. Use Spd for a noise-robust density.
+    A summit is a pixel higher than each of its 8 neighbours by more than `noise_floor` (EUR 15178N 'summit'
+    with only a numerical-resolution criterion: no minimum height above the mean plane and no separation
+    criterion). `noise_floor` is the float32 resolution of the original heights (height_noise_floor; analyze()
+    passes it); by default it is taken from `s` itself, which cannot see an offset or form already removed.
+    Sds = number of summits per mm² of valid area; Ssc = arithmetic mean of the principal curvatures at the
+    summits, -(z_xx + z_yy)/2, in 1/µm when z is in µm.
+    Because nothing is pruned, Sds counts every measured noise maximum: on a noisy surface it is far larger
+    than Spd (the density of Wolf-pruned significant peaks, see feature_parameters) and it depends on the pixel
+    size and on the S-filter. Use Spd for a noise-robust density.
     """
     valid, z = _centred(s)
     if valid.sum() < 64:
         return {}
+    floor = height_noise_floor(s) if noise_floor is None else noise_floor
     c = z[1:-1, 1:-1]
     nbr_max = _neighbour_max(z)
-    summits = _window_valid(valid) & (c > nbr_max)
+    summits = _window_valid(valid) & (c - nbr_max > floor)
     area_mm2 = float(valid.sum()) * (um_per_px * 1e-3) ** 2
     out = {"Sds_per_mm2": int(summits.sum()) / area_mm2}
     if summits.any():
@@ -449,12 +540,13 @@ def _neighbour_max(z: np.ndarray) -> np.ndarray:
     return out
 
 
-def _significant_peak_mask(z: np.ndarray, valid: np.ndarray) -> np.ndarray | None:
+def _significant_peak_mask(z: np.ndarray, valid: np.ndarray, noise_floor: float = 0.0) -> np.ndarray | None:
     """Boolean mask of the regional maxima whose dynamic (height above the saddle to any higher peak) is at least
-    WOLF_PRUNE x Sz: the h-maxima, which is what Wolf pruning of the hill/dale segmentation leaves. None if flat."""
+    WOLF_PRUNE x Sz: the h-maxima, which is what Wolf pruning of the hill/dale segmentation leaves. None if flat
+    (Sz not above the numerical noise floor, see height_noise_floor)."""
     fin = z[valid]
     sz = float(fin.max() - fin.min())
-    if sz <= 1e-9:
+    if sz <= max(1e-9, noise_floor):
         return None
     return h_maxima(np.where(valid, z, fin.min()), WOLF_PRUNE * sz)
 
@@ -472,7 +564,8 @@ def _peak_positions(mask: np.ndarray, z: np.ndarray, win_valid: np.ndarray) -> n
     return pos[win_valid[pos[:, 0] - 1, pos[:, 1] - 1]]
 
 
-def feature_parameters(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | None = None) -> dict:
+def feature_parameters(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | None = None,
+                       noise_floor: float | None = None) -> dict:
     """ISO 25178-2 feature parameters Spd, Spc, S5p, S5v, S10z plus the summit parameters Sds and Ssc.
 
     Heights are measured from the mean plane. 'Significant' peaks and pits are the regional maxima / minima
@@ -483,15 +576,17 @@ def feature_parameters(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | Non
     S5v  mean depth of the five deepest significant pits below the mean plane (height unit).
     S10z = S5p + S5v.
     Peaks and pits on the 1-px border or next to invalid pixels are not used. Sds and Ssc: see summit_parameters.
+    A surface whose Sz does not exceed `noise_floor` (height_noise_floor; default from `s`) has no peaks.
     Costs about 1.5 s per megapixel (two h-maxima reconstructions), so analyze() leaves it to feature_set().
     """
-    out = summit_parameters(s, um_per_px)
+    floor = height_noise_floor(s) if noise_floor is None else noise_floor
+    out = summit_parameters(s, um_per_px, floor)
     if not out:
         return {}
     valid, z = _centred(s)
     win_valid = _window_valid(valid)
     area_mm2 = float(valid.sum()) * (um_per_px * 1e-3) ** 2
-    peak_mask = _peaks if _peaks is not None else _significant_peak_mask(z, valid)
+    peak_mask = _peaks if _peaks is not None else _significant_peak_mask(z, valid, floor)
     if peak_mask is None:
         return out
     fin = z[valid]
@@ -650,20 +745,23 @@ def grains(img: np.ndarray, um_per_px: float, h_rel: float = 0.15) -> dict:
     return out
 
 
-def grains_topographic(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | None = None) -> dict:
+def grains_topographic(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | None = None,
+                       noise_floor: float | None = None) -> dict:
     """Topographic hill segmentation of the height map (`sl_surface`): ISO 25178-2 hills by watershed.
 
     Markers are the Wolf-pruned peaks (regional maxima with a dynamic of at least 5 % of Sz, the same peaks that
     Spd counts); every valid pixel is then assigned to a hill by a watershed of the inverted height. Hills
     touching the border, or smaller than 20 px, are excluded from the count. Returns `topo_grain_count`,
     `topo_mean_grain_area_um2` (mean hill area, µm²) and `topo_watershed_labels` (all catchments, int32).
-    {} when fewer than 30 % of the pixels are valid; {"topo_grain_count": 0} for a flat surface.
+    {} when fewer than 30 % of the pixels are valid; {"topo_grain_count": 0} for a flat surface (Sz not above
+    `noise_floor`, see height_noise_floor; default from `s`).
     """
     valid = np.isfinite(s)
     if valid.mean() < MIN_VALID_FRACTION:
         return {}
     _, z = _centred(s)
-    peak_mask = _peaks if _peaks is not None else _significant_peak_mask(z, valid)
+    floor = height_noise_floor(s) if noise_floor is None else noise_floor
+    peak_mask = _peaks if _peaks is not None else _significant_peak_mask(z, valid, floor)
     if peak_mask is None:
         return {"topo_grain_count": 0}
     markers, _n = ndi.label(peak_mask, structure=_NEIGHBOURS8)
@@ -679,16 +777,18 @@ def grains_topographic(s: np.ndarray, um_per_px: float, _peaks: np.ndarray | Non
     return out
 
 
-def feature_set(s: np.ndarray, um_per_px: float, z_unit: str) -> dict:
+def feature_set(s: np.ndarray, um_per_px: float, z_unit: str, noise_floor: float | None = None) -> dict:
     """The expensive, on-demand surface features: Spd, Spc, S5p, S5v, S10z (feature_parameters) and the
-    topographic hills (grains_topographic), sharing one peak search. Curvatures are withheld unless z is in µm."""
+    topographic hills (grains_topographic), sharing one peak search. Curvatures are withheld unless z is in µm.
+    `noise_floor`: height_noise_floor of the heights `s` was made from (default: from `s` itself)."""
+    floor = height_noise_floor(s) if noise_floor is None else noise_floor
     valid, z = _centred(s)
-    mask = _significant_peak_mask(z, valid) if valid.sum() >= 64 else None
-    out = feature_parameters(s, um_per_px, _peaks=mask)
+    mask = _significant_peak_mask(z, valid, floor) if valid.sum() >= 64 else None
+    out = feature_parameters(s, um_per_px, _peaks=mask, noise_floor=floor)
     if mask is not None:
-        out.update(grains_topographic(s, um_per_px, _peaks=mask))
+        out.update(grains_topographic(s, um_per_px, _peaks=mask, noise_floor=floor))
     else:
-        out.update(grains_topographic(s, um_per_px))
+        out.update(grains_topographic(s, um_per_px, noise_floor=floor))
     if not units.is_um(z_unit):
         out.pop("Ssc_per_um", None)
         out.pop("Spc_per_um", None)
@@ -744,7 +844,9 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
         fp = functional_parameters(s)
         res.update(fp)
         elig["functional"] = "ok" if fp else "too few valid pixels (needs 200)"
-        feat = feature_set(s, um_per_px, z_unit) if features else summit_parameters(s, um_per_px)
+        floor = height_noise_floor(height)
+        feat = (feature_set(s, um_per_px, z_unit, noise_floor=floor) if features
+                else summit_parameters(s, um_per_px, noise_floor=floor))
         res.update(feat)
         if not feat:
             elig["feature"] = "too few valid pixels"

@@ -441,11 +441,16 @@ def _two_sine_surface(um):
 
 def _expected_roughness(lam_c, um, x_px0, x_px1):
     """Ra, Rq of the roughness profile of the two-sine line: each sine is attenuated by the ISO 16610-21 Gaussian
-    L-filter transmission exp(-pi (alpha lam_c / lam)^2) before being subtracted from the profile."""
+    L-filter transmission exp(-pi (alpha lam_c / lam)^2) before being subtracted from the profile. Evaluated over
+    the evaluation length: the largest whole number of lam_c sections left after lam_c/2 run-in and run-out,
+    centred on the line."""
     def t(lam):
         return np.exp(-np.pi * (ALPHA * lam_c / lam) ** 2)
 
-    xs = np.arange(x_px0, x_px1, 0.01 / um) * um
+    x0, x1 = x_px0 * um, x_px1 * um
+    n_sc = int(np.floor((x1 - x0) / lam_c * (1 + 1e-9))) - 1
+    mid = 0.5 * (x0 + x1)
+    xs = np.arange(mid - 0.5 * n_sc * lam_c, mid + 0.5 * n_sc * lam_c, 0.01)
     rough = (A_SHORT * (1 - t(LAM_SHORT)) * np.sin(2 * np.pi * xs / LAM_SHORT)
              + A_LONG * (1 - t(LAM_LONG)) * np.sin(2 * np.pi * xs / LAM_LONG + 0.7))
     return float(np.mean(np.abs(rough))), float(np.sqrt(np.mean(rough ** 2)))
@@ -476,10 +481,10 @@ def test_profile_label_reports_iso_roughness_at_the_chosen_cutoff(window, qapp, 
 
     # the waviness (40 um, 2 um high) dominates the unfiltered line, so Ra/Rq depend on lambda_c as the Gaussian
     # transmission says; a different lambda_c gives a different, equally predicted, value
-    w.sp_lc.setValue(0.0)  # "off": the label falls back to a fifth of the line, and says so
+    w.sp_lc.setValue(0.0)  # "off": the label falls back to a sixth of the line (5 sections + run-in/out), and says so
     _pump(qapp, 5)
     text0 = w.prof_label.text()
-    lam_default = length / metrology.PROFILE_EVAL_CUTOFFS
+    lam_default = length / metrology.PROFILE_TRAVERSE_CUTOFFS
     ra0, rq0 = _expected_roughness(lam_default, um, x_a, x_b)
     assert "default" in text0
     assert _label_value(text0, "Ra") == pytest.approx(ra0, rel=0.02)
@@ -609,10 +614,13 @@ def _wait_for(qapp, cond, timeout: float = 5.0) -> bool:
     return False
 
 
+@pytest.mark.characterization("pause/resume/step/seek mid-playback already worked; only the recording was made long "
+                              "enough that the end-of-recording behaviour (tests/test_gui_regressions.py) is not hit")
 def test_replay_ui_transport_bar(tmp_path, qapp):
     """Opening MainWindow(replay=...) shows the replay bar and the pause / seek / step / speed /
     loop controls drive the ReplaySource (offscreen, no real camera)."""
-    rec_dir = _make_recording(tmp_path)
+    # 20 s of recording: pause/resume must act mid-playback (at the end, the button restarts the recording instead)
+    rec_dir = _make_recording(tmp_path, n_frames=200)
     w = MainWindow(simulator_only=False, replay=str(rec_dir))
     w.show()
     _pump(qapp)
@@ -620,7 +628,7 @@ def test_replay_ui_transport_bar(tmp_path, qapp):
         assert isinstance(w.source, ReplaySource)
         assert w.replay_widget.isVisible()
         src: ReplaySource = w.source
-        assert src.total_frames == 8
+        assert src.total_frames == 200
 
         # pause: the playback thread stops advancing
         w.btn_replay_pause.click()

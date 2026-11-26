@@ -50,6 +50,8 @@ class Keyframe:
     area: int = 0  # mosaic area this keyframe belongs to
     angle_deg: float = 0.0  # in-plane stage angle at capture (degrees)
     rgb: np.ndarray | None = None  # uint8 HxWx3 colour image matching image, if any
+    # thumbnail spectrum for ranking bridge candidates (Mosaic._thumb_spectrum); derived, never persisted
+    spectrum: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -97,6 +99,10 @@ class Mosaic:
     angle_deg: float = 0.0  # current in-plane angle estimate (degrees)
     track_rotation: bool = False  # estimate & compensate in-plane rotation while tracking
     current_area: int = 0  # area new keyframes are added to
+    # what the last track() call did to the areas: None, "new_area" (an unconnected view started a separate area)
+    # or "areas_joined" (a bridge merged the current area into another one). `areas` alone cannot tell a join
+    # from a new area: a join lowers it and the next new area raises it back to the same number.
+    last_event: str | None = None
     # "feather": weighted average with a sine feather. "multiband": a TWO-band blend (not a Laplacian pyramid): the
     # image is split at Gaussian sigma 8 px; the low band is feather-weighted, the high band is weighted by
     # feather**4 so that overlaps take fine texture mostly from the keyframe whose centre is nearest. The id
@@ -127,6 +133,7 @@ class Mosaic:
         self.areas = 1
         self.angle_deg = 0.0
         self.current_area = 0
+        self.last_event = None
         self._last_rot = 0.0
         self.lost_frames = 0
         self.lost_view = None
@@ -348,6 +355,7 @@ class Mosaic:
         `rgb`, when given, is the colour image matching `frame` and is stored with the new keyframe and
         blended into the colour canvas when blending is active.
         """
+        self.last_event = None
         f = frame.astype(np.float32)
         fb = self._bp(f)
         b = brenner(f)
@@ -469,16 +477,20 @@ class Mosaic:
         w = f.shape[1]
         x = max(k.x for k in self.keyframes) + 1.3 * w
         y = min(k.y for k in self.keyframes)
-        self.current_area += 1
+        # a fresh id: ids of joined areas are not reused, so after a join the area count is not a free id
+        self.current_area = max(k.area for k in self.keyframes) + 1
         self.angle_deg = 0.0  # the orientation of an unconnected view is unknown: it defines its own
         self._add_keyframe(f, fb, b, x, y, None, (0.0, 0.0), rgb=rgb)
         self.ref = len(self.keyframes) - 1
         self.x, self.y = x, y
-        self.areas += 1
-        self.current_area = self.areas - 1
+        self.areas = len({k.area for k in self.keyframes})
+        self.last_event = "new_area"
         self.lost_view = None
         self.lost, self.lost_frames = False, 0
         self.prev_frame, self.prev_bp, self.prev_xy = f, fb, (x, y)
+        # the seed view is now the latest frame with a known position; left on the previous area's last frame, a
+        # re-acquisition from it would place frames in that area's coordinates under this area's id
+        self.last_good = (f, fb, (x, y), self.angle_deg)
 
     def _nearest(self, x, y, k: int = 1):
         d = [math.hypot(x - kf.x, y - kf.y) for kf in self.keyframes]
@@ -500,6 +512,8 @@ class Mosaic:
         k = self.keyframes[i]
         self.ref = i
         self.x, self.y = k.x - dx, k.y - dy
+        # the view is now in that keyframe's coordinates, which may be another area's: new keyframes belong there
+        self.current_area = k.area
         if self.track_rotation:  # keyframes are in the mosaic orientation: the measured rotation is absolute
             self.angle_deg = rot
         self.lost, self.lost_frames, self.lost_view = False, 0, None
@@ -553,8 +567,15 @@ class Mosaic:
 
         Returns (kf_yields, older_yields) where:
         - kf_yields: [(k_idx, grid)] of tiles in kf where an existing keyframe k is sharper;
-        - older_yields: [(k_idx, grid)] of tiles in existing keyframe k where the new kf is sharper.
-        """
+        - older_yields: [(k_idx, grid)] of tiles in existing keyframe k where the new kf is sharper, only for a k
+          that kf beats in EVERY tile both views show entirely (a blurred first pass under a sharp revisit).
+
+        A pair yields in one direction only. The per-tile comparison of two equally sharp views is decided by
+        noise, so letting both views yield wherever the other looked sharper made most overlapping pairs yield to
+        each other (40x closed loop, seed 2: 53 of 55 yielding pairs), and where their yield masks met nothing was
+        left (NaN holes inside keyframes) while every keyframe add re-splatted most of its neighbours. As in v0.9.0
+        the new view yields tile by tile to sharper existing views; an existing view yields to the new one only
+        when the new one is sharper in every compared tile, so the new one yields nothing to it."""
         h, w = kf.image.shape
         g = self.YIELD_GRID
         xs = np.linspace(0, w, g + 1).astype(int)
@@ -567,6 +588,7 @@ class Mosaic:
             if x1 - x0 < w / 4 or y1 - y0 < h / 4:
                 continue
             grid_kf = np.zeros((g, g), np.float32)
+            compared = kf_sharper = 0
             for i in range(g):
                 for j in range(g):
                     ta, tb, la, lb = ys[i], ys[i + 1], xs[j], xs[j + 1]
@@ -575,8 +597,13 @@ class Mosaic:
                     mine = self._relative_sharpness(kf.image[ta:tb, la:lb])
                     theirs = self._relative_sharpness(k.image[ta - oy:tb - oy, la - ox:lb - ox])
                     grid_kf[i, j] = float(mine < theirs)
+                    compared += 1
+                    kf_sharper += mine > theirs
             if grid_kf.any():
                 kf_out.append((k_idx, grid_kf))
+                continue
+            if compared == 0 or kf_sharper < compared:
+                continue
             xs_k = xs if kw == w else np.linspace(0, kw, g + 1).astype(int)
             ys_k = ys if kh == h else np.linspace(0, kh, g + 1).astype(int)
             kx0, ky0 = max(0, -ox), max(0, -oy)
@@ -625,58 +652,97 @@ class Mosaic:
         cur = self.keyframes[j]
         h, w = cur.image.shape
         linked = {e[0] for e in self.edges if e[1] == j}
-        cur_area0 = cur.area
         new = []
-        merged = False
+        # cross-area bridge first (the stage re-connected two previously disconnected areas): afterwards the joined
+        # area's keyframes are in cur's coordinates and get the ordinary predicted loop-closure test below
+        bridge = self._bridge(j, linked, win)
+        if bridge is not None:
+            new.append(bridge)
+            linked.add(bridge[0])
         for i, k in enumerate(self.keyframes[:-1]):
-            if i in linked:
+            if i in linked or k.area != cur.area or math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
                 continue
-            same_area = k.area == cur.area
-            if same_area and math.hypot(cur.x - k.x, cur.y - k.y) > 0.6 * min(h, w):
+            # predicted from the current estimate, within the drift this test tolerates
+            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win,
+                                    predict=(k.x - cur.x, k.y - cur.y),
+                                    gate=0.1 * min(h, w))
+            if q < self.LOOP_NCC:
                 continue
-            if same_area:
-                # predicted from the current estimate, within the drift this test tolerates
-                dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win,
-                                        predict=(k.x - cur.x, k.y - cur.y),
-                                        gate=0.1 * min(h, w))
-                if q < self.LOOP_NCC:
-                    continue
-                ex, ey = -dx, -dy  # measured position of j relative to i
-                if math.hypot(ex - (cur.x - k.x), ey - (cur.y - k.y)) > 0.1 * min(h, w):
-                    continue
-                new.append((i, j, ex, ey, 1.0))
-            else:
-                # cross-area bridge: the stage re-connected two previously disconnected areas
-                if cur.area != cur_area0 or merged:
-                    continue
-                dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
-                if q < max(self.LOOP_NCC, 0.72):
-                    continue
-                ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k)
-                shift_x = (k.x + ex) - cur.x
-                shift_y = (k.y + ey) - cur.y
-                old_area = cur.area
-                target_area = k.area
-                for kf2 in self.keyframes:
-                    if kf2.area == old_area:
-                        kf2.x += shift_x
-                        kf2.y += shift_y
-                        kf2.area = target_area
-                for p in self.patches:
-                    if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
-                        p.x = self.keyframes[p.kf].x + p.rel[0]
-                        p.y = self.keyframes[p.kf].y + p.rel[1]
-                self._shift_tracker(shift_x, shift_y)
-                self.current_area = target_area
-                merged = True
-                new.append((i, j, ex, ey, 1.0))
-        if merged:
-            self.areas = len({kf.area for kf in self.keyframes})
-            self._rebuild_canvas()
+            ex, ey = -dx, -dy  # measured position of j relative to i
+            if math.hypot(ex - (cur.x - k.x), ey - (cur.y - k.y)) > 0.1 * min(h, w):
+                continue
+            new.append((i, j, ex, ey, 1.0))
         if not new:
             return
         self.edges += new
         self._relax()
+
+    # Keyframes of OTHER areas matched (Mosaic._match) per keyframe add when looking for a bridge. Their positions
+    # relative to the current area are unknown, so no distance gate applies; matching all of them made every add
+    # in a new area cost one full match per mapped keyframe (5 areas, 34 keyframes in the first: 35 matches,
+    # 388-532 ms per add instead of 26-64 ms). They are ranked by the phase-only correlation peak of quarter-
+    # resolution band-pass thumbnails (Mosaic._bridge_score, ~0.2 ms per pair; on a random-texture world a 50 %
+    # overlap scored 0.23-0.25, non-overlapping views at most 0.09) and only the best are matched.
+    BRIDGE_CANDIDATES = 3
+
+    @staticmethod
+    def _thumb_spectrum(k: Keyframe) -> np.ndarray:
+        """Spectrum of the keyframe's windowed, zero-mean band-pass at half its resolution (computed once)."""
+        if k.spectrum is None:
+            bp = k.bp.astype(np.float32)
+            t = cv2.resize(bp, (bp.shape[1] // 2, bp.shape[0] // 2), interpolation=cv2.INTER_AREA)
+            win = cv2.createHanningWindow((t.shape[1], t.shape[0]), cv2.CV_32F)
+            k.spectrum = np.fft.rfft2((t - t.mean()) * win)
+        return k.spectrum
+
+    @classmethod
+    def _bridge_score(cls, a: Keyframe, b: Keyframe) -> float:
+        """Height of the phase-only correlation peak of two keyframes' thumbnails: the fraction of their spectrum
+        that agrees on one shift. Used only to rank bridge candidates; the decision is _match's."""
+        A, B = cls._thumb_spectrum(a), cls._thumb_spectrum(b)
+        X = np.conj(A) * B
+        shape = (b.bp.shape[0] // 2, b.bp.shape[1] // 2)
+        return float(np.fft.irfft2(X / (np.abs(X) + 1e-12), s=shape).max())
+
+    def _bridge(self, j: int, linked: set, win) -> tuple | None:
+        """Join cur's area to another area that cur's view overlaps; returns the bridge edge or None.
+
+        Only the BRIDGE_CANDIDATES best-ranked keyframes of other areas are matched. On success cur's whole area
+        moves into the other area's coordinates and takes its id."""
+        cur = self.keyframes[j]
+        if cur.bp is None:
+            return None
+        cands = [i for i, k in enumerate(self.keyframes[:-1])
+                 if k.area != cur.area and i not in linked and k.bp is not None and k.bp.shape == cur.bp.shape]
+        if not cands:
+            return None
+        if len(cands) > self.BRIDGE_CANDIDATES:
+            cands = sorted(cands, key=lambda i: -self._bridge_score(self.keyframes[i], cur))[:self.BRIDGE_CANDIDATES]
+        for i in cands:
+            k = self.keyframes[i]
+            dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
+            if q < max(self.LOOP_NCC, 0.72):
+                continue
+            ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k)
+            shift_x = (k.x + ex) - cur.x
+            shift_y = (k.y + ey) - cur.y
+            old_area, target_area = cur.area, k.area
+            for kf2 in self.keyframes:
+                if kf2.area == old_area:
+                    kf2.x += shift_x
+                    kf2.y += shift_y
+                    kf2.area = target_area
+            for p in self.patches:
+                if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
+                    p.x = self.keyframes[p.kf].x + p.rel[0]
+                    p.y = self.keyframes[p.kf].y + p.rel[1]
+            self._shift_tracker(shift_x, shift_y)
+            self.current_area = target_area
+            self.areas = len({kf.area for kf in self.keyframes})
+            self.last_event = "areas_joined"
+            self._rebuild_canvas()
+            return (i, j, ex, ey, 1.0)
+        return None
 
     # Robust pose graph (Mosaic._relax). Residual scale floor: an edge is only down-weighted when it disagrees with
     # the graph by more than registration error can explain, even when the graph is so consistent that the measured
@@ -785,11 +851,14 @@ class Mosaic:
         rgb: np.ndarray | None = None,
     ) -> None:
         h, w = img.shape
+        # the mode is read ONCE: another thread switching it in the middle of a splat must not mix the two paths
+        # (the high band would be used without having been computed)
+        multiband = self.blending == "multiband"
         base_f = _feather(h, w)
         if mask is not None:
             base_f = base_f * mask
         feather = base_f * weight
-        if self.blending == "multiband":
+        if multiband:
             img_f = img.astype(np.float32)
             low = cv2.GaussianBlur(img_f, (0, 0), 8.0)
             high = img_f - low
@@ -805,7 +874,7 @@ class Mosaic:
                 src = (slice(ay0 - y0, ay1 - y0), slice(ax0 - x0, ax1 - x0))
                 dst = (slice(ay0 - ty * t, ay1 - ty * t), slice(ax0 - tx * t, ax1 - tx * t))
                 fea = feather[src]
-                if self.blending == "multiband":
+                if multiband:
                     num, den = self.tiles.setdefault(
                         (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
                     )
@@ -854,9 +923,7 @@ class Mosaic:
     def image_rgb(self, d: int = 1) -> np.ndarray | None:
         """Assembled full-resolution colour mosaic (RGBA uint8; alpha marks valid area), or None when no colour
         keyframes have been added."""
-        if not self.tiles_rgb:
-            return None
-        return render_tiles_rgb(self.tiles_rgb, self.tile, d)
+        return render_tiles_rgb(self.tiles_rgb, self.tile, d)  # renders a snapshot of the tile dict
 
     def preview(self, max_px: int = 1600) -> tuple[np.ndarray, tuple[int, int], int]:
         """Mosaic rendered at a power-of-two reduction d so that its larger side is <= max_px (bounded memory).
@@ -1198,6 +1265,7 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
     feathered low-frequency band; empty canvas is NaN and the result is cropped to the valid bounding box, exactly
     as in feather mode. Works on a shallow copy of the tile dict, so the engine can render outside its lock.
     Returns (image, full-resolution origin, d)."""
+    tiles = dict(tiles)  # bounds and tiles from the same snapshot
     if not tiles:
         return np.full((8, 8), np.nan, np.float32), (0, 0), d
     t = tile
@@ -1206,7 +1274,7 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
     tys = [k[1] for k in tiles]
     X0, Y0 = min(txs), min(tys)
     out = np.full(((max(tys) - Y0 + 1) * td, (max(txs) - X0 + 1) * td), np.nan, np.float32)
-    for (tx, ty), (num, den) in list(tiles.items()):
+    for (tx, ty), (num, den) in tiles.items():
         if d > 1:
             num = cv2.resize(num, (td, td), interpolation=cv2.INTER_AREA)
             den = cv2.resize(den, (td, td), interpolation=cv2.INTER_AREA)
@@ -1233,7 +1301,9 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
 
 
 def render_tiles_rgb(tiles_rgb: dict, tile: int, d: int = 1) -> np.ndarray | None:
-    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d."""
+    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d. Works on a shallow copy of
+    the tile dict (bounds and tiles from the same snapshot), as render_tiles does."""
+    tiles_rgb = dict(tiles_rgb)
     if not tiles_rgb:
         return None
     td = tile // d

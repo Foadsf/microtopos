@@ -61,6 +61,48 @@ def test_header_buttons_and_height_do_not_move_while_chips_change(window):
     _settle(app)
 
 
+# Limits on what the window may demand of the screen. Fonts differ between platforms (Qt's offscreen platform has the
+# widest, which is what CI uses), so the limits leave room for them; the real measurements, in Qt's device-independent
+# pixels with Segoe UI on Windows: the window's minimum width was 2361 before the tool bars wrapped, 1092 after.
+# (Offscreen: 3477 before, 1723 after.)
+MAX_WINDOW_MIN_WIDTH = 1800
+MAX_PAGE_MIN_WIDTH = 600
+MAX_LEFT_PANEL_MIN_WIDTH = 650
+
+
+def test_no_page_or_panel_sets_a_wide_minimum_width(window):
+    """Every control in a row of a QHBoxLayout adds its width to the window's MINIMUM width, so the Live tab's row of
+    checkboxes, combo boxes and buttons made 0.10.0 unable to shrink below 2361 px: on a 1920 px screen the window
+    could not be narrowed, and maximised it lost its right panel off the screen. Tool bars wrap instead."""
+    app, w = window
+    w.replay_widget.setVisible(True)  # the replay transport bar is part of the Live tab while a recording plays
+    _settle(app)
+    try:
+        wide = {w.tabs.tabText(i): w.tabs.widget(i).minimumSizeHint().width() for i in range(w.tabs.count())
+                if w.tabs.widget(i).minimumSizeHint().width() > MAX_PAGE_MIN_WIDTH}
+    finally:
+        w.replay_widget.setVisible(False)
+    assert not wide, f"tabs that demand more than {MAX_PAGE_MIN_WIDTH} px of width: {wide}"
+    assert w.dock_left.minimumWidth() <= MAX_LEFT_PANEL_MIN_WIDTH, w.dock_left.minimumWidth()
+    assert w.minimumSizeHint().width() <= MAX_WINDOW_MIN_WIDTH, (
+        f"the window cannot be narrower than {w.minimumSizeHint().width()} px")
+
+
+@pytest.mark.parametrize("size", [(1920, 1080), (1800, 1000)])
+def test_the_window_takes_the_size_it_is_given_and_keeps_both_panels_inside(window, size):
+    """Resizing (which is what the window manager does on maximise) must give exactly that size, with the session
+    panel, the middle panel and the telemetry panel all inside it."""
+    app, w = window
+    w.resize(*size)
+    _settle(app, 20)
+    assert (w.width(), w.height()) == size, f"asked for {size}, the window is {(w.width(), w.height())}"
+    left, mid, right = w.dock_left.geometry(), w.centralWidget().geometry(), w.dock_right.geometry()
+    assert w.dock_left.isVisible() and w.dock_right.isVisible()
+    assert left.left() >= 0 and right.right() <= w.width() - 1, (left.getRect(), right.getRect())
+    assert mid.width() > 0 and left.right() < mid.left() + 2 and mid.right() < right.left() + 2, (
+        left.getRect(), mid.getRect(), right.getRect())
+
+
 def test_left_panel_pages_fit_their_panel(window):
     """The pages scroll vertically only, so each page must fit the panel's width; a long camera name must not
     widen the page past it (the Camera page's right side was cut off under the middle panel)."""

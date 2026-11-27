@@ -2014,15 +2014,17 @@ class MainWindow(QMainWindow):
                 self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
             self._refresh_checklist()
         self._cal_was = cp
-        if s.mosaic_version != self.last_mosaic_version and self.tabs.currentIndex() == 1:
+        if (s.mosaic_version != self.last_mosaic_version or s.mosaic_hold != getattr(self, "_mosaic_hold_shown", None)) \
+                and self.tabs.currentIndex() == 1:
             self.last_mosaic_version = s.mosaic_version
-            (img, origin, d), parts, nkf, npatch = self.engine.mosaic_image()
+            self._mosaic_hold_shown = s.mosaic_hold
+            (img, origin, d), parts, nkf, npatch, um_view = self.engine.mosaic_view()
             showing_loaded = nkf <= 1 and self.loaded_mosaic is not None
             if showing_loaded:  # nothing mapped yet: show the opened session's mosaic
                 (img, origin, d), parts, um_loaded = self.loaded_mosaic
                 m_um = um_loaded or um_prev
-            else:
-                m_um = um_prev
+            else:  # the mosaic's own scale (an opened one may be another objective's); the live one until it has one
+                m_um = um_view or um_prev
             self.mosaic_um = m_um
             self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
@@ -2045,13 +2047,15 @@ class MainWindow(QMainWindow):
                 self._draw_height_overlay(parts if mode == 1 else [], origin, m_um)
             span = (img.shape[1] * d * m_um, img.shape[0] * d * m_um)
             self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · {span[0]:.0f} × {span[1]:.0f} µm"
-                                    + (f" · shown at 1/{d}" if d > 1 else ""))
+                                    + (f" · shown at 1/{d}" if d > 1 else "")
+                                    + (f" · not tracking: {s.mosaic_hold} (Reset mosaic to map with the current "
+                                       "objective)" if s.mosaic_hold and not showing_loaded else ""))
         if self.tabs.currentIndex() == 1:
             showing_loaded = self.loaded_mosaic is not None and self.engine.mosaic_image()[2] <= 1
-            if showing_loaded:
+            if showing_loaded or s.mosaic_hold:  # the camera is not in this mosaic
                 self.cam_box.hide()
             else:
-                self._draw_camera_box(s, um_prev)
+                self._draw_camera_box(s, getattr(self, "mosaic_um", um_prev))
         if s.seq % 20 == 0:
             self._refresh_checklist()
             if self.diag.isVisible() and self.result is None:
@@ -2925,7 +2929,8 @@ class MainWindow(QMainWindow):
                 if isinstance(r.get("height_mosaic"), np.ndarray):
                     parts = [(r.get("height_mosaic_key", "um" if units.is_um(r.get("z_unit")) else "frames#loaded"),
                               r["height_mosaic"], tuple(r["height_mosaic_origin"]), 1)]
-                um_loaded = r.get("um_preview")
+                # the scale the mosaic recorded itself, else the session's preview scale (older files)
+                um_loaded = mosaic.um_per_px if mosaic is not None and mosaic.um_per_px else r.get("um_preview")
                 if not (isinstance(um_loaded, (int, float)) and np.isfinite(um_loaded) and um_loaded > 0):
                     um_loaded = None
                     if has and isinstance(r.get("preview_shape"), (list, tuple)) and len(r["preview_shape"]) == 2 and r["preview_shape"][1]:
@@ -2940,6 +2945,13 @@ class MainWindow(QMainWindow):
             # everything is validated: apply. The live mosaic is replaced under the engine lock, in one step
             # (load_mosaic_state is all-or-nothing); the saved mosaic is the loader's private copy.
             if mosaic is not None:
+                # a mosaic saved before it recorded its objective and scale: the session's (it was made with the
+                # objective selected when it was saved, at that preview scale)
+                if not mosaic.objective and isinstance(_s.get("objective"), str):
+                    mosaic.objective = _s["objective"]
+                um_s = r.get("um_preview")
+                if mosaic.um_per_px is None and isinstance(um_s, (int, float)) and np.isfinite(um_s) and um_s > 0:
+                    mosaic.um_per_px = float(um_s)
                 mmeta, marrays = mosaic.to_state_arrays()
                 self.engine.load_mosaic_state(mmeta, marrays)
                 self._sync_mosaic_controls()

@@ -113,6 +113,7 @@ class Snapshot:
     frame_shape: tuple[int, int] = (0, 0)
     mosaic_version: int = 0
     mosaic_lost: bool = False
+    mosaic_hold: str | None = None  # why live frames are not tracked into the mosaic (another objective or mode)
     dwell_frames: int = 0
     seq: int = 0
     mosaic_xy: tuple = (0.0, 0.0)  # live camera position in mosaic pixels (preview scale)
@@ -164,11 +165,12 @@ class LiveEngine:
         self._stride, self._zcount = 1, 0
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
         self._pending_patches: list = []
-        self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0), 1), [], 0, 0)
+        self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0), 1), [], 0, 0, None)
         self._mosaic_rgb_view: np.ndarray | None = None
         self._view_version = -1
         self._view_t = 0.0
         self._areas_seen = 1
+        self._mosaic_hold: str | None = None  # see _mosaic_mismatch
         self._cov = None
         self._dwell = collections.deque(maxlen=16)
         self._avg = collections.deque(maxlen=8)
@@ -337,7 +339,30 @@ class LiveEngine:
     def mosaic_image(self):
         """Latest mosaic rendering, prepared by the engine thread:
         ((preview image, origin, reduction d), height partitions, n_keyframes, n_patches)."""
+        return self._mosaic_view[:4]
+
+    def mosaic_view(self):
+        """mosaic_image() plus the scale of that rendering's pixel grid (µm per full-resolution mosaic pixel, None
+        when the mosaic has not recorded one), read together: (view, partitions, n_keyframes, n_patches, um)."""
         return self._mosaic_view
+
+    def _mosaic_mismatch(self, shape) -> str | None:
+        """Why a live preview of `shape` cannot be tracked into the mosaic, or None when it can.
+
+        Mosaic pixels are preview pixels of one objective and camera mode (Mosaic.objective, frame_shape). A
+        frame from another objective has another scale, one from another mode another size (and possibly field):
+        tracking it into the mosaic would merge two scales into one pose graph or fail on the size. Such a mosaic
+        (typically an opened session) is kept as it is and frames are not tracked until the objective and mode
+        match again; Reset mosaic starts a new one for the current objective."""
+        m = self.mosaic
+        if not m.keyframes:
+            return None
+        if m.objective != self.objective.name:
+            return f"the mosaic was made with {m.objective or 'an unrecorded objective'}, not {self.objective.name}"
+        if m.frame_shape != tuple(shape):
+            fh, fw = m.frame_shape
+            return f"the mosaic was made at preview {fw}×{fh}, the camera now gives {shape[1]}×{shape[0]}"
+        return None
 
     def mosaic_full(self):
         """Full-resolution mosaic and its height partitions, e.g. for saving. The canvas is snapshotted under
@@ -431,7 +456,7 @@ class LiveEngine:
         if tiles_rgb:
             # the colour canvas, cut to the grey view's box so that both share its origin and its µm axes
             rgb = _crop_rgb_to_view(render_tiles_rgb(tiles_rgb, tile, d), tiles_rgb, tile, view)
-        self._mosaic_view = (view, height_partitions(patches), nkf, len(patches))
+        self._mosaic_view = (view, height_partitions(patches), nkf, len(patches), snap.um_per_px)
         self._mosaic_rgb_view = rgb
         self._view_version = version
 
@@ -510,11 +535,17 @@ class LiveEngine:
                 continue
             _, pose, e, hp, zu, zkey, rid, mgen = op
             if mgen != self.mosaic_generation:
-                self.log("height map not pinned: the mosaic was restarted after its sweep", seq)
+                self.log("height map not pinned: its sweep was not captured in this mosaic (restarted or replaced "
+                         "since, or not tracking at the time)", seq)
                 continue
             self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu, zkey, rid)
             self.mosaic_version += 1
         um = self.store.get(self.objective).um_per_px(prev.shape[1], self.objective, prev.shape[0])
+        hold = self._mosaic_mismatch(prev.shape)
+        if hold != self._mosaic_hold:
+            self.log(f"mosaic: live frames are not tracked into it: {hold}" if hold
+                     else "mosaic: live frames are tracked into it again", seq)
+            self._mosaic_hold = hold
         fm = focus_map(prev, "DoG band-pass", 9, self.objective.psf_sigma_px(um))
         th, tw = fm.shape[0] // 6, fm.shape[1] // 6
         tiles = fm[:th * 6, :tw * 6].reshape(6, th, 6, tw).mean(axis=(1, 3)).ravel()
@@ -543,7 +574,8 @@ class LiveEngine:
                         self._buf.append(*item)
                     self._n_preroll = len(self._buf)
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
-                    self._sweep_mgen = self.mosaic_generation
+                    # not tracking into the mosaic: the pose is not this view's, so the height map is never pinned
+                    self._sweep_mgen = self.mosaic_generation if hold is None else -1
                     self._sweep_simulated = simulated
                     self._sweep_manual = self.sm.override == Override.Z
                     self._cov = None
@@ -597,7 +629,10 @@ class LiveEngine:
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov
-        if state in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE) and self.sm.override != Override.PAUSE:
+        if hold is None and state in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE) \
+                and self.sm.override != Override.PAUSE:
+            # the mosaic's grid is this objective's preview at this mode: record (or refresh) what it is
+            self.mosaic.objective, self.mosaic.um_per_px = self.objective.name, um
             was_lost = self.mosaic.lost
             added, _ = self.mosaic.track(prev, rgb=prev_rgb)
             ev = self.mosaic.last_event  # set by this track() call: a join also changes `areas`, the other way
@@ -629,7 +664,8 @@ class LiveEngine:
             shift_px=feat.shift_px,
             response=feat.response, z_score=feat.z_score, brenner_hist=list(self._bhist), saturation=sat,
             sweep_frames=len(self._buf), coverage=self._cov, in_focus=in_focus, frame_shape=(h, w),
-            mosaic_version=self._view_version, mosaic_lost=self.mosaic.lost, dwell_frames=len(self._dwell), seq=seq,
+            mosaic_version=self._view_version, mosaic_lost=self.mosaic.lost or hold is not None, mosaic_hold=hold,
+            dwell_frames=len(self._dwell), seq=seq,
             mosaic_xy=(self.mosaic.x, self.mosaic.y), preview_shape=prev.shape,
             sweep_completeness=_completeness(self._buf.tiles) if state == State.Z_SWEEP and seq % 4 == 0
             else (self._snap.sweep_completeness if state == State.Z_SWEEP else 0.0),

@@ -94,6 +94,7 @@ class CanvasSnapshot:
     tile: int
     patches: list
     insets: list
+    um_per_px: float | None  # scale of the mosaic's pixel grid (Mosaic.um_per_px)
 
 
 @dataclass
@@ -116,6 +117,12 @@ class Mosaic:
     angle_deg: float = 0.0  # current in-plane angle estimate (degrees)
     track_rotation: bool = False  # estimate & compensate in-plane rotation while tracking
     current_area: int = 0  # area new keyframes are added to
+    # What the pixel grid is: mosaic pixels are preview pixels of ONE objective and camera mode (the keyframes'
+    # shape). `objective` is its name ("" = not recorded) and `um_per_px` its lateral scale (None = unknown). They
+    # travel with the saved state, so an opened mosaic is shown at its own scale whatever objective is selected,
+    # and the live engine tracks a frame into it only when it comes from that objective and mode.
+    objective: str = ""
+    um_per_px: float | None = None
     # what the last track() call did to the areas: None, "new_area" (an unconnected view started a separate area)
     # or "areas_joined" (a bridge merged the current area into another one). `areas` alone cannot tell a join
     # from a new area: a join lowers it and the next new area raises it back to the same number.
@@ -147,6 +154,7 @@ class Mosaic:
         if not keep_insets:
             self.insets.clear()
         self.x = self.y = 0.0
+        self.objective, self.um_per_px = "", None  # set again by whoever builds the next mosaic
         self.lost = False
         self.prev_frame = None
         self.edges.clear()
@@ -165,6 +173,11 @@ class Mosaic:
         self.rep_cache.clear()
         self._tile_epoch.clear()
 
+    @property
+    def frame_shape(self) -> tuple[int, int] | None:
+        """Shape of the views the mosaic is made of (every keyframe has it), None while it is empty."""
+        return self.keyframes[0].image.shape if self.keyframes else None
+
     def canvas_snapshot(self) -> CanvasSnapshot:
         """The canvas of this moment, for rendering outside the lock that serialises access to the mosaic.
 
@@ -174,7 +187,7 @@ class Mosaic:
         self._canvas_epoch += 1
         return CanvasSnapshot(dict(self.tiles), dict(self.tiles_low) if self.blending == "multiband" else None,
                               dict(self.tiles_rgb), self.tile, [copy.copy(p) for p in self.patches],
-                              list(self.insets))
+                              list(self.insets), self.um_per_px)
 
     def _tile(self, store: dict, name: str, key: tuple, shapes: tuple) -> list:
         """The [num, den] entry of tile `key` in canvas `store`, safe to write in place (see canvas_snapshot)."""
@@ -1045,6 +1058,8 @@ class Mosaic:
         """Serialize the full pose graph: keyframes (area, angle, rgb), edges, patches and insets."""
         meta = {
             "tile": self.tile,
+            "objective": self.objective,
+            "um_per_px": self.um_per_px,
             "blending": self.blending,
             "track_rotation": self.track_rotation,
             "angle_deg": self.angle_deg,
@@ -1137,6 +1152,9 @@ class Mosaic:
     def _load_state(self, meta: dict, arrays: dict) -> None:
         self.reset()
         self.tile = int(meta.get("tile", self.tile))
+        self.objective = str(meta.get("objective") or "")  # absent before the mosaic recorded it
+        um = meta.get("um_per_px")
+        self.um_per_px = float(um) if um is not None and math.isfinite(float(um)) and float(um) > 0 else None
         self.blending = str(meta.get("blending", "feather"))
         self.track_rotation = bool(meta.get("track_rotation", False))
         self.angle_deg = float(meta.get("angle_deg", 0.0))

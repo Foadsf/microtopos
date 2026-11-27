@@ -363,3 +363,93 @@ def test_a_join_updates_only_the_joined_area_on_the_canvas():
     assert incremental[1] == full[1]
     a, b = incremental[0], full[0]
     assert np.array_equal(np.isfinite(a), np.isfinite(b)) and np.nanmax(np.abs(a - b)) < 0.05
+
+
+# ------------------------------------------------------------------------------------------ R2 G5 whose grid
+
+
+def _session_mosaic(world: np.ndarray, objective: str, um: float) -> Mosaic:
+    """A mosaic as an opened session holds it: 320 x 240 views at stage x 100..480, made with `objective`."""
+    s = _Stage(world)
+    s.pan(100, 500)
+    s.m.objective, s.m.um_per_px = objective, um
+    return s.m
+
+
+def _keyframe_poses(m: Mosaic) -> list:
+    return [(k.x, k.y, k.area) for k in m.keyframes]
+
+
+def test_a_session_of_another_camera_mode_is_kept_and_frames_keep_being_processed():
+    """A session recorded at preview 320 x 240 is opened while the camera runs 320 x 180. Every frame raised a
+    broadcast error in the tracker (the engine only restarts the mosaic when the CAMERA changes size). Frames
+    must be processed (live view, state machine) and the opened mosaic kept unchanged and not tracked into: views
+    of another size cannot be matched against it, and another mode may have another field. With the session's
+    mode the same frames are tracked (the gate is the size, not the session)."""
+    world = _world(3, 1200, 3000)
+    saved = _session_mosaic(world, OBJ.name, OBJ.nominal_um_per_px(320))
+    for h, tracked in ((180, False), (240, True)):
+        eng = LiveEngine(CalibrationStore(None), OBJ)
+        eng.sm.override = Override.PAN
+        eng.process_frame(_bgr(world, 0, 0, h=h), 0.0, 1)  # the camera ran before the session was opened
+        eng.load_mosaic_state(*saved.to_state_arrays())
+        poses = _keyframe_poses(eng.mosaic)
+        for i in range(2, 12):
+            eng.process_frame(_bgr(world, 480 + 20 * i, 200, h=h), 0.04 * i, i)  # raises on e7c6d86 at h = 180
+        snap = eng.snapshot()
+        assert snap.seq == 11 and snap.preview.shape == (h, VW)
+        if tracked:
+            assert snap.mosaic_hold is None and len(eng.mosaic.keyframes) > len(poses)
+        else:
+            assert _keyframe_poses(eng.mosaic) == poses and eng.mosaic.frame_shape == (VH, VW)
+            assert "320×240" in snap.mosaic_hold and snap.mosaic_lost
+
+
+def test_frames_of_another_objective_are_not_tracked_into_an_opened_mosaic():
+    """A session mapped at 10x is opened while 40x is selected. The live frames (at 4x the magnification) were
+    tracked into the 10x pose graph. They must not be: the mosaic is kept unchanged, a sweep captured meanwhile is
+    not pinned into it (its pose is not in the mosaic's coordinates), and once its objective is selected again the
+    mosaic is tracked into as before (Open session continues where it stopped)."""
+    world = _world(3, 1200, 3000)
+    obj40 = objectives.resolve("40x / 0.85", objset=objectives.default_set())
+    saved = _session_mosaic(world, OBJ.name, OBJ.nominal_um_per_px(320))
+    eng = LiveEngine(CalibrationStore(None), obj40)
+    eng.sync_callbacks = True
+    caps: list = []
+    eng.on_sweep = caps.append
+    eng.load_mosaic_state(*saved.to_state_arrays())
+    poses = _keyframe_poses(eng.mosaic)
+    eng.sm.override = Override.PAN
+    for i in range(1, 10):
+        eng.process_frame(_bgr(world, 480 + 20 * i, 200), 0.04 * i, i)
+    assert _keyframe_poses(eng.mosaic) == poses and eng.mosaic.objective == OBJ.name
+    assert eng.snapshot().mosaic_hold and eng.mosaic.um_per_px == OBJ.nominal_um_per_px(320)
+    sim = SimulatorSource(4, OBJ, VW, VH)
+    eng.sm.override = Override.Z
+    for i, z_um in enumerate(sim.sim.sweep_trajectory(n_frames=14)):
+        sim.sim.focus_z_um = float(z_um)
+        eng.process_frame(sim.sim.render()[0], 1 + i * 0.04, 20 + i)
+    eng.flush()
+    assert len(caps) == 1 and caps[0].mosaic_generation != eng.mosaic_generation  # never pinned
+    eng.set_objective(OBJ)
+    eng.sm.override = Override.PAN
+    for i in range(1, 10):
+        eng.process_frame(_bgr(world, 480 + 20 * i, 200), 2 + 0.04 * i, 40 + i)
+    assert eng.snapshot().mosaic_hold is None and len(eng.mosaic.keyframes) > len(poses)
+
+
+def test_a_mosaic_records_the_objective_and_scale_it_is_made_with():
+    """The live engine's mosaic records the objective and preview scale its pixels have (the calibration's for that
+    objective and camera mode; nominal here), and the saved state carries them, so an opened mosaic knows its scale
+    whatever objective is selected later."""
+    world = _world(3, 1200, 3000)
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.sm.override = Override.PAN
+    for i in range(12):
+        eng.process_frame(_bgr(world, 100 + 30 * i, 200), 0.04 * i, i + 1)
+    assert len(eng.mosaic.keyframes) >= 3 and eng.snapshot().mosaic_hold is None
+    reopened = Mosaic()
+    reopened.load_state_arrays(*eng.mosaic_state())
+    assert (reopened.objective, reopened.um_per_px) == (OBJ.name, OBJ.nominal_um_per_px(VW))
+    eng._render_now()
+    assert eng.mosaic_view()[4] == OBJ.nominal_um_per_px(VW)

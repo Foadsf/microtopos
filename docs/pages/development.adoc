@@ -78,7 +78,7 @@ IMPORTANT: Real-sample accuracy against a certified roughness or step-height sta
 
 === Compute backends
 
-The CPU is the reference and the default. `ZSettings.backend = "opencl"` runs the DoG focus measure through OpenCV's OpenCL path, falls back to the CPU on any error, and the result records which backend ran. `microtopos-bench` measures both, synchronised and after warm-up, with a parity check and a negative control. On the development laptop (Intel UHD 620): relative L2 difference 1.1e-7, 3.4 ms with transfers against 3.6 ms on the CPU for one 960×540 frame. That is too small a gain to change the default; a GPU backend has to show an end-to-end improvement first.
+The CPU is the reference and the default. `ZSettings.backend = "opencl"` runs the DoG, Tenengrad and SML focus measures and the guided depth filter through OpenCV's OpenCL path, falls back to the CPU on any error, and the result records every backend that ran (for example `cpu+opencl` when the focus measure has no OpenCL version but the guided filter ran on OpenCL). `microtopos-bench` measures both, synchronised and after warm-up, with a parity check and a negative control. On the development laptop (Intel UHD 620): relative L2 difference 1.1e-7, 3.4 ms with transfers against 3.6 ms on the CPU for one 960×540 frame. That is too small a gain to change the default; a GPU backend has to show an end-to-end improvement first.
 
 == Builds and releases
 

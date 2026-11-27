@@ -41,6 +41,7 @@ from microtopos.stage import (
     GrblStageDriver,
     SimulatedStageDriver,
     StageError,
+    StagePose,
     capture_z_sweep,
     list_serial_ports,
     parse_grbl_status,
@@ -60,6 +61,10 @@ class FakeGrbl:
         `WCO:x,y,z` (WPos = MPos - WCO) is added to the first report, to the first report after any change of
         the offsets and then every 10th report.
       * "$10 - Status report options": bit 0 selects MPos (1) instead of WPos (0).
+      * "$13 - Report in inches": positions in status reports (MPos, WPos, WCO) are inches with 4 decimals when 1;
+        G20/G21 set only the units of G-code commands. `$$` lists the settings, one `$N=value` line each, then `ok`.
+      * Machine states: a feed hold suspends the move (`Hold:0`) until cycle start (`~`) resumes it; check mode
+        (`$C`) parses G-code and answers `ok` without moving, state `Check`.
       * "Response messages": every G-code line gets `ok` or `error:N` (error:9 = G-code locked out during
         alarm, error:20 = unsupported command, error:22 = feed rate not set, error:2 = bad number format).
       * "Push messages": `ALARM:N` pushed when an alarm is raised (soft limit = ALARM:2); the state is then
@@ -69,7 +74,7 @@ class FakeGrbl:
         the motion queue to drain; `G1` returns `ok` as soon as the move is queued, and the state is `Run`
         until the simulated move time (distance / feed) has elapsed.
     Test hooks: `silent` (never answers), `garble` (next N status reports are corrupted), `travel_mm` (soft
-    limits), `trigger_alarm()`.
+    limits), `trigger_alarm()`, `feed_hold()` / `cycle_start()`, `list_report_units` (False: `$$` omits `$13`).
     """
 
     def __init__(self, report: str = "MPos", wco=(0.0, 0.0, 0.0), start=(0.0, 0.0, 0.0), feed_mm_min=None):
@@ -88,6 +93,10 @@ class FakeGrbl:
         self._reports = 0
         self._wco_dirty = True
         self.model = "relative"
+        self.report_inches = False  # $13
+        self.list_report_units = True
+        self.check_mode = False  # $C
+        self._held: list[float] | None = None  # target of a move suspended by a feed hold
 
     # -- simulated physics
     def _position(self) -> list[float]:
@@ -108,6 +117,20 @@ class FakeGrbl:
         if self._move is not None:
             self.mpos, self._move = list(self._move[1]), None
 
+    def feed_hold(self) -> None:
+        """Suspend the current move where it is (state Hold:0) until cycle_start()."""
+        if self._move is not None:
+            pos = self._position()
+            if self._move is not None:
+                self._held, self._move, self.mpos = list(self._move[1]), None, list(pos)
+
+    def cycle_start(self) -> None:
+        """Resume a held move from where it stopped, at the modal feed."""
+        if self._held is not None:
+            here, target, self._held = list(self.mpos), self._held, None
+            dist = max(abs(target[i] - here[i]) for i in range(3))
+            self._move = (here, target, time.monotonic(), 0.0 if not self.feed else dist / self.feed * 60.0)
+
     def trigger_alarm(self, code: int = 1) -> None:
         self._settle()
         self.alarm = True
@@ -123,7 +146,7 @@ class FakeGrbl:
                 self._out.append(self._status_report())
         for line in data.decode("ascii").replace("?", "").splitlines():
             if line.strip():
-                self._out.append((self._execute(line.strip()) + "\r\n").encode())
+                self._out.extend((reply + "\r\n").encode() for reply in self._execute(line.strip()).split("\r\n"))
         return len(data)
 
     def flush(self) -> None:
@@ -145,12 +168,18 @@ class FakeGrbl:
     def _status_report(self) -> bytes:
         self._reports += 1
         pos = self._position()
-        state = "Alarm" if self.alarm else ("Run" if self._moving() else "Idle")
+        moving = self._moving()
+        state = ("Alarm" if self.alarm else "Hold:0" if self._held is not None else "Run" if moving
+                 else "Check" if self.check_mode else "Idle")
         wpos = [pos[i] - self.wco[i] for i in range(3)]
         key, val = ("MPos", pos) if self.report == "MPos" else ("WPos", wpos)
-        fields = [state, f"{key}:" + ",".join(f"{v:.3f}" for v in val), "FS:0,0"]
+
+        def fmt(v):
+            return ",".join(f"{c / 25.4:.4f}" for c in v) if self.report_inches else ",".join(f"{c:.3f}" for c in v)
+
+        fields = [state, f"{key}:" + fmt(val), "FS:0,0"]
         if self._wco_dirty or self._reports % 10 == 0:
-            fields.append("WCO:" + ",".join(f"{v:.3f}" for v in self.wco))
+            fields.append("WCO:" + fmt(self.wco))
             self._wco_dirty = False
         if self.garble > 0:
             self.garble -= 1
@@ -160,6 +189,15 @@ class FakeGrbl:
     def _execute(self, line: str) -> str:
         if line == "$X":
             self.alarm = False
+            return "ok"
+        if line == "$$":
+            units = [f"$13={int(self.report_inches)}"] if self.list_report_units else []
+            return "\r\n".join(["$0=10", f"$10={int(self.report == 'MPos')}", *units, "$110=500.000", "ok"])
+        if line.startswith("$13="):
+            self.report_inches = bool(int(line[4:]))
+            return "ok"
+        if line == "$C":
+            self.check_mode = not self.check_mode
             return "ok"
         if line.startswith("$10="):
             self.report = "MPos" if int(line[4:]) & 1 else "WPos"
@@ -201,6 +239,8 @@ class FakeGrbl:
         if 1.0 in g or 0.0 in g:
             if 1.0 in g and not self.feed:
                 return "error:22"
+            if self.check_mode:
+                return "ok"  # parsed, not executed
             here = list(self._position())
             target = list(here)
             for k, v in axes.items():
@@ -382,6 +422,89 @@ def test_grbl_pose_is_answered_while_another_thread_waits_for_a_move():
         mover.join(15.0)
     assert seen.moving is True and seen.x_um < 20000.0
     assert done["pose"].moving is False and done["pose"].x_um == pytest.approx(20000.0)
+
+
+def test_grbl_inch_reports_are_converted_to_micrometres():
+    """$13=1 makes Grbl report positions in inches whatever G20/G21 say; read as mm they were 25.4x too small."""
+    fake = FakeGrbl(feed_mm_min=6000.0)
+    fake.report_inches = True
+    drv = _grbl(fake)
+    drv.connect()
+    p = drv.move_to(x_um=-250.0, z_um=1000.0)
+    assert fake.mpos == pytest.approx([-0.25, 0.0, 1.0])  # the command is mm (G21)
+    assert p.z_um == pytest.approx(1000.0, abs=3.0)  # inch reports have 4 decimals: 2.54 um resolution
+    assert p.x_um == pytest.approx(-250.0, abs=3.0)
+
+
+def test_grbl_inch_reports_with_wpos_and_wco_are_converted_to_micrometres():
+    fake = FakeGrbl(report="WPos", wco=(5.0, -3.0, 2.0), feed_mm_min=6000.0)
+    fake.report_inches = True
+    drv = _grbl(fake)
+    drv.connect()
+    drv.zero()
+    p = drv.move_to(y_um=500.0)
+    assert fake.mpos[1] == pytest.approx(0.5)
+    assert p.y_um == pytest.approx(500.0, abs=3.0)
+
+
+def test_grbl_without_a_report_unit_setting_is_refused():
+    """A controller whose $$ does not list $13 reports positions in an unknown unit: connect refuses it."""
+    fake = FakeGrbl()
+    fake.list_report_units = False
+    drv = _grbl(fake)
+    with pytest.raises(StageError, match=r"\$13"):
+        drv.connect()
+    assert drv.pose() == StagePose()  # not connected: the port was released
+
+
+class _HoldingGrbl(FakeGrbl):
+    """A feed hold lands on the 2nd status report of a move; cycle start comes `resume_after` reports later
+    (None: never)."""
+
+    def __init__(self, *a, resume_after=None, **k):
+        super().__init__(*a, **k)
+        self.resume_after = resume_after
+        self._move_reports = 0
+        self._held_reports = 0
+
+    def _status_report(self):
+        if self._move is not None and self._held is None:
+            self._move_reports += 1
+            if self._move_reports == 2:
+                self.feed_hold()
+        elif self._held is not None:
+            self._held_reports += 1
+            if self.resume_after is not None and self._held_reports > self.resume_after:
+                self.cycle_start()
+        return super()._status_report()
+
+
+def test_grbl_move_waits_through_a_feed_hold_until_the_move_finishes():
+    fake = _HoldingGrbl(feed_mm_min=60.0, resume_after=5)
+    drv = _grbl(fake, feedrate_mm_min=60.0)
+    drv.connect()
+    p = drv.move_to(z_um=1000.0)
+    assert fake._held_reports > 5  # the hold happened and was waited through
+    assert p.z_um == pytest.approx(1000.0, abs=1.0) and not p.moving
+
+
+def test_grbl_move_held_until_the_deadline_raises_instead_of_reporting_arrival():
+    fake = _HoldingGrbl(feed_mm_min=60.0)
+    drv = _grbl(fake, feedrate_mm_min=60.0)
+    drv.connect()
+    with pytest.raises(StageError, match="Hold"):
+        drv.move_to(z_um=100.0)  # 0.1 s of travel: the deadline is 0.3 s + 2 x 0.1 s
+    assert drv.pose().moving  # a suspended move is busy, not idle
+
+
+def test_grbl_move_in_check_mode_raises_because_nothing_moves():
+    fake = FakeGrbl(feed_mm_min=6000.0)
+    drv = _grbl(fake)
+    drv.connect()
+    fake.check_mode = True
+    with pytest.raises(StageError, match="Check"):
+        drv.move_to(z_um=1000.0)
+    assert fake.mpos == [0.0, 0.0, 0.0]
 
 
 def test_grbl_error_reply_raises_and_pose_stays_truthful():
@@ -1005,6 +1128,56 @@ def test_replay_loop_wraps_without_skipping_or_repeating_a_frame(replay):
     assert rs.idx()[-1] == 6
 
 
+def test_replay_loop_switched_on_after_the_end_then_pause_and_play_continues(replay):
+    """Loop switched on after the recording ended: playback runs again, so Pause then Play continues with the next
+    frame (the end-of-recording flag stayed set and Play restarted from frame 0). Every command fires on the
+    playback thread at a set virtual time, so the pause lands mid-recording on every machine."""
+    n, dt = 8, 0.01
+    clock = _VirtualClock()
+    rs = replay(n=n, dt=dt, clock=clock.now, sleep=clock.sleep)
+    clock.at(0.20, lambda: rs.set_loop(True))  # the recording ended at 0.07
+    clock.at(0.245, rs.pause)  # between the 3rd and 4th frame of the second pass
+    clock.at(0.30, rs.resume)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= n + 6)
+    second = rs.idx()[n:n + 6]
+    assert second[:3] == [0, 1, 2], second  # the pause came after frame 2
+    assert second[3:] == [3, 4, 5], f"Play after Pause went to {second[3:]}, wanted [3, 4, 5]"
+
+
+def test_replay_loop_wrap_keeps_the_frame_interval(replay):
+    """At the wrap frame 0 follows the last frame after one frame interval, like every other frame (it came at the
+    same instant, so the last frame was shown for 0 s at every wrap)."""
+    n, dt = 5, 0.1
+    clock = _VirtualClock()
+    rs = replay(n=n, dt=dt, loop=True, clock=clock.now, sleep=clock.sleep)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 2 * n + 1)
+    assert rs.idx()[:2 * n + 1] == [i % n for i in range(2 * n + 1)]
+    intervals = [b - a for a, b in itertools.pairwise(rs.times()[:2 * n + 1])]
+    assert all(abs(i - dt) <= EXACT for i in intervals), [round(i * 1000, 3) for i in intervals]
+
+
+@pytest.mark.parametrize("delta, expected", [(+1, 4), (-1, 2)])
+def test_replay_frame_step_passes_a_damaged_frame(replay, delta, expected):
+    """A step onto a damaged frame counts it and lands on the next good frame in the direction of the step, as
+    playback does (the step published nothing and every later step aimed at the same damaged frame again)."""
+    rs = replay(n=7, dt=0.05)
+    (rs.files[3]).write_bytes(b"not a png at all" * 4)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 1)
+    rs.pause()
+    start = 3 - delta
+    rs.seek(start)
+    assert _until(lambda: rs.idx()[-1] == start)
+    n0, corrupt0 = len(rs.idx()), rs.corrupt
+    rs.step_frames(delta)
+    assert _until(lambda: len(rs.idx()) > n0)
+    assert rs.idx()[n0:] == [expected]
+    assert rs.position == expected
+    assert rs.corrupt == corrupt0 + 1
+
+
 def test_replay_two_steps_before_the_thread_publishes_coalesce_into_one(replay, gate):
     """step_frames bases on the last *published* position (documented): two +1 steps issued before the thread
     has published the first one are one step, never a skip; a later step starts from the new position."""
@@ -1269,6 +1442,8 @@ def test_gui_grbl_stage_error_is_reported_not_raised(window, qapp, monkeypatch):
     assert w.stage_driver is None
 
 
+@pytest.mark.characterization("disconnect already closed the port; the test now waits for the disconnect job "
+                               "that closes it instead of racing it (failed on a slow macOS runner)")
 def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, monkeypatch):
     w = window
     fake = FakeGrbl(start=(5.0, 0.0, 2.5))
@@ -1292,8 +1467,9 @@ def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, 
     assert "Z +0.00" in w.lbl_stg_pose.text()
     assert w.source.stage_driver is w.stage_driver  # attached to the active source
     w.btn_stg_connect.click()  # disconnect
-    assert _wait(qapp, lambda: w.stage_driver is None)
-    assert w.source.stage_driver is None and not fake.is_open
+    assert w.stage_driver is None and w.source.stage_driver is None  # detached at once, before the port closes
+    assert _wait(qapp, lambda: _stage_idle(w))  # the port is closed by the "Stage disconnect" job
+    assert not fake.is_open
 
 
 def test_gui_stage_z_sweep_captures_stage_z_and_reconstructs_in_um(window, qapp):

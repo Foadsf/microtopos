@@ -111,6 +111,12 @@ sweep is limited to 1.5 % and reported as a warning.</p>
 
 STEPS = ["Camera", "Objective", "Dark && flat", "Lateral scale", "Z scale", "Inspect"]
 
+# The profile-roughness cut-off used when the L-filter is off, in words built from the constants the code divides by
+# (the λc tooltip and the profile label both say this; neither may state another rule).
+DEFAULT_PROFILE_CUTOFF_TEXT = (f"the profile length / {metrology.PROFILE_TRAVERSE_CUTOFFS:g} "
+                               f"({metrology.PROFILE_EVAL_CUTOFFS:g} sections of λc plus "
+                               f"{metrology.PROFILE_RUN_CUTOFFS / 2:g} λc run-in and run-out)")
+
 
 class Bridge(QObject):
     sweep = Signal(object)
@@ -244,6 +250,7 @@ class MainWindow(QMainWindow):
         self.stage_jog_buttons: list = []
         self.level_picking = False       # 3-point level mode armed on the height view
         self.level_pts: list[tuple[float, float]] = []
+        self._replay_shown_pos: int | None = None  # the replay frame the seek slider was last set to by _tick
         self.zst = zstack.ZSettings()    # 3D reconstruction settings edited from the 3D page
         self.sr_result = None
         self.last_mosaic_version = -1
@@ -1195,8 +1202,8 @@ class MainWindow(QMainWindow):
         self.sp_lc.setSuffix(" µm")
         self.sp_lc.setSpecialValueText("off")
         self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off. "
-                              "Also the cut-off of the profile roughness on the Height tab "
-                              "(0 = a fifth of the profile length)")
+                              "Also the cut-off of the profile roughness on the Height tab; "
+                              f"at 0 that cut-off is {DEFAULT_PROFILE_CUTOFF_TEXT}")
         self.sp_lc.valueChanged.connect(lambda _v: self._update_profile())
         f = QFormLayout()
         f.addRow("Mode", self.cmb_override)
@@ -1420,6 +1427,7 @@ class MainWindow(QMainWindow):
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
             self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
+            self._replay_shown_pos = None  # a new player: the slider follows it from its first frame
             self._set_replay_transport_enabled(self.source.transport_supported)
             # a new player starts with the speed and looping the controls show, and playing
             self.source.set_loop(self.chk_replay_loop.isChecked())
@@ -1552,7 +1560,10 @@ class MainWindow(QMainWindow):
             return
         self.obj = obj
         self.settings.setValue("objective", name)
-        self.engine.set_objective(self.obj)
+        # a mosaic made with another objective restarts (keeping insets as the checkbox says, plus the old mosaic as
+        # an overview inset); one made with this objective (an opened session) is kept and tracked into again
+        restarted = self.engine.set_objective(self.obj, restart_mosaic=True,
+                                              keep_insets=self.chk_keep_insets.isChecked())
         if self.sim_source is not None:
             self.sim_source.set_objective(self.obj)
         self.sp_ls.blockSignals(True)
@@ -1560,9 +1571,9 @@ class MainWindow(QMainWindow):
         self.sp_ls.blockSignals(False)
         self._ls_user_set = False
         self._cancel_rotation_measure()
-        self.engine.reset_mosaic()
         self._refresh_checklist()
-        self.notify(f"Objective {name}. Mosaic restarted for the new magnification.")
+        self.notify(f"Objective {name}. " + ("Mosaic restarted for the new magnification." if restarted
+                                              else "The mosaic was made with this objective: mapping continues."))
 
     def _on_objective_hint(self, ratio):
         if ratio is not None and abs(math.log(ratio)) < math.log(1.6):
@@ -1786,11 +1797,10 @@ class MainWindow(QMainWindow):
         new["warnings"] = [w for w in new.get("warnings", []) if "Sweep direction unknown" not in w] + (
             ["Sweep direction unknown: heights are relative focus progression and the relief may be inverted."]
             if new.get("z_orientation") == "unknown" else [])
-        for i, h in enumerate(self.history):
-            if h is old:
-                self.history[i] = new
-        if self.result is old:
-            self.result = new
+        if not self._supersede(old, new):
+            self.notify(f"Z not applied: {old.get('label') or 'the result'} was closed while it was rescaled.",
+                        "warning")
+            return
         rid = new.get("result_id")
         if rid and new.get("mosaic_generation") == self.engine.mosaic_generation and new.get("preview_shape"):
             self.engine.remove_height_patch(rid)
@@ -1986,9 +1996,14 @@ class MainWindow(QMainWindow):
                               + self._brightness_note(s.preview))
         if isinstance(self.source, ReplaySource):
             self._replay_sync_button()
-            if not self._replay_stopped() and not self.replay_seek.isSliderDown():
+            # The slider follows every frame the player publishes, playing or stepped while paused. It is left alone
+            # while the user drags it and while the position has not changed, so a paused seek that has not been
+            # published yet does not pull the slider back to the frame before it.
+            pos = self.source.position
+            if pos != self._replay_shown_pos and not self.replay_seek.isSliderDown():
+                self._replay_shown_pos = pos
                 self.replay_seek.blockSignals(True)
-                self.replay_seek.setValue(min(self.replay_seek.maximum(), self.source.position))
+                self.replay_seek.setValue(min(self.replay_seek.maximum(), pos))
                 self.replay_seek.blockSignals(False)
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))
@@ -2002,15 +2017,17 @@ class MainWindow(QMainWindow):
                 self.notify(f"{self._cal_was[0].capitalize()} frame recorded and saved.", "success")
             self._refresh_checklist()
         self._cal_was = cp
-        if s.mosaic_version != self.last_mosaic_version and self.tabs.currentIndex() == 1:
+        if (s.mosaic_version != self.last_mosaic_version or s.mosaic_hold != getattr(self, "_mosaic_hold_shown", None)) \
+                and self.tabs.currentIndex() == 1:
             self.last_mosaic_version = s.mosaic_version
-            (img, origin, d), parts, nkf, npatch = self.engine.mosaic_image()
+            self._mosaic_hold_shown = s.mosaic_hold
+            (img, origin, d), parts, nkf, npatch, um_view = self.engine.mosaic_view()
             showing_loaded = nkf <= 1 and self.loaded_mosaic is not None
             if showing_loaded:  # nothing mapped yet: show the opened session's mosaic
                 (img, origin, d), parts, um_loaded = self.loaded_mosaic
                 m_um = um_loaded or um_prev
-            else:
-                m_um = um_prev
+            else:  # the mosaic's own scale (an opened one may be another objective's); the live one until it has one
+                m_um = um_view or um_prev
             self.mosaic_um = m_um
             self.current_parts = parts
             mode = self.cmb_mview.currentIndex()
@@ -2033,13 +2050,15 @@ class MainWindow(QMainWindow):
                 self._draw_height_overlay(parts if mode == 1 else [], origin, m_um)
             span = (img.shape[1] * d * m_um, img.shape[0] * d * m_um)
             self.lbl_mosaic.setText(f"{nkf} keyframes · {npatch} height patches · {span[0]:.0f} × {span[1]:.0f} µm"
-                                    + (f" · shown at 1/{d}" if d > 1 else ""))
+                                    + (f" · shown at 1/{d}" if d > 1 else "")
+                                    + (f" · not tracking: {s.mosaic_hold} (Reset mosaic to map with the current "
+                                       "objective)" if s.mosaic_hold and not showing_loaded else ""))
         if self.tabs.currentIndex() == 1:
             showing_loaded = self.loaded_mosaic is not None and self.engine.mosaic_image()[2] <= 1
-            if showing_loaded:
+            if showing_loaded or s.mosaic_hold:  # the camera is not in this mosaic
                 self.cam_box.hide()
             else:
-                self._draw_camera_box(s, um_prev)
+                self._draw_camera_box(s, getattr(self, "mosaic_um", um_prev))
         if s.seq % 20 == 0:
             self._refresh_checklist()
             if self.diag.isVisible() and self.result is None:
@@ -2293,10 +2312,8 @@ class MainWindow(QMainWindow):
                         r["sigma_inst_lt_Sq_over_10"] = bool(rep["sigma_inst"] < r["Sq"] / 10)
             else:
                 r["warnings"] = r.get("warnings", []) + [f"Repeatability not computed: {why}."]
-        # height tools act on the displayed map: points and ROIs placed on the previous map must not carry over
-        self._disarm_tools()
-        self.level_pts = []
-        self.prev_result, self.result = self.result, r
+        self.prev_result = self.result
+        self._set_result(r)
         self._result_t = time.perf_counter()
         self._remember(r)
         self.last_ignored = None
@@ -2340,8 +2357,36 @@ class MainWindow(QMainWindow):
 
     def _pick_history(self, i):
         if 0 <= i < len(self.history) and self.history[i] is not self.result:
-            self.result = self.history[i]
+            self._set_result(self.history[i])
             self._show_result()
+
+    def _set_result(self, r: dict):
+        """Make `r` the displayed result: the one step every path that replaces the result goes through.
+
+        Height tools act on the displayed map: when its height is not the one on screen (a new reconstruction, an
+        opened session, another history entry, an edited or rescaled height), armed tools and picked levelling
+        points were placed on the previous map and must not carry over. A recompute that keeps the height (a
+        filter change) keeps them."""
+        cur = self.result
+        if cur is None or cur.get("height") is not r.get("height"):
+            self._disarm_tools()
+            self.level_pts = []
+        self.result = r
+
+    def _supersede(self, old: dict, new: dict) -> bool:
+        """Put `new` in place of `old` in the history and, when `old` is displayed, on screen. Results are found by
+        identity; the jobs that replace a result (metrology, Z rescale) run one at a time, and the feature job merges
+        into its result instead of replacing it, so `old` is still there unless it was closed meanwhile. Returns
+        False, installing nothing, when it is no longer open."""
+        found = False
+        for i, h in enumerate(self.history):
+            if h is old:
+                self.history[i] = new
+                found = True
+        if self.result is old:
+            self._set_result(new)
+            found = True
+        return found
 
     def _recompute(self):
         r = self.result
@@ -2358,15 +2403,16 @@ class MainWindow(QMainWindow):
             new.pop(k, None)
         new["warnings"] = [x for x in new.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
         new.update(m)
-        for i, h in enumerate(self.history):
-            if h is r:
-                self.history[i] = new
-        if self.result is r:
-            self.result = new
+        if not self._supersede(r, new):
+            self.lbl_job.setText("Metrology result discarded.")
+            self.notify(f"Not applied: {r.get('label') or 'the result'} was closed while its metrology was "
+                        "recomputed.", "warning")
+            return
         self.prog.setValue(1000)
         self.lbl_job.setText("Metrology recomputed.")
         self._show_result()
-        self.notify(message, "success")
+        self.notify(message if self.result is new else
+                    f"{message} (to {new.get('label') or 'a result'} in the history, not the one displayed)", "success")
 
     def _ensure_features(self):
         """Start the on-demand feature job for the current result when the box is ticked and they are missing."""
@@ -2382,17 +2428,13 @@ class MainWindow(QMainWindow):
     def _on_features(self, r, m):
         if not any(h is r for h in self.history) and self.result is not r:
             return  # the result was replaced (height tool, recompute) while this ran: its features are stale
-        new = dict(r)
-        new.update(m)
-        new["features_done"] = True
-        for i, h in enumerate(self.history):
-            if h is r:
-                self.history[i] = new
-        if self.result is r:
-            self.result = new
-        el = dict(new.get("eligibility", {}))
-        el["feature"] = "ok"
-        new["eligibility"] = el
+        # Merged INTO r, not into a copy: a metrology or Z job started from r finds it by identity when it finishes
+        # (_supersede). Replacing r here made such a job, finishing second, drop its height edit or filter change.
+        # The features are kept only by results with this height and filter: _on_recomputed drops them
+        # (metrology.PARAMETER_KEYS) and _ensure_features computes them again for the new result.
+        r.update(m)
+        r["features_done"] = True
+        r["eligibility"] = {**r.get("eligibility", {}), "feature": "ok"}
         self.lbl_job.setText("Feature parameters computed.")
         self._show_result()
 
@@ -2564,8 +2606,7 @@ class MainWindow(QMainWindow):
         lam_c = self.sp_lc.value()
         origin = "L-filter setting"
         if lam_c <= 0:
-            lam_c, origin = (length / metrology.PROFILE_TRAVERSE_CUTOFFS,
-                             "default: a sixth of the line (5 sections + λc/2 run-in and run-out)")
+            lam_c, origin = length / metrology.PROFILE_TRAVERSE_CUTOFFS, f"default: {DEFAULT_PROFILE_CUTOFF_TEXT}"
         lam_s = float(r.get("lambda_s_um") or 0.0)
         why = metrology.profile_cutoff_problem(n, step, lam_c)
         if why is not None:
@@ -2683,8 +2724,10 @@ class MainWindow(QMainWindow):
             ("Sp", "Sp", zu, "Maximum peak height", "{:.4g}", "height"),
             ("Sv", "Sv", zu, "Maximum pit depth", "{:.4g}", "height"),
             ("Sz", "Sz", zu, "Maximum height (Sp + Sv)", "{:.4g}", "height"),
-            ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
-            ("Sdq", "Sdq", "rad", "Mean surface slope (gradient magnitude)", "{:.4g}", "height"),
+            ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height")])
+        body += table("Hybrid (ISO 25178-2)", [
+            ("Sdq", "Sdq", "", "Root mean square gradient (dimensionless, 1 = 45° plane; needs z in µm)", "{:.4g}",
+             "height"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])
         vol_unit = "µm³/µm²" if units.is_um(r["z_unit"]) else f"{zu} (per unit area)"
         body += table("Volume parameters (per unit area, p = 10 %, q = 80 %)", [
@@ -2889,7 +2932,8 @@ class MainWindow(QMainWindow):
                 if isinstance(r.get("height_mosaic"), np.ndarray):
                     parts = [(r.get("height_mosaic_key", "um" if units.is_um(r.get("z_unit")) else "frames#loaded"),
                               r["height_mosaic"], tuple(r["height_mosaic_origin"]), 1)]
-                um_loaded = r.get("um_preview")
+                # the scale the mosaic recorded itself, else the session's preview scale (older files)
+                um_loaded = mosaic.um_per_px if mosaic is not None and mosaic.um_per_px else r.get("um_preview")
                 if not (isinstance(um_loaded, (int, float)) and np.isfinite(um_loaded) and um_loaded > 0):
                     um_loaded = None
                     if has and isinstance(r.get("preview_shape"), (list, tuple)) and len(r["preview_shape"]) == 2 and r["preview_shape"][1]:
@@ -2904,6 +2948,13 @@ class MainWindow(QMainWindow):
             # everything is validated: apply. The live mosaic is replaced under the engine lock, in one step
             # (load_mosaic_state is all-or-nothing); the saved mosaic is the loader's private copy.
             if mosaic is not None:
+                # a mosaic saved before it recorded its objective and scale: the session's (it was made with the
+                # objective selected when it was saved, at that preview scale)
+                if not mosaic.objective and isinstance(_s.get("objective"), str):
+                    mosaic.objective = _s["objective"]
+                um_s = r.get("um_preview")
+                if mosaic.um_per_px is None and isinstance(um_s, (int, float)) and np.isfinite(um_s) and um_s > 0:
+                    mosaic.um_per_px = float(um_s)
                 mmeta, marrays = mosaic.to_state_arrays()
                 self.engine.load_mosaic_state(mmeta, marrays)
                 self._sync_mosaic_controls()
@@ -2912,7 +2963,7 @@ class MainWindow(QMainWindow):
                 self.loaded_mosaic = loaded_mosaic
                 self.last_mosaic_version = -1
             if has:
-                self.result = r
+                self._set_result(r)
                 self._remember(r)
                 self._show_result()
                 self.tabs.setCurrentIndex(3)
@@ -3048,6 +3099,9 @@ class MainWindow(QMainWindow):
         if s.preview is None:
             self.notify("No live image to inset yet.", "warning")
             return
+        if s.mosaic_hold:  # the live view's position is in no mosaic coordinates
+            self.notify(f"No inset: the live view is not tracked into this mosaic ({s.mosaic_hold}).", "warning")
+            return
         # The mosaic is in preview pixels, so the inset's scale is the preview's (the same one the Live view uses,
         # calibrated for this camera mode or nominal) and its position is the live view's mosaic position.
         pw = s.preview.shape[1]
@@ -3078,7 +3132,6 @@ class MainWindow(QMainWindow):
         base = dict(r)
         if "height_reconstructed" not in base:
             base["height_reconstructed"] = r["height"]
-            base["height_raw_at_edit"] = r.get("height_raw")
         base["height"] = new_height
         base["height_tools"] = list(r.get("height_tools", [])) + [rec]
         base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
@@ -3088,15 +3141,23 @@ class MainWindow(QMainWindow):
         self._start_job(job, lambda m, r=r, base=base: self._on_recomputed(r, m, base=base, message=message),
                         main=True)
 
+    @staticmethod
+    def _tools_reset_blocker(r: dict) -> str | None:
+        """Why "Reset height tools" cannot restore the reconstructed height of `r`, or None when it can."""
+        if "height_reconstructed" not in r:
+            return ("This result does not hold the height from before the edits (a session saved by an older version); "
+                    "reconstruct again to get the original.")
+        return None  # a Z rescale scales the reconstructed height with the others (zstack.HEIGHT_ARRAYS)
+
     def _reset_height_tools(self):
         r = self.result
-        if r is None or "height_reconstructed" not in r:
+        if r is None or not r.get("height_tools"):
             return
-        if r.get("height_raw") is not r.get("height_raw_at_edit"):
-            self.notify("The heights were rescaled after they were edited; reconstruct again to get the original.",
-                        "warning")
+        why = self._tools_reset_blocker(r)
+        if why is not None:
+            self.notify(why, "warning")
             return
-        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_raw_at_edit", "height_tools")}
+        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_tools")}
         base["height"] = r["height_reconstructed"]
         base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
         job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),

@@ -85,6 +85,48 @@ def test_single_pass_with_a_sharp_layer_at_one_end_is_not_a_reversal(amplitude, 
     assert sff.find_reversal(tiles[::-1] if at_end else tiles) is None
 
 
+def _single_pass_with_end_layer(seed, n, w, gain, layer, decay, at_end, noise):
+    """Tile focus curves of ONE monotonic pass over frames 0..n-1 (no turnaround): 36 tiles in focus at random frames
+    inside the sweep, plus a layer that is sharp at one end of the sweep and decays over `decay` frames."""
+    rng = np.random.default_rng(seed)
+    z = np.arange(n, dtype=float)
+    focus = rng.uniform(6 * w, n - 6 * w, 36)
+    base = rng.uniform(0.5, 2.0, 36)
+    tiles = base * (1 + gain * np.exp(-(z[:, None] - focus[None]) ** 2 / (2 * w * w)))
+    d = (n - 1 - z) if at_end else z
+    tiles = tiles + (layer * gain * np.exp(-d / decay))[:, None] * rng.uniform(0.5, 1.5, 36)[None]
+    return tiles * np.exp(noise * rng.normal(size=tiles.shape))
+
+
+# Single passes that find_reversal still takes for a turnaround (strict: a fix turns them red, so the entry goes with
+# the fix). Both score under BOUNDARY_PEAK_MIRROR_MAX at or past the end midpoint; see its comment.
+KNOWN_FALSE_TURNAROUNDS = {
+    "n39-layer1.7": "accepted at frame 30 (end midpoint 29.5), mirror/travel 0.46",
+    "n40-layer0.5": "accepted at frame 31 (end midpoint 30.0), mirror/travel 0.43",
+}
+SINGLE_PASSES = {
+    # found by shrinking a random failure: accepted at frame 12, six frames before the end midpoint 18, which is a
+    # lower bound of any turnaround that ends near focus; the search now stays within the midpoint tolerance of it
+    "n25-layer0.31": (8, 25, 1.5, 5.0, 0.3125, 1.5, True, 0.0),
+    # two of 20000 random draws whose verdict the bound changed: v0.10.1 accepted them at frames 12 and 16
+    "n26-layer0.31": (10138, 26, 1.8084925014223954, 11.123667131887967, 0.3076532972307618, 4.351642135858976, True,
+                      0.02937259458998135),
+    "n31-layer0.46": (18726, 31, 2.241102290886313, 40.78915220600517, 0.45764315037898645, 1.9724137525035477, True,
+                      0.046566725055764036),
+    "n39-layer1.7": (273, 39, 2.785107701806346, 33.537211358410744, 1.7089067383076242, 1.6067971457612413, True,
+                     0.0022289952694011296),
+    "n40-layer0.5": (379, 40, 2.9679130100310047, 49.57424831708108, 0.49950011737170696, 2.5129747873108554, True,
+                     0.016678346370918203),
+}
+
+
+@pytest.mark.parametrize("case", [pytest.param(k, marks=[pytest.mark.xfail(strict=True, reason=KNOWN_FALSE_TURNAROUNDS[k])]
+                                               if k in KNOWN_FALSE_TURNAROUNDS else []) for k in SINGLE_PASSES])
+def test_single_pass_with_a_decaying_end_layer_is_not_a_reversal(case):
+    """Ground truth: one monotonic pass, so there is no turnaround to report."""
+    assert sff.find_reversal(_single_pass_with_end_layer(*SINGLE_PASSES[case])) is None
+
+
 def test_reversed_40x_hand_sweep_reconstruction_matches_v090():
     """Seed 22 end to end, scored like the review: v0.9.0 valid 94.0 %, r 0.984, RMSE after a linear fit to truth
     0.133 um; v0.10.1 (turnaround missed, return pass folded into the depth fit) 63.5 %, 0.850, 0.302 um."""
@@ -168,3 +210,87 @@ def test_theoretical_fwhm_of_a_response_narrower_than_two_samples(name, um_per_p
     got = theoretical_fwhm_um(obj, um_per_px, lambda im: np.full(im.shape, float(im.max() - im.min()), np.float32), tex)
     assert got is not None
     assert got == pytest.approx(hand, rel=0.01), (got, hand)
+
+
+# ------------------------------------------------------------------------------------------------ colour fusion
+def _two_frame_stack(h: int, w: int):
+    """Two integer-valued frames, each sharp on one half, and the complementary hard weight step."""
+    rng = np.random.default_rng(0)
+    tex = np.rint(rng.random((h, w)) * 255).astype(np.float32)
+    left = np.arange(w)[None, :] < w // 2
+    f0 = np.where(left, tex, 128.0).astype(np.float32)
+    f1 = np.where(~left, tex, 128.0).astype(np.float32)
+    w0 = np.broadcast_to(left, (h, w)).astype(np.float32)
+    return (f0, f1), (w0, 1.0 - w0)
+
+
+def test_colour_fusion_uses_the_same_pyramid_as_the_grey_fusion():
+    """EDFAccumulator took its pyramid depth from min(shape), which is 3 for (H, W, 3): the colour all-in-focus image
+    got 1 level instead of 5, so it was not the fusion the luma image got. Ground truth: frames whose three channels
+    equal a grey frame must fuse to the grey fusion, channel by channel."""
+    frames, weights = _two_frame_stack(256, 320)
+    grey, colour = sff.EDFAccumulator((256, 320)), sff.EDFAccumulator((256, 320, 3))
+    for f, wt in zip(frames, weights):
+        grey.add(f, wt)
+        colour.add(np.dstack([f] * 3), wt)
+    rg, rc = grey.result(), colour.result()
+    assert np.max(np.abs(rc - rg[..., None])) < 1e-3
+
+
+OBJ10 = resolve("10x / 0.25", objset=BUILTIN)
+
+
+def _grey_sweep(seed: int = 3):
+    """A 9-frame simulated 10x sweep, 320 x 240, as uint8 grey frames, and its true focus positions."""
+    sim = SpecimenSimulator(seed, OBJ10, out_w=320, out_h=240)
+    frames, zs = [], []
+    for z_k in sim.sweep_trajectory(n_frames=9):
+        sim.focus_z_um = float(z_k)
+        bgr, truth = sim.render()
+        frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        zs.append(truth.focus_z_um)
+    return frames, np.array(zs)
+
+
+def test_reconstructed_colour_edf_of_grey_frames_equals_the_grey_edf():
+    """End to end through zstack.reconstruct: colour frames that are the luma frames replicated into three channels
+    must give edf_rgb equal to the rounded luma edf in every channel."""
+    frames, zs = _grey_sweep()
+    r = zstack.reconstruct(frames, zs, OBJ10, 1.0, "um", color_frames=[np.dstack([f] * 3) for f in frames],
+                           settings=zstack.ZSettings(allow_tiling=False))
+    for c in range(3):
+        assert np.max(np.abs(r["edf_rgb"][..., c].astype(np.float32) - r["edf"])) <= 0.5 + 1e-3
+
+
+# ------------------------------------------------------------------------------------------------ compute backend
+def test_refine_depth_reports_the_backend_its_guided_filter_ran_on():
+    """refine_depth discarded the backend guided_filter_backend returned; it must hand it to the caller."""
+    rng = np.random.default_rng(0)
+    z = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    guide = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    out, ran = sff.refine_depth(z, np.ones_like(z), guide, 3, backend="cpu")
+    assert ran == {"cpu"} and out.shape == z.shape
+
+
+def test_refine_depth_on_opencl_reports_opencl_only(opencl):
+    """Both guided-filter passes (before and after outlier rejection) ran on OpenCL: the set is exactly {'opencl'}."""
+    rng = np.random.default_rng(0)
+    z = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    guide = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    _out, ran = sff.refine_depth(z, np.ones_like(z), guide, 3, backend="opencl")
+    assert ran == {"opencl"}
+
+
+def test_result_backend_names_the_opencl_guided_filter(opencl, monkeypatch):
+    """With OpenCL selected and a focus measure that has no OpenCL version (Vollath F4) the focus maps run on the CPU
+    but the guided filter of the depth refinement runs on OpenCL; the result said 'cpu'. It must name both."""
+    from microtopos import backend
+
+    calls = []
+    real = backend._guided_filter_umat
+    monkeypatch.setattr(backend, "_guided_filter_umat", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    frames, zs = _grey_sweep()
+    r = zstack.reconstruct(frames, zs, OBJ10, 1.0, "um",
+                           settings=zstack.ZSettings(backend="opencl", measure="Vollath F4", workers=1))
+    assert calls, "the guided filter did not run on OpenCL"
+    assert r["backend"] == "cpu+opencl"

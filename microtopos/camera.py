@@ -100,9 +100,11 @@ def camera_modes(info: CameraInfo) -> list[str]:
         by_fmt: dict[str, list[str]] = {}
         fmt = ""
         for line in out.splitlines():
-            m = re.search(r"\[\d+\]:\s*'(\w+)'", line)
+            # a format header in either v4l-utils layout ("[0]: 'MJPG' ..." or "Pixel Format: 'MJPG' ..."); the
+            # FourCC is the four characters between the quotes, spaces included ('Y16 ', 'Y8  ')
+            m = re.search(r"(?:\[\d+\]:|Pixel Format\s*:)\s*'([^']*)'", line)
             if m:
-                fmt = m.group(1)
+                fmt = m.group(1).strip()
                 continue
             m = re.search(r"Size:\s*Discrete\s+(\d+)x(\d+)", line)
             if m and fmt:
@@ -562,6 +564,7 @@ class ReplaySource(FrameSource):
         self.paused = False
         self.position = 0
         self._seek_target: int | None = None
+        self._seek_dir = 1  # where a seek or step moves on when its target frame is damaged (+1 / -1)
         self._ctrl_lock = threading.Lock()
         self._last_pub: tuple[float, float] | None = None  # (wall time, media time) of the last published frame
 
@@ -604,6 +607,7 @@ class ReplaySource(FrameSource):
         self._need_transport("seek")
         with self._ctrl_lock:
             self._seek_target = int(np.clip(index, 0, max(0, len(self.files) - 1)))
+            self._seek_dir = -1 if self._seek_target < self.position else 1
             self.done = False
 
     def step_frames(self, delta: int = 1) -> None:
@@ -623,6 +627,7 @@ class ReplaySource(FrameSource):
             self.paused = True
             base = self.position
             self._seek_target = int(np.clip(base + delta, 0, max(0, len(self.files) - 1)))
+            self._seek_dir = -1 if delta < 0 else 1
             self.done = False
 
     def set_speed(self, speed: float) -> None:
@@ -697,6 +702,7 @@ class ReplaySource(FrameSource):
         while self._running:
             with self._ctrl_lock:
                 seek_to = self._seek_target
+                seek_dir = self._seek_dir
                 self._seek_target = None
                 paused = self.paused
                 spd = self.speed
@@ -713,8 +719,15 @@ class ReplaySource(FrameSource):
             if seek_to is not None:
                 idx = seek_to
                 prev_seq = None
-                f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
-                img = decode(f)
+                img = decode(self.files[idx])
+                while img is None:  # a damaged target is counted and passed in the direction of travel, as in playback
+                    self.corrupt += 1
+                    self.error = f"{self.corrupt} damaged frame(s) skipped (last: {self.files[idx].name})"
+                    if not 0 <= idx + seek_dir < len(self.files):
+                        break
+                    idx += seek_dir
+                    img = decode(self.files[idx])
+                ts, rseq = self.stamps[idx], self.manifest.seqs[idx]
                 if img is not None:
                     if not self._commit(idx, img, ts, 1, seek=True):
                         continue  # a newer seek or step arrived while decoding: serve that one only
@@ -731,9 +744,18 @@ class ReplaySource(FrameSource):
                 continue
             if idx >= len(self.files):
                 if self.loop:
+                    with self._ctrl_lock:
+                        self.done = False  # loop may have been switched on after the end: playing again, not done
                     idx = 0
                     prev_seq = None
-                    t_anchor = self._now()
+                    # frame 0 follows the last frame after one more recorded interval (the last one), like every
+                    # other frame: re-anchoring at "now" showed the last frame for 0 s at every wrap
+                    last = self._last_pub
+                    gap = self.stamps[-1] - self.stamps[-2] if len(self.stamps) > 1 else 0.0
+                    if last is not None and self.stamps and last[1] == self.stamps[-1]:
+                        t_anchor = last[0] + max(gap, 0.0) / spd
+                    else:
+                        t_anchor = self._now()
                     ts_anchor = self.stamps[0] if self.stamps else 0.0
                     continue
                 self.done = True

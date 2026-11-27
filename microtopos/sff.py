@@ -27,8 +27,12 @@ def monotonic_segments_from_z(z: np.ndarray, min_len: int = 5) -> list[tuple[int
 # maximum at the first or last frame is accepted. Such a maximum is also what a single pass that starts or ends
 # sharp on another layer (dust, a cover slip) shows in every tile, so it needs the mirror evidence a peak inside the
 # sweep does not. Measured on simulated hand sweeps (seeds 10-25, 10x / 0.25 and 40x / 0.85, tremor on): true
-# turnarounds 0.08-0.39; single passes with a decaying layer at either end (tests/test_reported_bugs.py B8,
-# 30-300 % of the surface's contrast) 0.62-0.80. find_optical_reversal searches every frame without peak evidence and
+# turnarounds 0.08-0.39; the single passes with a decaying layer at either end of tests/test_reported_bugs.py B8
+# (30-300 % of the surface's contrast) 0.62-0.80. Not every such single pass scores that high: on synthetic tile
+# curves (36 tiles, 25-70 frames, focus gain 5-50, an end layer of 0.3-3 x the gain decaying over 1.5-6 frames)
+# 3 of 600 and 2 of 400 random draws still score 0.42-0.50 at or past the end midpoint and are accepted as a
+# turnaround (two are kept as strict known failures in tests/test_reconstruction_regressions.py); true turnarounds of
+# the same synthetic family score at most 0.12. find_optical_reversal searches every frame without peak evidence and
 # keeps its stricter 0.35.
 BOUNDARY_PEAK_MIRROR_MAX = 0.5
 
@@ -65,13 +69,18 @@ def find_optical_reversal(tiles: np.ndarray, min_arm: int = 4) -> int | None:
     return best
 
 
+def _midpoint_tolerance(n: int) -> float:
+    """Frames within which per-tile turnaround midpoints count as agreeing (n frames in the sweep)."""
+    return max(3.0, 0.06 * n)
+
+
 def _agreeing_median(mids: list[float], n: int, n_tiles: int) -> float | None:
     """Median turnaround of the per-tile midpoints when enough tiles give one and most of them agree."""
     if len(mids) < max(3, 0.25 * n_tiles):
         return None
     mids_a = np.array(mids)
     med = float(np.median(mids_a))
-    if (np.abs(mids_a - med) <= max(3.0, 0.06 * n)).mean() < 0.6:
+    if (np.abs(mids_a - med) <= _midpoint_tolerance(n)).mean() < 0.6:
         return None
     return med
 
@@ -120,7 +129,9 @@ def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5, min_arm: int =
         return best
     med = _agreeing_median(mids_ends, n, lt.shape[1])
     if med is not None and n >= 2 * min_arm + 1:
-        lo = min_arm if sides[0] > sides[1] else max(min_arm, int(med) - 6)
+        # unless start maxima dominate, the midpoint is a lower bound of the turnaround (the return peak lies at or
+        # beyond the last frame): search no further below it than the midpoints themselves may disagree
+        lo = min_arm if sides[0] > sides[1] else max(min_arm, int(np.floor(med - _midpoint_tolerance(n))))
         hi = n - min_arm if sides[1] > sides[0] else min(n - min_arm, int(med) + 7)
         best, best_score = None, BOUNDARY_PEAK_MIRROR_MAX
         for t in range(lo, hi):
@@ -228,37 +239,13 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
 # ---------------------------------------------------------------------------------------------- refinement
 
 
-def weighted_guided_filter(p: np.ndarray, w: np.ndarray, guide: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """Guided filter (He et al.) with per-pixel data weights w; NaN in p counts as weight 0."""
-    w = np.where(np.isfinite(p), w, 0.0).astype(np.float32)
-    p0 = np.where(np.isfinite(p), p, 0.0).astype(np.float32)
-    I = guide.astype(np.float32)
-    k = (2 * radius + 1, 2 * radius + 1)
-
-    def box(x):
-        return cv2.boxFilter(x, cv2.CV_32F, k, normalize=False, borderType=cv2.BORDER_REFLECT)
-
-    sw = box(w) + 1e-6
-    mI = box(w * I) / sw
-    mp = box(w * p0) / sw
-    vI = box(w * I * I) / sw - mI * mI
-    cIp = box(w * I * p0) / sw - mI * mp
-    A = cIp / (vI + eps)
-    B = mp - A * mI
-    n = box(np.ones_like(I))
-    support = box((w > 0).astype(np.float32)) / n
-    A = box(A) / n
-    B = box(B) / n
-    out = A * I + B
-    return np.where(support > 0.15, out, np.nan).astype(np.float32)
-
-
 def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int,
-                 *, backend: str = "cpu") -> np.ndarray:
+                 *, backend: str = "cpu") -> tuple[np.ndarray, set[str]]:
     """Edge-aware smoothing guided by the all-in-focus image, with one round of outlier rejection.
 
     backend selects "cpu" (reference) or "opencl" for the guided filter (CPU fallback if OpenCL is
-    unavailable or fails); see backend.guided_filter_backend.
+    unavailable or fails); see backend.guided_filter_backend. Returns (refined depth, the set of backends the
+    guided filter actually ran on), so the caller can record what ran.
     """
     from .backend import guided_filter_backend
     g = guide.astype(np.float32)
@@ -266,15 +253,17 @@ def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int
     zr = np.nanstd(z) if np.any(np.isfinite(z)) else 1.0
     eps = (0.1) ** 2
     zn = z / (zr + 1e-9)
-    sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
+    sm, used = guided_filter_backend(zn, conf, g, radius, eps, backend)
+    ran = {used}
     resid = np.abs(zn - sm)
     r_ok = resid[np.isfinite(resid)]
     if r_ok.size:
         thr = 4.0 * 1.4826 * np.median(r_ok) + 1e-6
         zn = np.where(resid > thr, np.nan, zn)
-        sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
+        sm, used = guided_filter_backend(zn, conf, g, radius, eps, backend)
+        ran.add(used)
     out = np.where(np.isfinite(zn), sm, np.nan) * (zr + 1e-9)
-    return out.astype(np.float32)
+    return out.astype(np.float32), ran
 
 
 # ---------------------------------------------------------------------------------------------- fusion
@@ -284,12 +273,14 @@ class EDFAccumulator:
     """Streaming Laplacian-pyramid fusion: add (frame, weight) pairs one at a time, normalised at the end.
 
     Weights should already be normalised across the stack per pixel; they are low-pass filtered by the
-    Gaussian pyramid, which avoids seams between frames.
+    Gaussian pyramid, which avoids seams between frames. `shape` is (H, W) for grey frames or (H, W, channels)
+    for colour frames fused with a (H, W) weight; the pyramid depth depends on (H, W) only, so a colour fusion
+    uses the same levels as the grey one.
     """
 
-    def __init__(self, shape: tuple[int, int], levels: int = 5):
+    def __init__(self, shape: tuple[int, ...], levels: int = 5):
         self.shape = shape
-        self.levels = max(1, min(levels, int(np.log2(min(shape))) - 3))
+        self.levels = max(1, min(levels, int(np.log2(min(shape[:2]))) - 3))  # (H, W) or (H, W, channels)
         self.acc = None
         self.wsum = None
 

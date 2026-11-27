@@ -5,7 +5,9 @@
 The CPU path is the default everywhere. OpenCL (OpenCV's transparent API, cv2.UMat) is used only when asked for
 (ZSettings.backend = "opencl"), only for measures that have an OpenCL implementation of the SAME measure
 (DoG band-pass, Tenengrad, SML; same kernels, window and border mode as focus.focus_map) and for the guided
-filter, and falls back to the CPU on any OpenCL error; the result records which backend actually ran.
+filter, and falls back to the CPU on any OpenCL error; the result records which backends actually ran, for the
+focus measure and the guided filter together (zstack result "backend", e.g. "cpu+opencl" for a measure without an
+OpenCL version whose depth refinement ran on OpenCL).
 OpenCL is NOT claimed to be faster: on a given computer it can be slower (kernel launch and transfer costs);
 the benchmark below measures it for every offered measure, with the input already on the device and
 including upload and download, synchronised, after warm-up, and checks that each output agrees with the CPU

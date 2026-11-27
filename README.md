@@ -79,9 +79,14 @@ Grbl controller: **no real camera, stage or Grbl hardware has been used with the
   saved sessions) and RGB mosaic.
 - **Interactive replay transport bar** (`ReplaySource`): pause/resume, seek, single-frame step, playback speed
   and loop, driven from the GUI replay bar — no real camera required.
-- **Mosaicking**: disconnected-area bridging (cross-area loop closure), multi-scale `MosaicInset` overlays,
-  `feather` and `multiband` (a two-band blend, not a Laplacian pyramid) blending, rotational stage tracking
-  (`track_rotation`), and saving and reloading the mosaic graph (`LiveEngine.mosaic_state` / `load_mosaic_state`).
+- **Mosaicking**: disconnected-area bridging (cross-area loop closure; with `track_rotation` the join also applies
+  the measured rotation), multi-scale insets (`MosaicInset`: a view pinned with "Add inset", and the previous
+  objective's mosaic after an objective change) drawn under the mosaic at their own scale, `feather` and
+  `multiband` (a two-band blend, not a Laplacian pyramid) blending, rotational stage tracking (`track_rotation`),
+  and saving and reloading the mosaic graph (`LiveEngine.mosaic_state` / `load_mosaic_state`). A mosaic records
+  its objective and preview scale: an opened one is shown at its own scale, and live frames of another objective
+  or camera mode are not tracked into it. An inset's place in a new mosaic assumes parcentred objectives and a
+  stage that does not move during the change.
 - **3D reconstruction & compute**: experimental focus-breathing correction (`estimate_breathing_scales`, off by
   default), strip-wise (tiled) Z-stack reconstruction that bounds peak working memory (`allow_tiling`), an optical
   depth-of-field ruler (`theoretical_fwhm_um`, an estimate), and expanded OpenCL (`cv2.UMat`) focus metrics and

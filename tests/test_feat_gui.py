@@ -6,6 +6,7 @@ Runs offscreen with isolated Qt settings, like tests/test_gui_layout.py.
 
 import os
 import re
+import threading
 import time
 from unittest import mock
 
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from microtopos import export, metrology, zstack
 from microtopos import mosaic as mosaic_mod
 from microtopos.camera import ReplaySource
+from microtopos.gui import main_window
 from microtopos.gui.main_window import MainWindow
 from microtopos.gui.theme import DARK
 from microtopos.gui.widgets import ImagePanel
@@ -229,13 +231,20 @@ def _install(app, w, swept, height, form=0, mode=0, base=None):
 
 
 def _three_point_expected(z, pts, radius):
-    """Plane through the medians of the (2 radius + 1)-px square patches at the 3 points, subtracted from z."""
+    """Plane through the 3 patch samples, subtracted from z: each sample is the mean height of the valid pixels of the
+    (2 radius + 1)-px square patch within 3 x 1.4826 x MAD of the patch median, placed at those pixels' centroid
+    (metrology.level_three_points' definition, rebuilt here with plain numpy)."""
     rows, vals = [], []
     for px, py in pts:
         ix, iy = round(px), round(py)
-        patch = z[max(0, iy - radius):iy + radius + 1, max(0, ix - radius):ix + radius + 1]
-        rows.append([1.0, px, py])
-        vals.append(np.nanmedian(patch))
+        y0, x0 = max(0, iy - radius), max(0, ix - radius)
+        patch = z[y0:iy + radius + 1, x0:ix + radius + 1].astype(np.float64)
+        yy, xx = np.nonzero(np.isfinite(patch))
+        v = patch[yy, xx]
+        dev = np.abs(v - np.median(v))
+        keep = dev <= 3.0 * 1.4826 * np.median(dev)
+        rows.append([1.0, xx[keep].mean() + x0, yy[keep].mean() + y0])
+        vals.append(v[keep].mean())
     c0, cx, cy = np.linalg.solve(np.array(rows), np.array(vals, np.float64))
     yy, xx = np.mgrid[0:z.shape[0], 0:z.shape[1]].astype(np.float64)
     return z - (c0 + cx * xx + cy * yy)
@@ -296,8 +305,8 @@ def test_three_point_levelling_removes_the_tilt_whatever_layer_is_shown(window, 
     coef = np.linalg.lstsq(A, diff[ok].astype(np.float64), rcond=None)[0]
     assert np.abs(A @ coef - diff[ok]).max() < 1e-3
     assert np.allclose(c, -TILT, rtol=0.03)
-    # the plane is the one through the medians of three 10 um patches around the picked points, computed here
-    # independently with numpy; every parameter was recomputed from that height (Sa is the plain mean |z - mean|)
+    # the plane is the one through the outlier-trimmed means of three 10 um patches around the picked points, each at
+    # its pixels' centroid, computed here independently with numpy; every parameter was recomputed from that height (Sa is the plain mean |z - mean|)
     expected = _three_point_expected(tilted, pts, max(3, round(10 / um)))
     assert np.allclose(after["height"], expected, atol=2e-4, equal_nan=True)
     assert after["Sa"] == pytest.approx(_sa(expected), rel=1e-3)
@@ -553,6 +562,222 @@ def test_feature_checkbox_computes_spd_and_the_known_hill_count_and_area(window,
     w._recompute()
     _wait_jobs(qapp, w)
     assert "Spd_per_mm2" not in w.result and "Hill count" not in w.report.toPlainText()
+
+
+# ---------------------------------------------------------------- audit defects: words, height tools across maps, races
+
+def test_lambda_c_tooltip_and_profile_label_state_the_default_cutoff_the_code_applies(window, qapp, swept):
+    """With the L-filter off the profile roughness uses length / PROFILE_TRAVERSE_CUTOFFS (6: five sections plus
+    the λc/2 run-in and run-out). The λc tooltip said 'a fifth of the profile length'."""
+    w = window
+    rule = f"profile length / {metrology.PROFILE_TRAVERSE_CUTOFFS:g}"
+    assert rule in w.sp_lc.toolTip(), w.sp_lc.toolTip()
+    assert "fifth" not in w.sp_lc.toolTip()
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _two_sine_surface(um), form=0, mode=0)
+    w.sp_lc.setValue(0.0)
+    _pump(qapp, 5)
+    p0, p1 = w.prof_roi.getHandles()
+    length = float(np.hypot(p1.pos().x() - p0.pos().x(), p1.pos().y() - p0.pos().y()))
+    text = w.prof_label.text()
+    assert rule in text, text  # the label states the same rule as the tooltip ...
+    assert f"λc {length / metrology.PROFILE_TRAVERSE_CUTOFFS:.3g} µm" in text  # ... and applies it
+
+
+def _session_file(w, tmp_path, name="map.npz"):
+    path = tmp_path / name
+    export.save_session(path, w.result, {})
+    return path
+
+
+def _open(app, w, path):
+    with mock.patch.object(QFileDialog, "getOpenFileName", return_value=(str(path), "Session (*.npz)")):
+        w._load_session()
+    _pump(app, 5)
+
+
+def test_level_points_picked_on_one_map_never_level_the_next_one(window, qapp, swept, tmp_path):
+    """Open session and a history pick replace the displayed map like a new reconstruction does: two points picked
+    on the previous map are dropped, so one click on the new map does not level it."""
+    w = window
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _nodata(_relief(um)))
+    path = _session_file(w, tmp_path)
+    for replace in ("open session", "history pick"):
+        _open(qapp, w, path)
+        shown = w.result
+        h0 = shown["height"].copy()
+        w.btn_level3.setChecked(True)
+        w.p_height.clicked_px.emit(100.0, 60.0)
+        w.p_height.clicked_px.emit(500.0, 60.0)
+        _pump(qapp, 3)
+        if replace == "open session":
+            _open(qapp, w, path)
+        else:
+            w.cmb_hist.setCurrentIndex(next(i for i, h in enumerate(w.history) if h is not shown))
+            _pump(qapp, 3)
+        assert w.result is not shown
+        assert w.btn_level3.text() == "Level: pick 3 points" and not w.btn_level3.isChecked()
+        before = w.result["height"].copy()
+        w.p_height.clicked_px.emit(300.0, 300.0)  # one click on the new map
+        _pump(qapp, 3)
+        _wait_jobs(qapp, w)
+        assert "height_tools" not in w.result, replace
+        assert np.array_equal(w.result["height"], before, equal_nan=True)
+        assert np.array_equal(shown["height"], h0, equal_nan=True)
+
+
+def _toasts(w):
+    seen = []
+    show = w.toast.show_message
+    w.toast.show_message = lambda text, kind="info", **k: (seen.append((kind, text)), show(text, kind, **k))
+    return seen
+
+
+def _exclude(app, w, um, rect):
+    x0, y0, x1, y1 = rect
+    w.btn_mask.click()
+    w.mask_roi.setPos((x0 * um, y0 * um))
+    w.mask_roi.setSize(((x1 - x0) * um, (y1 - y0) * um))
+    w.btn_mask.click()
+
+
+def test_reset_height_tools_restores_the_reconstructed_height_of_a_reopened_session(window, qapp, swept, tmp_path):
+    """Save an edited map, open it again: Reset restores the height from before the edit. A file that does not
+    store that height (written before it was saved) says why instead of doing nothing."""
+    w = window
+    um = swept["um_per_px"]
+    original = _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    h0, sa0 = original["height"].copy(), original["Sa"]
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    _wait_jobs(qapp, w)
+    assert w.result["height_tools"] and np.isnan(w.result["height"][100:180, 200:350]).all()
+    edited = w.result
+    path = tmp_path / "edited.npz"
+    with mock.patch.object(w, "_save_path", return_value=str(path)):
+        w._save_session()
+    _open(qapp, w, path)
+    assert w.result is not edited and w.btn_tools_reset.isEnabled()
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    r = w.result
+    assert np.array_equal(r["height"], h0, equal_nan=True)
+    assert r["Sa"] == pytest.approx(sa0, rel=1e-6)
+    assert "height_tools" not in r and not any(m.startswith("Height edited") for m in r["warnings"])
+    assert not w.btn_tools_reset.isEnabled()
+
+    # an edited session that does not hold the pre-edit height (an older file): the button explains itself
+    old = tmp_path / "old.npz"
+    export.save_session(old, {k: v for k, v in edited.items() if k != "height_reconstructed"}, {})
+    _open(qapp, w, old)
+    shown = w.result
+    seen = _toasts(w)
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    assert w.result is shown and np.isnan(shown["height"][100:180, 200:350]).all()
+    assert seen and seen[-1][0] == "warning" and "reconstruct again" in seen[-1][1], seen
+
+
+def test_reset_height_tools_after_a_z_rescale_restores_the_height_in_the_new_scale(window, qapp, swept):
+    """Edit the map, then state another Z scale (direction flipped, travel doubled): Reset gives the original height
+    in the new scale. The rescale left the height from before the edit in the old scale, so Reset was refused."""
+    w = window
+    um = swept["um_per_px"]
+    original = _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    h0 = original["height"].copy()
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    _wait_jobs(qapp, w)
+    edited = w.result
+    assert edited["height_tools"]
+    factor = -2.0
+    # the last two lines of the "Set Z..." dialog: the rescale job, then the result replaced on screen
+    w._start_job(main_window.Job(main_window._rescale_job, edited, factor, edited["z_unit"], label="Z"),
+                 lambda res: w._replace_result(edited, res), main=True)
+    _wait_jobs(qapp, w)
+    assert w.result is not edited and w.result["height_tools"]
+    assert w.btn_tools_reset.isEnabled()
+    seen = _toasts(w)
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    r = w.result
+    assert not [t for t in seen if t[0] == "warning"], seen
+    assert "height_tools" not in r
+    np.testing.assert_allclose(r["height"], h0 * factor, rtol=1e-6, atol=1e-6, equal_nan=True)
+    assert np.array_equal(np.isnan(r["height"]), np.isnan(h0))  # the excluded pixels are back
+
+
+def test_height_edit_is_kept_when_the_feature_job_finishes_first(window, qapp, swept, monkeypatch):
+    """Tick 'Feature parameters', then exclude an ROI while the feature job runs. The feature job finishing first
+    must not make the exclusion disappear while the window says it was applied."""
+    w = window
+    um = swept["um_per_px"]
+    z = _nodata(_hill_map(um))
+    _install(qapp, w, swept, z, form=0)
+    real = main_window._metrology_job
+    w.chk_topo_grains.setChecked(True)  # starts the feature job for the displayed result
+    features = [j for j in w.jobs if getattr(j, "feature_for", None) is not None]
+    assert features
+
+    def after_features(*a, **k):  # the metrology job finishes after the feature job has delivered its result
+        for j in features:
+            j.wait()
+        return real(*a, **k)
+
+    monkeypatch.setattr(main_window, "_metrology_job", after_features)
+    seen = _toasts(w)
+    rect = (200, 100, 350, 180)
+    _exclude(qapp, w, um, rect)
+    _wait_jobs(qapp, w)
+    r = w.result
+    expected_nan = np.isnan(z)
+    expected_nan[100:180, 200:350] = True
+    assert np.array_equal(np.isnan(r["height"]), expected_nan)
+    assert r["height_tools"] == [{"tool": "exclude", "rect_px": list(rect)}]
+    assert any(k == "success" and "excluded" in t for k, t in seen), seen
+    assert "excluded" in w.report.toPlainText()
+    assert r.get("features_done")  # computed again, for the edited map
+
+
+def test_a_metrology_result_for_a_closed_map_is_not_reported_as_applied(window, qapp, swept, tmp_path, monkeypatch):
+    """An exclusion whose map was closed (pushed out of the history by opened sessions) while its metrology ran is
+    not installed anywhere, and the window says so instead of reporting success."""
+    w = window
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    path = _session_file(w, tmp_path)
+    gate = threading.Event()
+    real = main_window._metrology_job
+    monkeypatch.setattr(main_window, "_metrology_job", lambda *a, **k: (gate.wait(30), real(*a, **k))[1])
+    seen = _toasts(w)
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    for _ in range(w.HISTORY):
+        _open(qapp, w, path)
+    gate.set()
+    _wait_jobs(qapp, w)
+    assert not any("height_tools" in h for h in w.history) and "height_tools" not in w.result
+    assert seen[-1][0] == "warning" and "Not applied" in seen[-1][1], seen
+    assert not any(k == "success" and "excluded" in t for k, t in seen), seen
+
+
+def test_sdq_is_reported_as_the_dimensionless_rms_gradient(window, qapp, swept):
+    """Sdq (ISO 25178-2) is the root mean square of the gradient, a ratio of lengths: a 45° plane gives exactly 1.
+    The report said unit 'rad' and 'Mean surface slope'."""
+    w = window
+    um = swept["um_per_px"]
+    x, _ = _xy_um(um)
+    r = _install(qapp, w, swept, _nodata(x), form=0)  # z = x in µm: dz/dx = 1, dz/dy = 0
+    assert r["Sdq"] == pytest.approx(1.0, rel=1e-4)
+    lines = [ln.strip() for ln in w.report.toPlainText().splitlines()]
+    k = lines.index("Sdq")
+    value, unit, meaning = lines[k + 1:k + 4]
+    assert float(value) == pytest.approx(1.0, rel=1e-3)
+    assert unit == "", lines[k:k + 4]
+    assert "root mean square gradient" in meaning.lower() and "dimensionless" in meaning
+    assert "rad" not in unit and "mean surface slope" not in meaning.lower()
+    # Sdq and Sdr are hybrid parameters in ISO 25178-2 (they combine height and lateral information), not amplitude
+    heading = [ln for ln in lines[:k] if "ISO 25178-2" in ln][-1]
+    assert heading == "Hybrid (ISO 25178-2)", heading
+    assert lines.index("Sdr") > k and not [ln for ln in lines[k:lines.index("Sdr")] if "ISO 25178" in ln]
 
 
 # ---------------------------------------------------------------- session save/load

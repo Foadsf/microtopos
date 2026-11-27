@@ -66,6 +66,42 @@ def test_modes_are_the_mjpeg_sizes_the_device_lists_largest_first(monkeypatch):
     assert camera.camera_modes(CameraInfo(0, "webcam", "/dev/video0")) == ["1280x720", "640x480"]
 
 
+def test_a_fourcc_with_a_space_starts_its_own_format(monkeypatch):
+    """v4l2-ctl prints the four FourCC characters between the quotes, spaces included ('Y16 '): those sizes are
+    Y16's, not MJPG's (crediting them to MJPG offered 1920x1080 on a camera whose MJPG stops at 1280x720)."""
+    _fake_v4l2(monkeypatch, """ioctl: VIDIOC_ENUM_FMT
+\tType: Video Capture
+
+\t[0]: 'MJPG' (Motion-JPEG, compressed)
+\t\tSize: Discrete 1280x720
+\t\tSize: Discrete 640x480
+\t[1]: 'Y16 ' (16-bit Greyscale)
+\t\tSize: Discrete 1920x1080
+""")
+    modes = camera.camera_modes(CameraInfo(0, "cam", "/dev/video0"))
+    assert modes == ["1280x720", "640x480"]
+    assert camera.pick_resolution(modes, None) == "1280x720"
+
+
+def test_modes_are_read_from_the_older_v4l_utils_layout(monkeypatch):
+    """Older v4l-utils print `Pixel Format: 'MJPG'` blocks; _v4l2_is_capture accepts that layout, so camera_modes
+    reads it too instead of offering the generic list of sizes the device does not have."""
+    _fake_v4l2(monkeypatch, """ioctl: VIDIOC_ENUM_FMT
+\tIndex       : 0
+\tType        : Video Capture
+\tPixel Format: 'YUYV'
+\tName        : YUYV 4:2:2
+\t\tSize: Discrete 640x480
+\tIndex       : 1
+\tType        : Video Capture
+\tPixel Format: 'MJPG' (compressed)
+\tName        : Motion-JPEG
+\t\tSize: Discrete 1280x720
+\t\tSize: Discrete 640x480
+""")
+    assert camera.camera_modes(CameraInfo(0, "cam", "/dev/video0")) == ["1280x720", "640x480"]
+
+
 def test_modes_fall_back_to_the_generic_list_when_the_device_cannot_be_asked(monkeypatch):
     monkeypatch.setattr(camera.shutil, "which", lambda name: None)
     modes = camera.camera_modes(CameraInfo(0, "cam", "/dev/video0"))

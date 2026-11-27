@@ -17,8 +17,9 @@ increment, and its shift is turned into mosaic axes with that frame's angle.
 from __future__ import annotations
 
 import collections
+import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -56,13 +57,16 @@ class Keyframe:
 
 @dataclass
 class MosaicInset:
-    """Multi-scale inset reference view."""
+    """A reference view at its own scale (another objective, or the previous objective's whole mosaic), shown under
+    the mosaic canvas (underlay_insets). (x_um, y_um) is its top-left in the mosaic's µm frame: mosaic pixels times
+    Mosaic.um_per_px; um_per_px is the scale of its own pixels. It belongs to an area and moves with it on a join."""
 
     objective: str
     um_per_px: float
     x_um: float
     y_um: float
     image: np.ndarray
+    area: int = 0
 
 
 @dataclass
@@ -77,6 +81,23 @@ class HeightPatch:
     rel: tuple = (0.0, 0.0)  # patch position minus keyframe position
     z_key: str = ""  # comparability key: only patches with equal keys are levelled and blended together
     rid: str = ""  # id of the result the patch came from
+
+
+@dataclass
+class CanvasSnapshot:
+    """What a render of the mosaic needs, frozen at one moment (Mosaic.canvas_snapshot).
+
+    The tile dicts hold the canvas arrays as they were when the snapshot was taken: the mosaic copies a tile before
+    its first write after a snapshot (copy-on-write), so these arrays are never modified afterwards and can be
+    rendered without any lock. Patches are shallow copies (their arrays are never modified in place)."""
+
+    tiles: dict
+    tiles_low: dict | None  # only in "multiband" mode
+    tiles_rgb: dict
+    tile: int
+    patches: list
+    insets: list
+    um_per_px: float | None  # scale of the mosaic's pixel grid (Mosaic.um_per_px)
 
 
 @dataclass
@@ -99,6 +120,12 @@ class Mosaic:
     angle_deg: float = 0.0  # current in-plane angle estimate (degrees)
     track_rotation: bool = False  # estimate & compensate in-plane rotation while tracking
     current_area: int = 0  # area new keyframes are added to
+    # What the pixel grid is: mosaic pixels are preview pixels of ONE objective and camera mode (the keyframes'
+    # shape). `objective` is its name ("" = not recorded) and `um_per_px` its lateral scale (None = unknown). They
+    # travel with the saved state, so an opened mosaic is shown at its own scale whatever objective is selected,
+    # and the live engine tracks a frame into it only when it comes from that objective and mode.
+    objective: str = ""
+    um_per_px: float | None = None
     # what the last track() call did to the areas: None, "new_area" (an unconnected view started a separate area)
     # or "areas_joined" (a bridge merged the current area into another one). `areas` alone cannot tell a join
     # from a new area: a join lowers it and the next new area raises it back to the same number.
@@ -116,6 +143,10 @@ class Mosaic:
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
     rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
     _last_rot: float = field(default=0.0, repr=False)  # rotation (angle_deg convention) measured by the last verified match
+    # copy-on-write of the canvas (canvas_snapshot): a tile entry is written in place only if it was made in the
+    # current epoch; an older one may be shared with a snapshot and is copied first
+    _canvas_epoch: int = field(default=0, repr=False)
+    _tile_epoch: dict = field(default_factory=dict, repr=False)  # (canvas name, tile key) -> epoch it was made in
 
     def reset(self, keep_insets: bool = False) -> None:
         self.tiles.clear()
@@ -126,6 +157,7 @@ class Mosaic:
         if not keep_insets:
             self.insets.clear()
         self.x = self.y = 0.0
+        self.objective, self.um_per_px = "", None  # set again by whoever builds the next mosaic
         self.lost = False
         self.prev_frame = None
         self.edges.clear()
@@ -142,6 +174,33 @@ class Mosaic:
         self.prev_bp = None
         self.recent_b.clear()
         self.rep_cache.clear()
+        self._tile_epoch.clear()
+
+    @property
+    def frame_shape(self) -> tuple[int, int] | None:
+        """Shape of the views the mosaic is made of (every keyframe has it), None while it is empty."""
+        return self.keyframes[0].image.shape if self.keyframes else None
+
+    def canvas_snapshot(self) -> CanvasSnapshot:
+        """The canvas of this moment, for rendering outside the lock that serialises access to the mosaic.
+
+        Must be called where nothing else touches the mosaic (the live engine calls it under its lock). It costs
+        dict copies only: the tile arrays are shared with the snapshot, and the next splat into a shared tile
+        copies that tile first (_tile), so the snapshot keeps showing exactly one state of the canvas."""
+        self._canvas_epoch += 1
+        return CanvasSnapshot(dict(self.tiles), dict(self.tiles_low) if self.blending == "multiband" else None,
+                              dict(self.tiles_rgb), self.tile, [copy.copy(p) for p in self.patches],
+                              list(self.insets), self.um_per_px)
+
+    def _tile(self, store: dict, name: str, key: tuple, shapes: tuple) -> list:
+        """The [num, den] entry of tile `key` in canvas `store`, safe to write in place (see canvas_snapshot)."""
+        e = store.get(key)
+        if e is None:
+            e = store[key] = [np.zeros(sh, np.float32) for sh in shapes]
+        elif self._tile_epoch.get((name, key)) != self._canvas_epoch:
+            e = store[key] = [a.copy() for a in e]  # may be shared with a snapshot: write into a private copy
+        self._tile_epoch[(name, key)] = self._canvas_epoch
+        return e
 
     def set_blending(self, mode: str) -> None:
         if mode not in ("feather", "multiband"):
@@ -151,7 +210,8 @@ class Mosaic:
             self._rebuild_canvas()
 
     def add_inset(self, objective: str, um_per_px: float, x_um: float, y_um: float, image: np.ndarray) -> None:
-        self.insets.append(MosaicInset(objective, um_per_px, x_um, y_um, np.asarray(image).copy()))
+        """Add an inset placed in the coordinates of the area the camera is in (MosaicInset)."""
+        self.insets.append(MosaicInset(objective, um_per_px, x_um, y_um, np.asarray(image).copy(), self.current_area))
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -441,8 +501,8 @@ class Mosaic:
             self.ref = len(self.keyframes) - 1
             self._loop_closure(win)
             return True, q
-        if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe
-            self.ref = self._nearest(self.x, self.y)
+        if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe of this area
+            self.ref = self._nearest(self.x, self.y, area=self.current_area)
         return False, q
 
     def _derotate(self, bp: np.ndarray) -> np.ndarray:
@@ -492,10 +552,17 @@ class Mosaic:
         # re-acquisition from it would place frames in that area's coordinates under this area's id
         self.last_good = (f, fb, (x, y), self.angle_deg)
 
-    def _nearest(self, x, y, k: int = 1):
-        d = [math.hypot(x - kf.x, y - kf.y) for kf in self.keyframes]
-        order = np.argsort(d)
-        return int(order[0]) if k == 1 else [int(i) for i in order[:k]]
+    def _nearest(self, x, y, k: int = 1, area: int | None = None):
+        """Index (k = 1) or indices of the keyframes nearest (x, y); with `area`, only that area's keyframes.
+
+        Areas are not connected: a position in one area's coordinates says nothing about where another area's
+        keyframes are (a separate area is placed to the right of everything, and panning it moves its coordinates
+        over the others' keyframes). Whatever is anchored to the camera position (the tracking reference, a height
+        map) must use the camera's own area."""
+        idx = [i for i, kf in enumerate(self.keyframes) if area is None or kf.area == area]
+        d = [math.hypot(x - self.keyframes[i].x, y - self.keyframes[i].y) for i in idx]
+        order = np.argsort(d, kind="stable")
+        return idx[int(order[0])] if k == 1 else [idx[int(i)] for i in order[:k]]
 
     def _relocalize(self, f, fb, win) -> bool:
         """After losing track, try the keyframes nearest the last known position (bounded work per attempt)."""
@@ -708,7 +775,10 @@ class Mosaic:
         """Join cur's area to another area that cur's view overlaps; returns the bridge edge or None.
 
         Only the BRIDGE_CANDIDATES best-ranked keyframes of other areas are matched. On success cur's whole area
-        moves into the other area's coordinates and takes its id."""
+        is moved into the other area's coordinates by the measured rigid transform and takes its id (_join_area).
+        With track_rotation the match also measures how cur's area is turned against the other one (an area
+        started without a connection defines its own orientation, _new_area), and that rotation is applied too;
+        without it a turned area's keyframes would land about angle x distance from their true position."""
         cur = self.keyframes[j]
         if cur.bp is None:
             return None
@@ -723,26 +793,103 @@ class Mosaic:
             dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
             if q < max(self.LOOP_NCC, 0.72):
                 continue
-            ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k)
-            shift_x = (k.x + ex) - cur.x
-            shift_y = (k.y + ey) - cur.y
-            old_area, target_area = cur.area, k.area
-            for kf2 in self.keyframes:
-                if kf2.area == old_area:
-                    kf2.x += shift_x
-                    kf2.y += shift_y
-                    kf2.area = target_area
-            for p in self.patches:
-                if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
-                    p.x = self.keyframes[p.kf].x + p.rel[0]
-                    p.y = self.keyframes[p.kf].y + p.rel[1]
-            self._shift_tracker(shift_x, shift_y)
-            self.current_area = target_area
-            self.areas = len({kf.area for kf in self.keyframes})
+            # (dx, dy) is the shift of the view centre (of the derotated pair, with track_rotation), and _last_rot
+            # the rotation of cur's view, i.e. of its area's orientation, against k's area (angle_deg convention)
+            rot = self._last_rot if self.track_rotation else 0.0
+            ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k), in k's area's axes
+            self._join_area(cur.area, k.area, (cur.x, cur.y), (k.x + ex, k.y + ey), rot, cur.image.shape)
             self.last_event = "areas_joined"
-            self._rebuild_canvas()
             return (i, j, ex, ey, 1.0)
         return None
+
+    def _join_area(self, old: int, target: int, src: tuple, dst: tuple, rot: float, shape: tuple) -> None:
+        """Move area `old` into area `target`'s coordinates: the rigid transform that takes a view of size `shape`
+        at top-left `src` (old coordinates) to `dst` (target coordinates), turned by `rot` (angle_deg convention:
+        old's axes are those of a view at angle `rot` in target's). Applied to the area's keyframes (pose, stored
+        image, angle), the edges between them, its height patches, and the tracker (the camera is in that area).
+
+        The canvas is updated incrementally (_move_keyframes): only the moved keyframes, the keyframes whose
+        yield masks refer to them, and the moved patches are re-splatted, not the whole canvas, so the time the
+        caller holds the engine lock grows with the joined area, not with the mosaic."""
+        h, w = shape
+        c0 = (src[0] + (w - 1) / 2.0, src[1] + (h - 1) / 2.0)  # the joining view's centre, old coordinates
+        c1 = (dst[0] + (w - 1) / 2.0, dst[1] + (h - 1) / 2.0)  # ... and target coordinates
+
+        def place(x: float, y: float, hh: int, ww: int) -> tuple[float, float]:
+            """Top-left of an hh x ww rectangle at top-left (x, y), old -> target coordinates (about its centre)."""
+            vx, vy = self._to_mosaic(x + (ww - 1) / 2.0 - c0[0], y + (hh - 1) / 2.0 - c0[1], rot)
+            return c1[0] + vx - (ww - 1) / 2.0, c1[1] + vy - (hh - 1) / 2.0
+
+        turn = rot != 0.0  # _verified leaves 0 below ROT_MIN_DEG: nothing is resampled for an unturned area
+        members = [idx for idx, k in enumerate(self.keyframes) if k.area == old]
+        member_set = set(members)
+        self._move_keyframes({idx: place(self.keyframes[idx].x, self.keyframes[idx].y,
+                                         *self.keyframes[idx].image.shape) for idx in members},
+                             {idx: self._turned_views(self.keyframes[idx], rot) for idx in members} if turn else None)
+        for idx in members:
+            self.keyframes[idx].area = target
+            self.keyframes[idx].angle_deg += rot
+        if turn:  # relative positions measured inside the area are in its old axes
+            self.edges = [(i, j, *self._to_mosaic(ex, ey, rot), wt) if i in member_set and j in member_set
+                          else (i, j, ex, ey, wt) for i, j, ex, ey, wt in self.edges]
+        for p in self.patches:  # height patches follow their keyframe, turned with it
+            if p.kf is None or p.kf not in member_set:
+                continue
+            self._splat(p.edf, p.x, p.y, weight=-4.0)
+            if turn:
+                p.edf, p.height = _turn(p.edf, -rot), _turn(p.height, -rot, invalid=np.nan)
+                p.rel = self._to_mosaic(p.rel[0], p.rel[1], rot)
+            k = self.keyframes[p.kf]
+            p.x, p.y = k.x + p.rel[0], k.y + p.rel[1]
+            self._splat(p.edf, p.x, p.y, weight=4.0)
+        self._solve_offsets()  # the joined patches may now overlap others of their z_key: level them together
+        if self.um_per_px:  # insets placed in the joined area move with it (their position is in µm of this grid)
+            um = self.um_per_px
+            for n, it in enumerate(self.insets):
+                if it.area != old:
+                    continue
+                ih, iw = np.asarray(it.image).shape[:2]
+                x, y = place(it.x_um / um, it.y_um / um, ih * it.um_per_px / um, iw * it.um_per_px / um)
+                self.insets[n] = replace(it, x_um=x * um, y_um=y * um, area=target,
+                                         image=_turn(np.asarray(it.image, np.float32), -rot) if turn else it.image)
+        # the tracker: the camera is at the joining view, in the old area's coordinates and orientation
+        self.x, self.y = place(self.x, self.y, h, w)
+        self.prev_xy = place(*self.prev_xy, h, w)
+        if self.velocity is not None:
+            self.velocity = self._to_mosaic(*self.velocity, rot)
+        if self.last_good is not None:
+            gf, gb, gxy, gang = self.last_good
+            self.last_good = (gf, gb, place(*gxy, h, w), gang + rot)
+        self.angle_deg += rot
+        self.current_area = target
+        self.areas = len({kf.area for kf in self.keyframes})
+
+    def _turned_views(self, k: Keyframe, rot: float) -> tuple:
+        """(image, band-pass, rgb) of keyframe k turned from its area's orientation into one turned by -rot, the
+        same resampling _add_keyframe applies to a rotated view."""
+        f = _turn(k.image.astype(np.float32), -rot)
+        rgb = None if k.rgb is None else np.clip(_turn(k.rgb.astype(np.float32), -rot) + 0.5, 0, 255).astype(np.uint8)
+        return np.clip(f + 0.5, 0, 255).astype(np.uint8), self._bp(f).astype(np.float16), rgb
+
+    def _move_keyframes(self, poses: dict, views: dict | None = None) -> None:
+        """Give keyframes new positions (and, with `views`, new (image, band-pass, rgb)), keeping the canvas equal
+        to a rebuild: every keyframe whose contribution changes (the moved ones and those whose yield masks refer
+        to them) is un-splatted with what it splatted, updated, and splatted again."""
+        moved = set(poses)
+        resplat = moved | {idx for idx, k in enumerate(self.keyframes) if any(j in moved for j, _ in k.yields)}
+        # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
+        for idx, (x, y) in poses.items():
+            k = self.keyframes[idx]
+            k.x, k.y = float(x), float(y)
+            if views is not None:
+                k.image, k.bp, k.rgb = views[idx]
+                k.spectrum = None
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
 
     # Robust pose graph (Mosaic._relax). Residual scale floor: an edge is only down-weighted when it disagrees with
     # the graph by more than registration error can explain, even when the graph is so consistent that the measured
@@ -803,18 +950,8 @@ class Mosaic:
         if corr < 0.5:
             return
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
-        moved_kfs = {idx for idx, (k, x, y) in enumerate(zip(self.keyframes, sx, sy)) if math.hypot(k.x - x, k.y - y) > 0.5}
-        resplat = moved_kfs | {idx for idx, k in enumerate(self.keyframes) if any(j in moved_kfs for j, _ in k.yields)}
-        # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
-        for idx in resplat:
-            k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
-        for idx in moved_kfs:
-            k = self.keyframes[idx]
-            k.x, k.y = float(sx[idx]), float(sy[idx])
-        for idx in resplat:
-            k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
+        self._move_keyframes({idx: (sx[idx], sy[idx]) for idx, k in enumerate(self.keyframes)
+                              if math.hypot(k.x - sx[idx], k.y - sy[idx]) > 0.5})
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -831,8 +968,8 @@ class Mosaic:
         self._shift_tracker(dxc, dyc)
 
     def _shift_tracker(self, dx: float, dy: float) -> None:
-        """The graph moved under the camera (relaxation, or a bridge that joined two areas): move every position the
-        tracker holds by the same amount. `last_good` is the reference for re-acquiring a lost track; left behind,
+        """The graph moved under the camera (relaxation): move every position the tracker holds by the same amount
+        (a join moves them with its rigid transform, _join_area). `last_good` is the reference for re-acquiring a lost track; left behind,
         the first frame after a loss would be placed where the graph used to be."""
         self.x, self.y = self.x + dx, self.y + dy
         self.prev_xy = (self.prev_xy[0] + dx, self.prev_xy[1] + dy)
@@ -875,26 +1012,18 @@ class Mosaic:
                 dst = (slice(ay0 - ty * t, ay1 - ty * t), slice(ax0 - tx * t, ax1 - tx * t))
                 fea = feather[src]
                 if multiband:
-                    num, den = self.tiles.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
-                    low_num, sharp_den = self.tiles_low.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    num, den = self._tile(self.tiles, "grey", (tx, ty), ((t, t), (t, t)))
+                    low_num, sharp_den = self._tile(self.tiles_low, "low", (tx, ty), ((t, t), (t, t)))
                     num[dst] += high[src] * sharp_w[src]
                     low_num[dst] += low[src] * fea
                     den[dst] += fea
                     sharp_den[dst] += sharp_w[src]
                 else:
-                    num, den = self.tiles.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    num, den = self._tile(self.tiles, "grey", (tx, ty), ((t, t), (t, t)))
                     num[dst] += img[src] * fea
                     den[dst] += fea
                 if rgb is not None and rgb.ndim == 3:
-                    rnum, rden = self.tiles_rgb.setdefault(
-                        (tx, ty), [np.zeros((t, t, 3), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    rnum, rden = self._tile(self.tiles_rgb, "rgb", (tx, ty), ((t, t, 3), (t, t)))
                     rnum[dst] += rgb[src].astype(np.float32) * fea[..., None]
                     rden[dst] += fea
 
@@ -908,6 +1037,7 @@ class Mosaic:
         self.tiles.clear()
         self.tiles_low.clear()
         self.tiles_rgb.clear()
+        self._tile_epoch.clear()
         for k in self.keyframes:
             self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
         for p in self.patches:
@@ -923,7 +1053,7 @@ class Mosaic:
     def image_rgb(self, d: int = 1) -> np.ndarray | None:
         """Assembled full-resolution colour mosaic (RGBA uint8; alpha marks valid area), or None when no colour
         keyframes have been added."""
-        return render_tiles_rgb(self.tiles_rgb, self.tile, d)  # renders a snapshot of the tile dict
+        return render_tiles_rgb(self.tiles_rgb, self.tile, d)
 
     def preview(self, max_px: int = 1600) -> tuple[np.ndarray, tuple[int, int], int]:
         """Mosaic rendered at a power-of-two reduction d so that its larger side is <= max_px (bounded memory).
@@ -941,6 +1071,8 @@ class Mosaic:
         """Serialize the full pose graph: keyframes (area, angle, rgb), edges, patches and insets."""
         meta = {
             "tile": self.tile,
+            "objective": self.objective,
+            "um_per_px": self.um_per_px,
             "blending": self.blending,
             "track_rotation": self.track_rotation,
             "angle_deg": self.angle_deg,
@@ -991,6 +1123,7 @@ class Mosaic:
                     "um_per_px": float(it.um_per_px),
                     "x_um": float(it.x_um),
                     "y_um": float(it.y_um),
+                    "area": int(it.area),
                 }
                 for it in self.insets
             ],
@@ -1033,6 +1166,9 @@ class Mosaic:
     def _load_state(self, meta: dict, arrays: dict) -> None:
         self.reset()
         self.tile = int(meta.get("tile", self.tile))
+        self.objective = str(meta.get("objective") or "")  # absent before the mosaic recorded it
+        um = meta.get("um_per_px")
+        self.um_per_px = float(um) if um is not None and math.isfinite(float(um)) and float(um) > 0 else None
         self.blending = str(meta.get("blending", "feather"))
         self.track_rotation = bool(meta.get("track_rotation", False))
         self.angle_deg = float(meta.get("angle_deg", 0.0))
@@ -1068,7 +1204,7 @@ class Mosaic:
         for i, im in enumerate(meta.get("insets", [])):
             self.insets.append(MosaicInset(str(im["objective"]), float(im["um_per_px"]),
                                            float(im["x_um"]), float(im["y_um"]),
-                                           arrays[f"inset_img_{i}"]))
+                                           arrays[f"inset_img_{i}"], int(im.get("area", 0))))
         if self.keyframes:
             self.prev_frame = self.keyframes[self.ref].image.astype(np.float32)
             self.prev_bp = self.keyframes[self.ref].bp
@@ -1097,7 +1233,9 @@ class Mosaic:
         from . import units
 
         unit = units.canon(z_unit)
-        kf = self._nearest(x, y) if self.keyframes else None
+        # the camera's own area: a keyframe of another area does not move with this view when the areas are joined
+        mine = any(k.area == self.current_area for k in self.keyframes)
+        kf = self._nearest(x, y, area=self.current_area) if mine else None
         rel = (x - self.keyframes[kf].x, y - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
         self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), unit, 0.0, kf, rel,
                                         z_key or unit, rid))
@@ -1245,13 +1383,43 @@ def _feather(h: int, w: int) -> np.ndarray:
     return f
 
 
-def preview_factor(tiles: dict, tile: int, max_px: int) -> int:
-    """Smallest power-of-two reduction (<= tile) that keeps the rendered mosaic within max_px."""
-    if not tiles:
+def _turn(img: np.ndarray, deg: float, invalid: float | None = None) -> np.ndarray:
+    """img turned about its centre by deg (cv2.getRotationMatrix2D convention), same size. Corners take the
+    reflected border (as for derotated keyframes) or, with `invalid`, that value (NaN for heights)."""
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0), deg, 1.0)
+    if invalid is None:
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=invalid)
+
+
+def inset_boxes(insets: list, um_per_px: float) -> list[tuple[float, float, float, float]]:
+    """(x0, y0, width, height) of every inset in full-resolution pixels of a mosaic whose pixel is um_per_px µm."""
+    out = []
+    for it in insets:
+        h, w = np.asarray(it.image).shape[:2]
+        s = it.um_per_px / um_per_px
+        out.append((it.x_um / um_per_px, it.y_um / um_per_px, w * s, h * s))
+    return out
+
+
+def preview_factor(tiles: dict, tile: int, max_px: int, boxes: list = ()) -> int:
+    """Smallest power-of-two reduction (<= tile) that keeps the rendered mosaic, together with `boxes` drawn with
+    it ((x0, y0, w, h) in full-resolution pixels: inset_boxes), within max_px."""
+    if not tiles and not boxes:
         return 1
-    txs = [k[0] for k in tiles]
-    tys = [k[1] for k in tiles]
-    side = max(max(txs) - min(txs) + 1, max(tys) - min(tys) + 1) * tile
+    x0s, y0s, x1s, y1s = [], [], [], []
+    if tiles:
+        txs = [k[0] for k in tiles]
+        tys = [k[1] for k in tiles]
+        x0s, y0s, x1s, y1s = [min(txs) * tile], [min(tys) * tile], [(max(txs) + 1) * tile], [(max(tys) + 1) * tile]
+    for bx, by, bw, bh in boxes:
+        x0s.append(bx)
+        y0s.append(by)
+        x1s.append(bx + bw)
+        y1s.append(by + bh)
+    side = max(max(x1s) - min(x0s), max(y1s) - min(y0s))
     d = 1
     while side / d > max_px and d < tile:
         d *= 2
@@ -1263,8 +1431,9 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
     """Assemble tiles reduced by d (weighted: num and den are reduced separately). When tiles_low is given
     ("multiband" mode, a two-band blend), each tile's high-frequency band is divided by sharp_den and added to the
     feathered low-frequency band; empty canvas is NaN and the result is cropped to the valid bounding box, exactly
-    as in feather mode. Works on a shallow copy of the tile dict, so the engine can render outside its lock.
-    Returns (image, full-resolution origin, d)."""
+    as in feather mode. The tile arrays are read in place: nothing may splat into them during the call, so render
+    the tiles of a Mosaic.canvas_snapshot (taken under the lock) or hold the lock (the dict is copied only so that
+    bounds and tiles come from the same set of keys). Returns (image, full-resolution origin, d)."""
     tiles = dict(tiles)  # bounds and tiles from the same snapshot
     if not tiles:
         return np.full((8, 8), np.nan, np.float32), (0, 0), d
@@ -1300,9 +1469,60 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
     return out, (X0 * t + int(cols[0]) * d, Y0 * t + int(rows[0]) * d), d
 
 
+def underlay_insets(view: tuple, rgb: np.ndarray | None, insets: list, um_per_px: float):
+    """A rendered view with the insets drawn UNDER it, each at its own scale and position.
+
+    `view` is render_tiles' (image, origin, d) and `rgb` its colour version on the same box (RGBA, or None). The
+    box is extended to the insets' boxes (the origin stays on the view's pixel grid); every inset is resampled to
+    the view's scale (inset µm/px over the mosaic's, divided by d) and painted in order, later ones on top, and
+    the canvas is painted over them wherever it has data (grey: finite; colour: alpha > 0). Insets are grey: in
+    the colour view they are opaque grey, except where they are NaN (empty). Returns (view, rgb) in the same
+    forms."""
+    img, (ox, oy), d = view
+    boxes = inset_boxes(insets, um_per_px)
+    has = bool(np.isfinite(img).any())
+    x0 = min([b[0] for b in boxes] + ([ox] if has else []))
+    y0 = min([b[1] for b in boxes] + ([oy] if has else []))
+    x1 = max([b[0] + b[2] for b in boxes] + ([ox + img.shape[1] * d] if has else []))
+    y1 = max([b[1] + b[3] for b in boxes] + ([oy + img.shape[0] * d] if has else []))
+    X0, Y0 = math.floor(x0), math.floor(y0)
+    if has:  # keep the canvas on whole pixels of the reduced view
+        X0, Y0 = ox - d * math.ceil((ox - X0) / d), oy - d * math.ceil((oy - Y0) / d)
+    H, W = math.ceil((y1 - Y0) / d), math.ceil((x1 - X0) / d)
+    out = np.full((H, W), np.nan, np.float32)
+    out_rgb = None if rgb is None else np.zeros((H, W, 4), np.uint8)
+    for it, (bx, by, bw, bh) in zip(insets, boxes):
+        tw, th = round(bw / d), round(bh / d)
+        if tw < 1 or th < 1:
+            continue
+        im = np.asarray(it.image, np.float32)
+        im = im.mean(axis=2) if im.ndim == 3 else im
+        im = cv2.resize(im, (tw, th), interpolation=cv2.INTER_AREA if tw < im.shape[1] else cv2.INTER_LINEAR)
+        px, py = round((bx - X0) / d), round((by - Y0) / d)
+        sx0, sy0, sx1, sy1 = max(0, -px), max(0, -py), min(tw, W - px), min(th, H - py)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+        part = im[sy0:sy1, sx0:sx1]
+        ok = np.isfinite(part)  # an overview inset is NaN where the old mosaic was empty: nothing is drawn there
+        out[py + sy0:py + sy1, px + sx0:px + sx1][ok] = part[ok]
+        if out_rgb is not None:
+            g = np.clip(part[ok] + 0.5, 0, 255).astype(np.uint8)
+            out_rgb[py + sy0:py + sy1, px + sx0:px + sx1][ok] = np.stack([g, g, g, np.full_like(g, 255)], -1)
+    if has:
+        vx, vy = (ox - X0) // d, (oy - Y0) // d
+        sub = out[vy:vy + img.shape[0], vx:vx + img.shape[1]]
+        ok = np.isfinite(img)
+        sub[ok] = img[ok]
+        if out_rgb is not None:
+            subr = out_rgb[vy:vy + rgb.shape[0], vx:vx + rgb.shape[1]]
+            a = rgb[..., 3] > 0
+            subr[a] = rgb[a]
+    return (out, (X0, Y0), d), out_rgb
+
+
 def render_tiles_rgb(tiles_rgb: dict, tile: int, d: int = 1) -> np.ndarray | None:
-    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d. Works on a shallow copy of
-    the tile dict (bounds and tiles from the same snapshot), as render_tiles does."""
+    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d. Reads the tile arrays in
+    place, like render_tiles: pass the tiles of a Mosaic.canvas_snapshot or hold the lock."""
     tiles_rgb = dict(tiles_rgb)
     if not tiles_rgb:
         return None

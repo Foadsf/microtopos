@@ -749,6 +749,12 @@ class ReplaySource(FrameSource):
             step = 1 if prev_seq is None or rseq <= prev_seq else rseq - prev_seq
             if not self._commit(idx, img, ts, step, seek=False):
                 continue  # paused or seeked while decoding: this frame is stale now
+            # More than one frame interval behind (a slow decode, an oversleep, a loaded machine): the schedule is
+            # re-anchored on this frame instead of catching up, so playback never runs faster than the set speed
+            # (catching up sent the overdue frames back to back: 2.9 ms/frame at a 5 ms interval on macOS CI).
+            nxt = self.stamps[idx + 1] if idx + 1 < len(self.stamps) else ts
+            if time.perf_counter() - (t_anchor + (ts - ts_anchor) / spd) > max(nxt - ts, 0.0) / spd:
+                t_anchor, ts_anchor = time.perf_counter(), ts
             prev_seq = rseq
             self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd
             idx += 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -934,6 +935,26 @@ def test_replay_speed_change_takes_effect_without_stall_or_burst(replay, before,
     assert t[n0] >= t_change
     span = t[n0 + 12] - t[n0 + 2]  # ten intervals, clear of the frame that was already in flight
     assert 0.7 * 10 * expected <= span <= 3 * 10 * expected + 0.1, f"{span / 10 * 1000:.1f} ms/frame, wanted {expected * 1000:.1f}"
+
+
+def test_replay_that_falls_behind_sends_no_catch_up_burst(replay, gate):
+    """One frame takes 150 ms to decode (6 intervals at 25 ms): a slow disk, an oversleep, a loaded machine. Playback
+    resumes at the recorded interval from there; catching up sent the overdue frames back to back (v0.10.1 on macOS
+    CI: 2.9 ms/frame where 5 ms was wanted, after the playback thread overslept)."""
+    dt = 0.025
+    rs = replay(n=80, dt=dt)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= 3)
+    gate.arm()
+    assert gate.entered.wait(5)
+    time.sleep(0.15)
+    k = len(rs.idx())
+    gate.release.set()
+    assert _until(lambda: len(rs.idx()) >= k + 6, timeout=5)
+    t = rs.times()[k:k + 6]  # the held frame, then five more
+    intervals = [b - a for a, b in itertools.pairwise(t)]
+    assert min(intervals) >= 0.6 * dt, f"catch-up burst after falling behind: {[round(i * 1000) for i in intervals]} ms"
+    assert rs.idx()[k:k + 6] == list(range(rs.idx()[k], rs.idx()[k] + 6))  # every frame, none skipped
 
 
 def test_replay_loop_wraps_without_skipping_or_repeating_a_frame(replay):

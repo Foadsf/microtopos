@@ -85,6 +85,48 @@ def test_single_pass_with_a_sharp_layer_at_one_end_is_not_a_reversal(amplitude, 
     assert sff.find_reversal(tiles[::-1] if at_end else tiles) is None
 
 
+def _single_pass_with_end_layer(seed, n, w, gain, layer, decay, at_end, noise):
+    """Tile focus curves of ONE monotonic pass over frames 0..n-1 (no turnaround): 36 tiles in focus at random frames
+    inside the sweep, plus a layer that is sharp at one end of the sweep and decays over `decay` frames."""
+    rng = np.random.default_rng(seed)
+    z = np.arange(n, dtype=float)
+    focus = rng.uniform(6 * w, n - 6 * w, 36)
+    base = rng.uniform(0.5, 2.0, 36)
+    tiles = base * (1 + gain * np.exp(-(z[:, None] - focus[None]) ** 2 / (2 * w * w)))
+    d = (n - 1 - z) if at_end else z
+    tiles = tiles + (layer * gain * np.exp(-d / decay))[:, None] * rng.uniform(0.5, 1.5, 36)[None]
+    return tiles * np.exp(noise * rng.normal(size=tiles.shape))
+
+
+# Single passes that find_reversal still takes for a turnaround (strict: a fix turns them red, so the entry goes with
+# the fix). Both score under BOUNDARY_PEAK_MIRROR_MAX at or past the end midpoint; see its comment.
+KNOWN_FALSE_TURNAROUNDS = {
+    "n39-layer1.7": "accepted at frame 30 (end midpoint 29.5), mirror/travel 0.46",
+    "n40-layer0.5": "accepted at frame 31 (end midpoint 30.0), mirror/travel 0.43",
+}
+SINGLE_PASSES = {
+    # found by shrinking a random failure: accepted at frame 12, six frames before the end midpoint 18, which is a
+    # lower bound of any turnaround that ends near focus; the search now stays within the midpoint tolerance of it
+    "n25-layer0.31": (8, 25, 1.5, 5.0, 0.3125, 1.5, True, 0.0),
+    # two of 20000 random draws whose verdict the bound changed: v0.10.1 accepted them at frames 12 and 16
+    "n26-layer0.31": (10138, 26, 1.8084925014223954, 11.123667131887967, 0.3076532972307618, 4.351642135858976, True,
+                      0.02937259458998135),
+    "n31-layer0.46": (18726, 31, 2.241102290886313, 40.78915220600517, 0.45764315037898645, 1.9724137525035477, True,
+                      0.046566725055764036),
+    "n39-layer1.7": (273, 39, 2.785107701806346, 33.537211358410744, 1.7089067383076242, 1.6067971457612413, True,
+                     0.0022289952694011296),
+    "n40-layer0.5": (379, 40, 2.9679130100310047, 49.57424831708108, 0.49950011737170696, 2.5129747873108554, True,
+                     0.016678346370918203),
+}
+
+
+@pytest.mark.parametrize("case", [pytest.param(k, marks=[pytest.mark.xfail(strict=True, reason=KNOWN_FALSE_TURNAROUNDS[k])]
+                                               if k in KNOWN_FALSE_TURNAROUNDS else []) for k in SINGLE_PASSES])
+def test_single_pass_with_a_decaying_end_layer_is_not_a_reversal(case):
+    """Ground truth: one monotonic pass, so there is no turnaround to report."""
+    assert sff.find_reversal(_single_pass_with_end_layer(*SINGLE_PASSES[case])) is None
+
+
 def test_reversed_40x_hand_sweep_reconstruction_matches_v090():
     """Seed 22 end to end, scored like the review: v0.9.0 valid 94.0 %, r 0.984, RMSE after a linear fit to truth
     0.133 um; v0.10.1 (turnaround missed, return pass folded into the depth fit) 63.5 %, 0.850, 0.302 um."""

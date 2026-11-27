@@ -27,8 +27,12 @@ def monotonic_segments_from_z(z: np.ndarray, min_len: int = 5) -> list[tuple[int
 # maximum at the first or last frame is accepted. Such a maximum is also what a single pass that starts or ends
 # sharp on another layer (dust, a cover slip) shows in every tile, so it needs the mirror evidence a peak inside the
 # sweep does not. Measured on simulated hand sweeps (seeds 10-25, 10x / 0.25 and 40x / 0.85, tremor on): true
-# turnarounds 0.08-0.39; single passes with a decaying layer at either end (tests/test_reported_bugs.py B8,
-# 30-300 % of the surface's contrast) 0.62-0.80. find_optical_reversal searches every frame without peak evidence and
+# turnarounds 0.08-0.39; the single passes with a decaying layer at either end of tests/test_reported_bugs.py B8
+# (30-300 % of the surface's contrast) 0.62-0.80. Not every such single pass scores that high: on synthetic tile
+# curves (36 tiles, 25-70 frames, focus gain 5-50, an end layer of 0.3-3 x the gain decaying over 1.5-6 frames)
+# 3 of 600 and 2 of 400 random draws still score 0.42-0.50 at or past the end midpoint and are accepted as a
+# turnaround (two are kept as strict known failures in tests/test_reconstruction_regressions.py); true turnarounds of
+# the same synthetic family score at most 0.12. find_optical_reversal searches every frame without peak evidence and
 # keeps its stricter 0.35.
 BOUNDARY_PEAK_MIRROR_MAX = 0.5
 
@@ -65,13 +69,18 @@ def find_optical_reversal(tiles: np.ndarray, min_arm: int = 4) -> int | None:
     return best
 
 
+def _midpoint_tolerance(n: int) -> float:
+    """Frames within which per-tile turnaround midpoints count as agreeing (n frames in the sweep)."""
+    return max(3.0, 0.06 * n)
+
+
 def _agreeing_median(mids: list[float], n: int, n_tiles: int) -> float | None:
     """Median turnaround of the per-tile midpoints when enough tiles give one and most of them agree."""
     if len(mids) < max(3, 0.25 * n_tiles):
         return None
     mids_a = np.array(mids)
     med = float(np.median(mids_a))
-    if (np.abs(mids_a - med) <= max(3.0, 0.06 * n)).mean() < 0.6:
+    if (np.abs(mids_a - med) <= _midpoint_tolerance(n)).mean() < 0.6:
         return None
     return med
 
@@ -120,7 +129,9 @@ def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5, min_arm: int =
         return best
     med = _agreeing_median(mids_ends, n, lt.shape[1])
     if med is not None and n >= 2 * min_arm + 1:
-        lo = min_arm if sides[0] > sides[1] else max(min_arm, int(med) - 6)
+        # unless start maxima dominate, the midpoint is a lower bound of the turnaround (the return peak lies at or
+        # beyond the last frame): search no further below it than the midpoints themselves may disagree
+        lo = min_arm if sides[0] > sides[1] else max(min_arm, int(np.floor(med - _midpoint_tolerance(n))))
         hi = n - min_arm if sides[1] > sides[0] else min(n - min_arm, int(med) + 7)
         best, best_score = None, BOUNDARY_PEAK_MIRROR_MAX
         for t in range(lo, hi):

@@ -9,7 +9,9 @@ jobs:
   test:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # a guard against a hung job, not a speed target: the same suite takes 21-40+ min on the hosted macOS and
+    # Windows runners depending on the machine (2026-11-27), so 40 cancelled healthy runs
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

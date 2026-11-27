@@ -142,15 +142,39 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         with w.sim_source.lock:
             w.sim_source.sim.tremor_px = 0.6
     t0 = time.time()
-    while len(w.engine.dwell_frames()) < 8 and time.time() - t0 < 30:  # still frames for the dwell buffer
+    # the simulator plays its scripted refocus one step per frame: on a slow machine it is still moving the focus
+    # here, and the dwell buffer (16 frames) holds frames from different focus heights that do not register. Wait
+    # for the script to end, then for 16 more frames so that the buffer holds only frames of the still view.
+    while w.sim_source is not None and w.sim_source.busy() and time.time() - t0 < 60:
         pump(app, 0.2)
-    log.append(f"{'ok' if len(w.engine.dwell_frames()) >= 8 else 'FAIL'}    view still for super-resolution")
-    step("super-resolution", w._run_sr)
+    seq_still = w.engine.snapshot().seq
+    while ((w.engine.snapshot().seq < seq_still + 16 or len(w.engine.dwell_frames()) < 8)
+           and time.time() - t0 < 90):
+        pump(app, 0.2)
+    still = (w.sim_source is None or not w.sim_source.busy()) and len(w.engine.dwell_frames()) >= 8
+    log.append(f"{'ok' if still else 'FAIL'}    view still for super-resolution")
+    sr_job_before = w.sr_job
+
+    def start_sr():
+        # a single frame that is not still empties the dwell buffer (live.py), so on a slow machine the tremor can
+        # take it below 8 frames between the check above and the press; _run_sr then only asks the user to hold
+        # still. Press again, as a user would, until the job has started.
+        t0 = time.time()
+        while w.sr_job is sr_job_before and time.time() - t0 < 30:
+            if len(w.engine.dwell_frames()) >= 8:
+                w._run_sr()
+            if w.sr_job is sr_job_before:
+                pump(app, 0.2)
+        assert w.sr_job is not sr_job_before, "no 8 still frames at a press within 30 s"
+
+    step("super-resolution", start_sr)
     t0 = time.time()
     while getattr(w, "sr_count", 0) == sr_before and time.time() - t0 < 30:
         pump(app, 0.2)
+    sr_state = ("not started" if w.sr_job is sr_job_before
+                else "still running" if w.sr_job.isRunning() else "finished")
     log.append(f"{'ok' if getattr(w, 'sr_count', 0) > sr_before else 'FAIL'}    super-resolution produced a new image"
-               f" ({w.lbl_job.text()[:120]})")
+               f" (job {sr_state}; {w.lbl_job.text()[:120]})")
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
     step("objective change", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
     pump(app, 1)

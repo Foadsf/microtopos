@@ -1442,6 +1442,8 @@ def test_gui_grbl_stage_error_is_reported_not_raised(window, qapp, monkeypatch):
     assert w.stage_driver is None
 
 
+@pytest.mark.characterization("disconnect already closed the port; the test now waits for the disconnect job "
+                               "that closes it instead of racing it (failed on a slow macOS runner)")
 def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, monkeypatch):
     w = window
     fake = FakeGrbl(start=(5.0, 0.0, 2.5))
@@ -1465,8 +1467,9 @@ def test_gui_grbl_stage_connect_jog_zero_with_the_fake_controller(window, qapp, 
     assert "Z +0.00" in w.lbl_stg_pose.text()
     assert w.source.stage_driver is w.stage_driver  # attached to the active source
     w.btn_stg_connect.click()  # disconnect
-    assert _wait(qapp, lambda: w.stage_driver is None)
-    assert w.source.stage_driver is None and not fake.is_open
+    assert w.stage_driver is None and w.source.stage_driver is None  # detached at once, before the port closes
+    assert _wait(qapp, lambda: _stage_idle(w))  # the port is closed by the "Stage disconnect" job
+    assert not fake.is_open
 
 
 def test_gui_stage_z_sweep_captures_stage_z_and_reconstructs_in_um(window, qapp):

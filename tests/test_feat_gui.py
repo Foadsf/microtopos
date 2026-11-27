@@ -575,6 +575,23 @@ def test_lambda_c_tooltip_and_profile_label_state_the_default_cutoff_the_code_ap
     assert f"λc {length / metrology.PROFILE_TRAVERSE_CUTOFFS:.3g} µm" in text  # ... and applies it
 
 
+def test_sdq_is_reported_as_the_dimensionless_rms_gradient(window, qapp, swept):
+    """Sdq (ISO 25178-2) is the root mean square of the gradient, a ratio of lengths: a 45° plane gives exactly 1.
+    The report said unit 'rad' and 'Mean surface slope'."""
+    w = window
+    um = swept["um_per_px"]
+    x, _ = _xy_um(um)
+    r = _install(qapp, w, swept, _nodata(x), form=0)  # z = x in µm: dz/dx = 1, dz/dy = 0
+    assert r["Sdq"] == pytest.approx(1.0, rel=1e-4)
+    lines = [ln.strip() for ln in w.report.toPlainText().splitlines()]
+    k = lines.index("Sdq")
+    value, unit, meaning = lines[k + 1:k + 4]
+    assert float(value) == pytest.approx(1.0, rel=1e-3)
+    assert unit == "", lines[k:k + 4]
+    assert "root mean square gradient" in meaning.lower() and "dimensionless" in meaning
+    assert "rad" not in unit and "mean surface slope" not in meaning.lower()
+
+
 # ---------------------------------------------------------------- session save/load
 
 def test_mosaic_session_save_and_load_roundtrip(window, qapp, tmp_path):

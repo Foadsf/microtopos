@@ -2689,7 +2689,8 @@ class MainWindow(QMainWindow):
             ("Sv", "Sv", zu, "Maximum pit depth", "{:.4g}", "height"),
             ("Sz", "Sz", zu, "Maximum height (Sp + Sv)", "{:.4g}", "height"),
             ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
-            ("Sdq", "Sdq", "rad", "Mean surface slope (gradient magnitude)", "{:.4g}", "height"),
+            ("Sdq", "Sdq", "", "Root mean square gradient (dimensionless, 1 = 45° plane; needs z in µm)", "{:.4g}",
+             "height"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])
         vol_unit = "µm³/µm²" if units.is_um(r["z_unit"]) else f"{zu} (per unit area)"
         body += table("Volume parameters (per unit area, p = 10 %, q = 80 %)", [

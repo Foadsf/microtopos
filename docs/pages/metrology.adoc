@@ -39,6 +39,7 @@ Only valid pixels are used throughout. If fewer than 30 % of the pixels have a r
 | Ssk | – | skewness: negative for a plateau with pits, positive for peaks on a flat
 | Sku | – | kurtosis: 3 for a Gaussian surface, larger for sharp peaks or pits
 3+| *Hybrid*
+| Sdq | – | root mean square gradient: the RMS of the local slope magnitude √((∂z/∂x)² + (∂z/∂y)²), a ratio of lengths and not an angle (a 45° plane has Sdq = 1). Shown only when z is in µm.
 | Sdr | % | developed interfacial area ratio: extra true area over the projected area, from two triangles per pixel cell. Shown only when z is in µm.
 3+| *Functional (material ratio curve)*
 | Sk | z | core height, from the 40 % secant of least slope on the material ratio curve

@@ -538,8 +538,13 @@ def opencv_threads(n: int | None = None) -> None:
 class ReplaySource(FrameSource):
     """Plays back a recording with full transport controls (pause, resume, seek, frame-step, speed, loop)."""
 
-    def __init__(self, folder: str, speed: float = 1.0, loop: bool = False, exhaustive: bool = False):
+    def __init__(self, folder: str, speed: float = 1.0, loop: bool = False, exhaustive: bool = False, *,
+                 clock=time.perf_counter, sleep=time.sleep):
         super().__init__()
+        # The playback schedule reads time and waits only through these two, so a test can run it on a virtual clock
+        # whose result does not depend on how fast the machine is (the app always uses the real ones).
+        self._now = clock
+        self._sleep = sleep
         from .recording import load_manifest
 
         self.manifest = load_manifest(folder)
@@ -654,7 +659,7 @@ class ReplaySource(FrameSource):
                 return False
             self.position = idx
             self._publish(img, ts=ts, step=step)
-            self._last_pub = (time.perf_counter(), ts)
+            self._last_pub = (self._now(), ts)
             return True
 
     def _run(self):
@@ -686,7 +691,7 @@ class ReplaySource(FrameSource):
 
         idx = 0  # the next frame to publish
         prev_seq = None
-        t_anchor = time.perf_counter()  # wall time that corresponds to media time ts_anchor
+        t_anchor = self._now()  # wall time that corresponds to media time ts_anchor
         ts_anchor = self.stamps[0] if self.stamps else 0.0
         anchor_speed = self.speed
         while self._running:
@@ -703,7 +708,7 @@ class ReplaySource(FrameSource):
                 if last is not None and idx < len(self.stamps) and self.stamps[idx] >= last[1]:
                     t_anchor, ts_anchor = last
                 else:
-                    t_anchor = time.perf_counter()
+                    t_anchor = self._now()
                     ts_anchor = self.stamps[min(idx, len(self.stamps) - 1)] if self.stamps else 0.0
             if seek_to is not None:
                 idx = seek_to
@@ -714,13 +719,13 @@ class ReplaySource(FrameSource):
                     if not self._commit(idx, img, ts, 1, seek=True):
                         continue  # a newer seek or step arrived while decoding: serve that one only
                     prev_seq = rseq
-                t_anchor = time.perf_counter()
+                t_anchor = self._now()
                 ts_anchor = ts
                 idx += 1  # the shown frame is not published again on resume
                 continue
             if paused:
-                time.sleep(0.02)
-                t_anchor = time.perf_counter()
+                self._sleep(0.02)
+                t_anchor = self._now()
                 if 0 < idx <= len(self.stamps):
                     ts_anchor = self.stamps[idx - 1]  # resume continues from the frame shown, one interval later
                 continue
@@ -728,16 +733,16 @@ class ReplaySource(FrameSource):
                 if self.loop:
                     idx = 0
                     prev_seq = None
-                    t_anchor = time.perf_counter()
+                    t_anchor = self._now()
                     ts_anchor = self.stamps[0] if self.stamps else 0.0
                     continue
                 self.done = True
-                time.sleep(0.05)
+                self._sleep(0.05)
                 continue
             f, ts, rseq = self.files[idx], self.stamps[idx], self.manifest.seqs[idx]
-            wait = (ts - ts_anchor) / spd - (time.perf_counter() - t_anchor)
+            wait = (ts - ts_anchor) / spd - (self._now() - t_anchor)
             if wait > 0:
-                time.sleep(min(wait, 0.05))
+                self._sleep(min(wait, 0.05))
                 if wait > 0.05:
                     continue
             img = decode(f)
@@ -753,8 +758,8 @@ class ReplaySource(FrameSource):
             # re-anchored on this frame instead of catching up, so playback never runs faster than the set speed
             # (catching up sent the overdue frames back to back: 2.9 ms/frame at a 5 ms interval on macOS CI).
             nxt = self.stamps[idx + 1] if idx + 1 < len(self.stamps) else ts
-            if time.perf_counter() - (t_anchor + (ts - ts_anchor) / spd) > max(nxt - ts, 0.0) / spd:
-                t_anchor, ts_anchor = time.perf_counter(), ts
+            if self._now() - (t_anchor + (ts - ts_anchor) / spd) > max(nxt - ts, 0.0) / spd:
+                t_anchor, ts_anchor = self._now(), ts
             prev_seq = rseq
             self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3) * spd
             idx += 1

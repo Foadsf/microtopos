@@ -254,11 +254,12 @@ def weighted_guided_filter(p: np.ndarray, w: np.ndarray, guide: np.ndarray, radi
 
 
 def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int,
-                 *, backend: str = "cpu") -> np.ndarray:
+                 *, backend: str = "cpu") -> tuple[np.ndarray, set[str]]:
     """Edge-aware smoothing guided by the all-in-focus image, with one round of outlier rejection.
 
     backend selects "cpu" (reference) or "opencl" for the guided filter (CPU fallback if OpenCL is
-    unavailable or fails); see backend.guided_filter_backend.
+    unavailable or fails); see backend.guided_filter_backend. Returns (refined depth, the set of backends the
+    guided filter actually ran on), so the caller can record what ran.
     """
     from .backend import guided_filter_backend
     g = guide.astype(np.float32)
@@ -266,15 +267,17 @@ def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int
     zr = np.nanstd(z) if np.any(np.isfinite(z)) else 1.0
     eps = (0.1) ** 2
     zn = z / (zr + 1e-9)
-    sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
+    sm, used = guided_filter_backend(zn, conf, g, radius, eps, backend)
+    ran = {used}
     resid = np.abs(zn - sm)
     r_ok = resid[np.isfinite(resid)]
     if r_ok.size:
         thr = 4.0 * 1.4826 * np.median(r_ok) + 1e-6
         zn = np.where(resid > thr, np.nan, zn)
-        sm, _ = guided_filter_backend(zn, conf, g, radius, eps, backend)
+        sm, used = guided_filter_backend(zn, conf, g, radius, eps, backend)
+        ran.add(used)
     out = np.where(np.isfinite(zn), sm, np.nan) * (zr + 1e-9)
-    return out.astype(np.float32)
+    return out.astype(np.float32), ran
 
 
 # ---------------------------------------------------------------------------------------------- fusion

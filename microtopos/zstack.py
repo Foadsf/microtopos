@@ -413,7 +413,9 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     fit.z[~support] = np.nan
     fit.confidence[~support] = 0.0
     check_cancel()
-    height = sff.refine_depth(fit.z, fit.confidence, edf_proc, radius=max(2, window // 2), backend=st.backend)
+    height, used = sff.refine_depth(fit.z, fit.confidence, edf_proc, radius=max(2, window // 2),
+                                    backend=st.backend)
+    ran |= used  # the guided filter can run on OpenCL even when the focus measure has no OpenCL version
     height[~support] = np.nan
     done("depth")
 

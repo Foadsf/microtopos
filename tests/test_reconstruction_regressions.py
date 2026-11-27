@@ -219,3 +219,36 @@ def test_reconstructed_colour_edf_of_grey_frames_equals_the_grey_edf():
     for c in range(3):
         assert np.max(np.abs(r["edf_rgb"][..., c].astype(np.float32) - r["edf"])) <= 0.5 + 1e-3
 
+
+# ------------------------------------------------------------------------------------------------ compute backend
+def test_refine_depth_reports_the_backend_its_guided_filter_ran_on():
+    """refine_depth discarded the backend guided_filter_backend returned; it must hand it to the caller."""
+    rng = np.random.default_rng(0)
+    z = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    guide = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    out, ran = sff.refine_depth(z, np.ones_like(z), guide, 3, backend="cpu")
+    assert ran == {"cpu"} and out.shape == z.shape
+
+
+def test_refine_depth_on_opencl_reports_opencl_only(opencl):
+    """Both guided-filter passes (before and after outlier rejection) ran on OpenCL: the set is exactly {'opencl'}."""
+    rng = np.random.default_rng(0)
+    z = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    guide = rng.normal(0, 1, (48, 64)).astype(np.float32)
+    _out, ran = sff.refine_depth(z, np.ones_like(z), guide, 3, backend="opencl")
+    assert ran == {"opencl"}
+
+
+def test_result_backend_names_the_opencl_guided_filter(opencl, monkeypatch):
+    """With OpenCL selected and a focus measure that has no OpenCL version (Vollath F4) the focus maps run on the CPU
+    but the guided filter of the depth refinement runs on OpenCL; the result said 'cpu'. It must name both."""
+    from microtopos import backend
+
+    calls = []
+    real = backend._guided_filter_umat
+    monkeypatch.setattr(backend, "_guided_filter_umat", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    frames, zs = _grey_sweep()
+    r = zstack.reconstruct(frames, zs, OBJ10, 1.0, "um",
+                           settings=zstack.ZSettings(backend="opencl", measure="Vollath F4", workers=1))
+    assert calls, "the guided filter did not run on OpenCL"
+    assert r["backend"] == "cpu+opencl"

@@ -289,3 +289,30 @@ def test_three_point_levelling_with_holes_and_a_spike_removes_an_exact_plane():
     ok = np.isfinite(z)
     ok[18, 82] = False
     assert np.max(np.abs(out[ok])) < 1e-4
+
+
+# ---------------------------------------------------------------- maps with no interior pixels
+
+
+@pytest.mark.parametrize("shape", [(1, 400), (400, 1)])
+def test_one_row_or_column_map_is_analysed(shape):
+    """analyze() worked on a 1 x N map in v0.9.0 and crashed in v0.10 (the summit search allocated (h-2, w-2)).
+    Sa and Sq must be those of the line-fit residual (computed here with numpy polyfit), the summit parameters are
+    withheld (no pixel has a 3 x 3 neighbourhood), and the eligibility says why."""
+    v = np.random.default_rng(0).normal(size=400) + 0.01 * np.arange(400)
+    z = v.reshape(shape).astype(np.float32)
+    r = metrology.analyze(z, np.full(shape, 100, np.float32), 0.5, "µm", 1.0)
+    x = np.arange(400)
+    res = z.ravel().astype(np.float64) - np.polyval(np.polyfit(x, z.ravel().astype(np.float64), 1), x)
+    res -= res.mean()
+    assert r["Sa"] == pytest.approx(np.mean(np.abs(res)), rel=1e-5)
+    assert r["Sq"] == pytest.approx(np.sqrt(np.mean(res ** 2)), rel=1e-5)
+    assert "Sds_per_mm2" not in r and "Ssc_per_um" not in r
+    assert "3 x 3 neighbourhood" in r["eligibility"]["feature"]
+
+
+def test_two_row_map_withholds_summits_instead_of_reporting_zero():
+    """A 2 x N map has no interior pixel, so no pixel can be tested as a summit: Sds is withheld, not 0 /mm²."""
+    z = np.random.default_rng(1).normal(size=(2, 200)).astype(np.float32)
+    assert metrology.summit_parameters(z, 0.5) == {}
+    assert metrology.feature_parameters(z, 0.5) == {}

@@ -561,14 +561,19 @@ def summit_parameters(s: np.ndarray, um_per_px: float, noise_floor: float | None
     Because nothing is pruned, Sds counts every measured noise maximum: on a noisy surface it is far larger
     than Spd (the density of Wolf-pruned significant peaks, see feature_parameters) and it depends on the pixel
     size and on the S-filter. Use Spd for a noise-robust density.
+    {} (withheld) with fewer than 64 valid pixels or no valid pixel with a full valid 3 x 3 neighbourhood (a map
+    of one or two rows or columns has none).
     """
     valid, z = _centred(s)
     if valid.sum() < 64:
         return {}
+    win_valid = _window_valid(valid)
+    if not win_valid.any():  # no pixel has a measured 3 x 3 neighbourhood: summits cannot be tested anywhere
+        return {}
     floor = height_noise_floor(s) if noise_floor is None else noise_floor
     c = z[1:-1, 1:-1]
     nbr_max = _neighbour_max(z)
-    summits = _window_valid(valid) & (c - nbr_max > floor)
+    summits = win_valid & (c - nbr_max > floor)
     area_mm2 = float(valid.sum()) * (um_per_px * 1e-3) ** 2
     out = {"Sds_per_mm2": int(summits.sum()) / area_mm2}
     if summits.any():
@@ -896,7 +901,7 @@ def analyze(height: np.ndarray, edf: np.ndarray, um_per_px: float, z_unit: str, 
                 else summit_parameters(s, um_per_px, noise_floor=floor))
         res.update(feat)
         if not feat:
-            elig["feature"] = "too few valid pixels"
+            elig["feature"] = "too few valid pixels (needs 64, and some with a full valid 3 x 3 neighbourhood)"
         elif features:
             elig["feature"] = "ok"
         else:

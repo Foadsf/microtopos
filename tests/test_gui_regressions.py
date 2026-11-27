@@ -13,7 +13,7 @@ import numpy as np
 import pyqtgraph as pg
 import pytest
 from PySide6.QtCore import QStandardPaths
-from PySide6.QtWidgets import QApplication, QCheckBox
+from PySide6.QtWidgets import QApplication, QCheckBox, QSlider
 
 from microtopos.camera import FrameSource, ReplaySource
 from microtopos.gui import main_window
@@ -261,3 +261,22 @@ def test_a_recreated_player_keeps_speed_and_loop_and_plays(replay_window, qapp):
     w._tick()
     assert w.btn_replay_pause.text() == "‖ Pause"
     assert not w.cmb_res.isVisible()  # a capture size means nothing to a replay
+
+
+def test_seek_slider_follows_steps_while_paused_and_seeks_from_there(replay_window, qapp):
+    """Step +1 pauses; the slider must still show each stepped frame, so a later arrow key (single step on the
+    slider) seeks from the frame on screen, not from where the replay was paused."""
+    w = replay_window(400)
+    src: ReplaySource = w.source
+    assert _wait_for(qapp, lambda: src.position >= 5, timeout=10)
+    w.btn_replay_pause.click()
+    _pump(qapp, 5)
+    paused_at = src.position
+    w._tick()
+    for k in range(1, 7):
+        w.btn_replay_step_f.click()
+        assert _wait_for(qapp, lambda k=k: src.position == paused_at + k, timeout=5)
+        w._tick()
+        assert w.replay_seek.value() == paused_at + k
+    w.replay_seek.triggerAction(QSlider.SliderAction.SliderSingleStepAdd)  # what the Right arrow key does
+    assert _wait_for(qapp, lambda: src.position == paused_at + 7, timeout=5), (paused_at, src.position)

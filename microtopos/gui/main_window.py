@@ -250,6 +250,7 @@ class MainWindow(QMainWindow):
         self.stage_jog_buttons: list = []
         self.level_picking = False       # 3-point level mode armed on the height view
         self.level_pts: list[tuple[float, float]] = []
+        self._replay_shown_pos: int | None = None  # the replay frame the seek slider was last set to by _tick
         self.zst = zstack.ZSettings()    # 3D reconstruction settings edited from the 3D page
         self.sr_result = None
         self.last_mosaic_version = -1
@@ -1426,6 +1427,7 @@ class MainWindow(QMainWindow):
         self.replay_widget.setVisible(isinstance(self.source, ReplaySource))
         if isinstance(self.source, ReplaySource):
             self.replay_seek.setRange(0, max(0, self.source.total_frames - 1))
+            self._replay_shown_pos = None  # a new player: the slider follows it from its first frame
             self._set_replay_transport_enabled(self.source.transport_supported)
             # a new player starts with the speed and looping the controls show, and playing
             self.source.set_loop(self.chk_replay_loop.isChecked())
@@ -1992,9 +1994,14 @@ class MainWindow(QMainWindow):
                               + self._brightness_note(s.preview))
         if isinstance(self.source, ReplaySource):
             self._replay_sync_button()
-            if not self._replay_stopped() and not self.replay_seek.isSliderDown():
+            # The slider follows every frame the player publishes, playing or stepped while paused. It is left alone
+            # while the user drags it and while the position has not changed, so a paused seek that has not been
+            # published yet does not pull the slider back to the frame before it.
+            pos = self.source.position
+            if pos != self._replay_shown_pos and not self.replay_seek.isSliderDown():
+                self._replay_shown_pos = pos
                 self.replay_seek.blockSignals(True)
-                self.replay_seek.setValue(min(self.replay_seek.maximum(), self.source.position))
+                self.replay_seek.setValue(min(self.replay_seek.maximum(), pos))
                 self.replay_seek.blockSignals(False)
         self.lbl_motion.setText(f"shift {s.shift_px:5.2f} px · corr {s.response:4.2f} · sharpness z {s.z_score:+5.1f}"
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))

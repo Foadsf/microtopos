@@ -671,6 +671,34 @@ def test_reset_height_tools_restores_the_reconstructed_height_of_a_reopened_sess
     assert seen and seen[-1][0] == "warning" and "reconstruct again" in seen[-1][1], seen
 
 
+def test_reset_height_tools_after_a_z_rescale_restores_the_height_in_the_new_scale(window, qapp, swept):
+    """Edit the map, then state another Z scale (direction flipped, travel doubled): Reset gives the original height
+    in the new scale. The rescale left the height from before the edit in the old scale, so Reset was refused."""
+    w = window
+    um = swept["um_per_px"]
+    original = _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    h0 = original["height"].copy()
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    _wait_jobs(qapp, w)
+    edited = w.result
+    assert edited["height_tools"]
+    factor = -2.0
+    # the last two lines of the "Set Z..." dialog: the rescale job, then the result replaced on screen
+    w._start_job(main_window.Job(main_window._rescale_job, edited, factor, edited["z_unit"], label="Z"),
+                 lambda res: w._replace_result(edited, res), main=True)
+    _wait_jobs(qapp, w)
+    assert w.result is not edited and w.result["height_tools"]
+    assert w.btn_tools_reset.isEnabled()
+    seen = _toasts(w)
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    r = w.result
+    assert not [t for t in seen if t[0] == "warning"], seen
+    assert "height_tools" not in r
+    np.testing.assert_allclose(r["height"], h0 * factor, rtol=1e-6, atol=1e-6, equal_nan=True)
+    assert np.array_equal(np.isnan(r["height"]), np.isnan(h0))  # the excluded pixels are back
+
+
 def test_height_edit_is_kept_when_the_feature_job_finishes_first(window, qapp, swept, monkeypatch):
     """Tick 'Feature parameters', then exclude an ROI while the feature job runs. The feature job finishing first
     must not make the exclusion disappear while the window says it was applied."""

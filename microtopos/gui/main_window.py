@@ -2889,12 +2889,8 @@ class MainWindow(QMainWindow):
             if lparts:
                 extra.update(height_mosaic=lparts[0][1], height_mosaic_origin=list(lparts[0][2]),
                              height_mosaic_key=lparts[0][0])
-        res = self.result
-        if res is not None and "height_reconstructed" in res and self._tools_reset_blocker(res):
-            # rescaled after the edit: the reconstructed height is in the old scale, so it is not saved as one
-            res = {k: v for k, v in res.items() if k != "height_reconstructed"}
         try:
-            export.save_session(p, res, {"objective": self.obj.name, "objective_spec": self.obj.to_dict(),
+            export.save_session(p, self.result, {"objective": self.obj.name, "objective_spec": self.obj.to_dict(),
                                                  "measure": self.cmb_measure.currentText(),
                                                  "software": f"MicroTopos {__version__}"}, extra)
             self.notify(f"Saved {p}" + ("" if self.result is not None else " (mosaic only)"), "success")
@@ -2937,8 +2933,6 @@ class MainWindow(QMainWindow):
                 loaded_mosaic = ((r["mosaic_image"], tuple(r["mosaic_origin"]), 1), parts, um_loaded)
             else:
                 loaded_mosaic = None
-            if has and "height_reconstructed" in r:  # saved only while it matched these heights (_save_session)
-                r["height_raw_at_edit"] = r.get("height_raw")
             if has:
                 r.setdefault("result_id", uuid.uuid4().hex[:12])
                 r["mosaic_generation"] = -1  # never pinned into the live mosaic
@@ -3120,7 +3114,6 @@ class MainWindow(QMainWindow):
         base = dict(r)
         if "height_reconstructed" not in base:
             base["height_reconstructed"] = r["height"]
-            base["height_raw_at_edit"] = r.get("height_raw")
         base["height"] = new_height
         base["height_tools"] = list(r.get("height_tools", [])) + [rec]
         base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
@@ -3134,11 +3127,9 @@ class MainWindow(QMainWindow):
     def _tools_reset_blocker(r: dict) -> str | None:
         """Why "Reset height tools" cannot restore the reconstructed height of `r`, or None when it can."""
         if "height_reconstructed" not in r:
-            return ("This result does not hold the height from before the edits (a session saved by an older version, "
-                    "or saved after the heights were rescaled); reconstruct again to get the original.")
-        if r.get("height_raw") is not r.get("height_raw_at_edit"):
-            return "The heights were rescaled after they were edited; reconstruct again to get the original."
-        return None
+            return ("This result does not hold the height from before the edits (a session saved by an older version); "
+                    "reconstruct again to get the original.")
+        return None  # a Z rescale scales the reconstructed height with the others (zstack.HEIGHT_ARRAYS)
 
     def _reset_height_tools(self):
         r = self.result
@@ -3148,7 +3139,7 @@ class MainWindow(QMainWindow):
         if why is not None:
             self.notify(why, "warning")
             return
-        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_raw_at_edit", "height_tools")}
+        base = {k: v for k, v in r.items() if k not in ("height_reconstructed", "height_tools")}
         base["height"] = r["height_reconstructed"]
         base["warnings"] = [w for w in r.get("warnings", []) if not w.startswith(self.TOOL_WARNING)]
         job = Job(_metrology_job, base, self.sp_form.value(), self._lam_s(resolve_result(r)), self.sp_lc.value(),

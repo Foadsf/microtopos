@@ -490,14 +490,17 @@ def reconstruct(frames: list[np.ndarray], z_labels: np.ndarray | None, objective
     }
 
 
-HEIGHT_ARRAYS = ("height", "height_raw")
+# every array of heights a result can hold, scaled together by rescale_heights; height_reconstructed (the height before
+# the GUI's height tools) is among them, so "Reset height tools" restores it in the new scale
+HEIGHT_ARRAYS = ("height", "height_raw", "height_reconstructed")
 
 
 def rescale_heights(result: dict, factor: float, new_unit: str, settings: ZSettings | None = None) -> dict:
     """A new result with every height scaled by `factor` (sign included) and metrology recomputed.
 
     Used when the user states the travel or direction of a hand sweep after it was reconstructed. All height
-    operators (form removal, Gaussian filters) are linear, so scaling the fitted depth is exact.
+    operators (form removal, Gaussian filters, 3-point levelling, exclusion masks) are linear or commute with a
+    scale, so scaling the fitted depth, and the depth from before the height tools, is exact.
     """
     if not np.isfinite(factor) or factor == 0:
         raise ValueError("scale factor must be finite and non-zero")

@@ -215,6 +215,8 @@ def test_step_height_on_parallel_one_pixel_regions_is_refused(ra, rb):
         metrology.step_height_regions(z, ra, rb)
 
 
+@pytest.mark.characterization("guards the new rank test against refusing an identifiable design; main already "
+                              "measured this one correctly")
 def test_step_height_on_a_row_and_a_column_is_exact():
     """A one-row region and a one-column region are not parallel, so tilt and step are separable and the exact step
     of a tilted ideal terrace is recovered: the rank test must not refuse a design that is identifiable."""

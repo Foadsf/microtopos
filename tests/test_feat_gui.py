@@ -6,6 +6,7 @@ Runs offscreen with isolated Qt settings, like tests/test_gui_layout.py.
 
 import os
 import re
+import threading
 import time
 from unittest import mock
 
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from microtopos import export, metrology, zstack
 from microtopos import mosaic as mosaic_mod
 from microtopos.camera import ReplaySource
+from microtopos.gui import main_window
 from microtopos.gui.main_window import MainWindow
 from microtopos.gui.theme import DARK
 from microtopos.gui.widgets import ImagePanel
@@ -573,6 +575,117 @@ def test_lambda_c_tooltip_and_profile_label_state_the_default_cutoff_the_code_ap
     text = w.prof_label.text()
     assert rule in text, text  # the label states the same rule as the tooltip ...
     assert f"λc {length / metrology.PROFILE_TRAVERSE_CUTOFFS:.3g} µm" in text  # ... and applies it
+
+
+def _session_file(w, tmp_path, name="map.npz"):
+    path = tmp_path / name
+    export.save_session(path, w.result, {})
+    return path
+
+
+def _open(app, w, path):
+    with mock.patch.object(QFileDialog, "getOpenFileName", return_value=(str(path), "Session (*.npz)")):
+        w._load_session()
+    _pump(app, 5)
+
+
+def test_level_points_picked_on_one_map_never_level_the_next_one(window, qapp, swept, tmp_path):
+    """Open session and a history pick replace the displayed map like a new reconstruction does: two points picked
+    on the previous map are dropped, so one click on the new map does not level it."""
+    w = window
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _nodata(_relief(um)))
+    path = _session_file(w, tmp_path)
+    for replace in ("open session", "history pick"):
+        _open(qapp, w, path)
+        shown = w.result
+        h0 = shown["height"].copy()
+        w.btn_level3.setChecked(True)
+        w.p_height.clicked_px.emit(100.0, 60.0)
+        w.p_height.clicked_px.emit(500.0, 60.0)
+        _pump(qapp, 3)
+        if replace == "open session":
+            _open(qapp, w, path)
+        else:
+            w.cmb_hist.setCurrentIndex(next(i for i, h in enumerate(w.history) if h is not shown))
+            _pump(qapp, 3)
+        assert w.result is not shown
+        assert w.btn_level3.text() == "Level: pick 3 points" and not w.btn_level3.isChecked()
+        before = w.result["height"].copy()
+        w.p_height.clicked_px.emit(300.0, 300.0)  # one click on the new map
+        _pump(qapp, 3)
+        _wait_jobs(qapp, w)
+        assert "height_tools" not in w.result, replace
+        assert np.array_equal(w.result["height"], before, equal_nan=True)
+        assert np.array_equal(shown["height"], h0, equal_nan=True)
+
+
+def _toasts(w):
+    seen = []
+    show = w.toast.show_message
+    w.toast.show_message = lambda text, kind="info", **k: (seen.append((kind, text)), show(text, kind, **k))
+    return seen
+
+
+def _exclude(app, w, um, rect):
+    x0, y0, x1, y1 = rect
+    w.btn_mask.click()
+    w.mask_roi.setPos((x0 * um, y0 * um))
+    w.mask_roi.setSize(((x1 - x0) * um, (y1 - y0) * um))
+    w.btn_mask.click()
+
+
+def test_height_edit_is_kept_when_the_feature_job_finishes_first(window, qapp, swept, monkeypatch):
+    """Tick 'Feature parameters', then exclude an ROI while the feature job runs. The feature job finishing first
+    must not make the exclusion disappear while the window says it was applied."""
+    w = window
+    um = swept["um_per_px"]
+    z = _nodata(_hill_map(um))
+    _install(qapp, w, swept, z, form=0)
+    real = main_window._metrology_job
+    w.chk_topo_grains.setChecked(True)  # starts the feature job for the displayed result
+    features = [j for j in w.jobs if getattr(j, "feature_for", None) is not None]
+    assert features
+
+    def after_features(*a, **k):  # the metrology job finishes after the feature job has delivered its result
+        for j in features:
+            j.wait()
+        return real(*a, **k)
+
+    monkeypatch.setattr(main_window, "_metrology_job", after_features)
+    seen = _toasts(w)
+    rect = (200, 100, 350, 180)
+    _exclude(qapp, w, um, rect)
+    _wait_jobs(qapp, w)
+    r = w.result
+    expected_nan = np.isnan(z)
+    expected_nan[100:180, 200:350] = True
+    assert np.array_equal(np.isnan(r["height"]), expected_nan)
+    assert r["height_tools"] == [{"tool": "exclude", "rect_px": list(rect)}]
+    assert any(k == "success" and "excluded" in t for k, t in seen), seen
+    assert "excluded" in w.report.toPlainText()
+    assert r.get("features_done")  # computed again, for the edited map
+
+
+def test_a_metrology_result_for_a_closed_map_is_not_reported_as_applied(window, qapp, swept, tmp_path, monkeypatch):
+    """An exclusion whose map was closed (pushed out of the history by opened sessions) while its metrology ran is
+    not installed anywhere, and the window says so instead of reporting success."""
+    w = window
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    path = _session_file(w, tmp_path)
+    gate = threading.Event()
+    real = main_window._metrology_job
+    monkeypatch.setattr(main_window, "_metrology_job", lambda *a, **k: (gate.wait(30), real(*a, **k))[1])
+    seen = _toasts(w)
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    for _ in range(w.HISTORY):
+        _open(qapp, w, path)
+    gate.set()
+    _wait_jobs(qapp, w)
+    assert not any("height_tools" in h for h in w.history) and "height_tools" not in w.result
+    assert seen[-1][0] == "warning" and "Not applied" in seen[-1][1], seen
+    assert not any(k == "success" and "excluded" in t for k, t in seen), seen
 
 
 def test_sdq_is_reported_as_the_dimensionless_rms_gradient(window, qapp, swept):

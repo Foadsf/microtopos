@@ -1794,11 +1794,10 @@ class MainWindow(QMainWindow):
         new["warnings"] = [w for w in new.get("warnings", []) if "Sweep direction unknown" not in w] + (
             ["Sweep direction unknown: heights are relative focus progression and the relief may be inverted."]
             if new.get("z_orientation") == "unknown" else [])
-        for i, h in enumerate(self.history):
-            if h is old:
-                self.history[i] = new
-        if self.result is old:
-            self.result = new
+        if not self._supersede(old, new):
+            self.notify(f"Z not applied: {old.get('label') or 'the result'} was closed while it was rescaled.",
+                        "warning")
+            return
         rid = new.get("result_id")
         if rid and new.get("mosaic_generation") == self.engine.mosaic_generation and new.get("preview_shape"):
             self.engine.remove_height_patch(rid)
@@ -2306,10 +2305,8 @@ class MainWindow(QMainWindow):
                         r["sigma_inst_lt_Sq_over_10"] = bool(rep["sigma_inst"] < r["Sq"] / 10)
             else:
                 r["warnings"] = r.get("warnings", []) + [f"Repeatability not computed: {why}."]
-        # height tools act on the displayed map: points and ROIs placed on the previous map must not carry over
-        self._disarm_tools()
-        self.level_pts = []
-        self.prev_result, self.result = self.result, r
+        self.prev_result = self.result
+        self._set_result(r)
         self._result_t = time.perf_counter()
         self._remember(r)
         self.last_ignored = None
@@ -2353,8 +2350,36 @@ class MainWindow(QMainWindow):
 
     def _pick_history(self, i):
         if 0 <= i < len(self.history) and self.history[i] is not self.result:
-            self.result = self.history[i]
+            self._set_result(self.history[i])
             self._show_result()
+
+    def _set_result(self, r: dict):
+        """Make `r` the displayed result: the one step every path that replaces the result goes through.
+
+        Height tools act on the displayed map: when its height is not the one on screen (a new reconstruction, an
+        opened session, another history entry, an edited or rescaled height), armed tools and picked levelling
+        points were placed on the previous map and must not carry over. A recompute that keeps the height (a
+        filter change) keeps them."""
+        cur = self.result
+        if cur is None or cur.get("height") is not r.get("height"):
+            self._disarm_tools()
+            self.level_pts = []
+        self.result = r
+
+    def _supersede(self, old: dict, new: dict) -> bool:
+        """Put `new` in place of `old` in the history and, when `old` is displayed, on screen. Results are found by
+        identity; the jobs that replace a result (metrology, Z rescale) run one at a time, and the feature job merges
+        into its result instead of replacing it, so `old` is still there unless it was closed meanwhile. Returns
+        False, installing nothing, when it is no longer open."""
+        found = False
+        for i, h in enumerate(self.history):
+            if h is old:
+                self.history[i] = new
+                found = True
+        if self.result is old:
+            self._set_result(new)
+            found = True
+        return found
 
     def _recompute(self):
         r = self.result
@@ -2371,15 +2396,16 @@ class MainWindow(QMainWindow):
             new.pop(k, None)
         new["warnings"] = [x for x in new.get("warnings", []) if not metrology.is_metrology_warning(x)] + m.pop("warnings")
         new.update(m)
-        for i, h in enumerate(self.history):
-            if h is r:
-                self.history[i] = new
-        if self.result is r:
-            self.result = new
+        if not self._supersede(r, new):
+            self.lbl_job.setText("Metrology result discarded.")
+            self.notify(f"Not applied: {r.get('label') or 'the result'} was closed while its metrology was "
+                        "recomputed.", "warning")
+            return
         self.prog.setValue(1000)
         self.lbl_job.setText("Metrology recomputed.")
         self._show_result()
-        self.notify(message, "success")
+        self.notify(message if self.result is new else
+                    f"{message} (to {new.get('label') or 'a result'} in the history, not the one displayed)", "success")
 
     def _ensure_features(self):
         """Start the on-demand feature job for the current result when the box is ticked and they are missing."""
@@ -2395,17 +2421,13 @@ class MainWindow(QMainWindow):
     def _on_features(self, r, m):
         if not any(h is r for h in self.history) and self.result is not r:
             return  # the result was replaced (height tool, recompute) while this ran: its features are stale
-        new = dict(r)
-        new.update(m)
-        new["features_done"] = True
-        for i, h in enumerate(self.history):
-            if h is r:
-                self.history[i] = new
-        if self.result is r:
-            self.result = new
-        el = dict(new.get("eligibility", {}))
-        el["feature"] = "ok"
-        new["eligibility"] = el
+        # Merged INTO r, not into a copy: a metrology or Z job started from r finds it by identity when it finishes
+        # (_supersede). Replacing r here made such a job, finishing second, drop its height edit or filter change.
+        # The features are kept only by results with this height and filter: _on_recomputed drops them
+        # (metrology.PARAMETER_KEYS) and _ensure_features computes them again for the new result.
+        r.update(m)
+        r["features_done"] = True
+        r["eligibility"] = {**r.get("eligibility", {}), "feature": "ok"}
         self.lbl_job.setText("Feature parameters computed.")
         self._show_result()
 
@@ -2925,7 +2947,7 @@ class MainWindow(QMainWindow):
                 self.loaded_mosaic = loaded_mosaic
                 self.last_mosaic_version = -1
             if has:
-                self.result = r
+                self._set_result(r)
                 self._remember(r)
                 self._show_result()
                 self.tabs.setCurrentIndex(3)

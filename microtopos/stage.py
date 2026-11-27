@@ -171,6 +171,14 @@ class _GarbledStatus(ValueError):
 
 
 _ERROR_RE = re.compile(r"^error:\s*(\d+)")
+_REPORT_INCHES_RE = re.compile(r"^\$13\s*=\s*(\d+)")
+MM_PER_INCH = 25.4
+
+# Grbl 1.1 machine states ("Real-time Status Reports"): a commanded move has finished only in Idle. Run/Jog/Home move;
+# Hold (feed hold, Hold:1 still decelerating) and Door (safety door) suspend the motion, which resumes on cycle start.
+# Check ($C, G-code is parsed but not executed) and Sleep never carry out a move.
+_MOVING_STATES = ("Run", "Jog", "Home")
+_SUSPENDED_STATES = ("Hold", "Door")
 _ALARM_RE = re.compile(r"^ALARM:\s*(\d+)")
 
 
@@ -211,7 +219,9 @@ class GrblStageDriver(StageDriver):
     VERIFIED AGAINST A SIMULATED CONTROLLER ONLY (tests/test_feat_hardware.py models the Grbl 1.1 serial
     interface), NOT ON HARDWARE. Grbl-compatible firmwares other than 1.1 are untested.
 
-    Coordinates on the wire are millimetres (G21); `um_per_unit` converts them to micrometres (default 1000).
+    Commands are millimetres (G21); `um_per_unit` converts them to micrometres (default 1000). G20/G21 do not set
+    the units of status reports: `$13` does ("report in inches"), so it is read from `$$` at connect and inch
+    reports are converted to mm; a controller that does not list `$13` is refused (its report unit is unknown).
     The driver owns its coordinate frame: it keeps a software origin in *machine* coordinates, moves with
     `G53` (machine coordinates) and reads positions as machine positions, so the result does not depend on the
     controller's work offsets (G92, G10, G54..) nor on whether `$10` makes it report MPos or WPos. When only
@@ -219,7 +229,9 @@ class GrblStageDriver(StageDriver):
     periodically). `zero()` moves the software origin; it does not touch the controller's work offsets.
 
     Every controller failure (`error:N`, `ALARM:N`, Alarm state, no answer, an unparsable report) raises
-    `StageError`; a position is only ever returned after the controller confirmed it.
+    `StageError`; a position is only ever returned after the controller confirmed it. A move has finished only
+    when the controller is Idle: through a feed hold or an open door `move_to` keeps waiting (until its deadline),
+    and in Check mode or Sleep, where the move is never carried out, it raises `StageError`.
     """
 
     _STATUS_RETRIES = 3
@@ -238,6 +250,7 @@ class GrblStageDriver(StageDriver):
         self._lock = threading.Lock()  # one conversation at a time on the single serial port
         self._origin_mm = (0.0, 0.0, 0.0)  # machine position of this driver's zero
         self._wco_mm: tuple | None = None  # last WCO the controller reported
+        self._report_mm = 1.0  # mm per status-report unit: 1, or 25.4 when the controller reports inches ($13=1)
 
     # -- units: the one place micrometres and controller units meet
     def _to_um(self, mm: float) -> float:
@@ -262,12 +275,22 @@ class GrblStageDriver(StageDriver):
                 self._ser.reset_input_buffer()
                 self._cmd("G21")  # metric (mm)
                 self._cmd("G90")  # absolute positioning
+                self._report_mm = self._read_report_unit()
                 self._origin_mm = (0.0, 0.0, 0.0)
                 self._wco_mm = None
                 self._machine_status()  # fail now, not on the first move, if the controller is not answering
             except Exception:
                 self._drop_port()
                 raise
+
+    def _read_report_unit(self) -> float:
+        """mm per status-report unit, from `$13` in the `$$` settings dump (callers hold self._lock)."""
+        for line in self._cmd("$$"):
+            m = _REPORT_INCHES_RE.match(line)
+            if m:
+                return MM_PER_INCH if int(m.group(1)) else 1.0
+        raise StageError("the controller did not list $13 (report units) in $$; its positions cannot be read in a "
+                         "known unit")
 
     def _drop_port(self) -> None:
         ser, self._ser = self._ser, None
@@ -338,29 +361,34 @@ class GrblStageDriver(StageDriver):
                 raise StageError(f"no status report within {self.timeout:g} s")
         raise StageError(f"garbled status report ({last})")
 
-    def _machine_status(self) -> tuple[bool, tuple]:
-        """(moving, machine position in mm), from MPos, or from WPos + WCO."""
+    def _machine_status(self) -> tuple[str, tuple]:
+        """(machine state without its sub-state, machine position in mm), from MPos, or from WPos + WCO."""
         for _ in range(self._WCO_POLLS):
             state, mpos, wpos, wco = self._status()
+            k = self._report_mm
+            mpos, wpos, wco = (None if v is None else tuple(c * k for c in v) for v in (mpos, wpos, wco))
             if wco is not None:
                 self._wco_mm = wco
             base = state.split(":")[0]
             if base == "Alarm":
                 raise StageError("controller is in the Alarm state (clear it with $X or homing)")
-            moving = base in ("Run", "Jog", "Home")
             if mpos is not None:
-                return moving, mpos
+                return base, mpos
             if wpos is not None and self._wco_mm is not None:
-                return moving, tuple(w + o for w, o in zip(wpos, self._wco_mm, strict=True))
+                return base, tuple(w + o for w, o in zip(wpos, self._wco_mm, strict=True))
             if wpos is None:
                 raise StageError("status report carries neither MPos nor WPos (check $10)")
             time.sleep(0.01)  # WPos without WCO yet: the next report includes it
         raise StageError("controller reports WPos but never sent WCO; set $10=1 to report MPos")
 
     def _pose_locked(self) -> StagePose:
-        moving, m = self._machine_status()
+        return self._pose_and_state_locked()[0]
+
+    def _pose_and_state_locked(self) -> tuple[StagePose, str]:
+        state, m = self._machine_status()
         o = self._origin_mm
-        return StagePose(*(self._to_um(m[i] - o[i]) for i in range(3)), moving, True)
+        # anything but Idle is busy: a suspended move (Hold, Door) has not arrived either
+        return StagePose(*(self._to_um(m[i] - o[i]) for i in range(3)), state != "Idle", True), state
 
     def pose(self) -> StagePose:
         with self._lock:
@@ -390,11 +418,15 @@ class GrblStageDriver(StageDriver):
         while True:
             with self._lock:
                 self._require_port()  # closed from another thread while waiting
-                pose = self._pose_locked()
-            if not pose.moving:
+                pose, state = self._pose_and_state_locked()
+            if state == "Idle":
                 return pose
+            if state not in _MOVING_STATES + _SUSPENDED_STATES:
+                raise StageError(f"the controller is in the {state} state: the move is not carried out")
             if time.perf_counter() > deadline:
-                raise StageError("the stage did not finish the move in time")
+                held = f" (the controller is in {state}: resume it with cycle start)" if state in _SUSPENDED_STATES \
+                    else ""
+                raise StageError(f"the stage did not finish the move in time{held}")
             time.sleep(0.01)
 
     def zero(self) -> StagePose:

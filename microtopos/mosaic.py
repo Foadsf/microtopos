@@ -758,7 +758,10 @@ class Mosaic:
         """Join cur's area to another area that cur's view overlaps; returns the bridge edge or None.
 
         Only the BRIDGE_CANDIDATES best-ranked keyframes of other areas are matched. On success cur's whole area
-        moves into the other area's coordinates and takes its id."""
+        is moved into the other area's coordinates by the measured rigid transform and takes its id (_join_area).
+        With track_rotation the match also measures how cur's area is turned against the other one (an area
+        started without a connection defines its own orientation, _new_area), and that rotation is applied too;
+        without it a turned area's keyframes would land about angle x distance from their true position."""
         cur = self.keyframes[j]
         if cur.bp is None:
             return None
@@ -773,26 +776,94 @@ class Mosaic:
             dx, dy, q = self._match(k.image, k.bp, cur.image, cur.bp, win)
             if q < max(self.LOOP_NCC, 0.72):
                 continue
-            ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k)
-            shift_x = (k.x + ex) - cur.x
-            shift_y = (k.y + ey) - cur.y
-            old_area, target_area = cur.area, k.area
-            for kf2 in self.keyframes:
-                if kf2.area == old_area:
-                    kf2.x += shift_x
-                    kf2.y += shift_y
-                    kf2.area = target_area
-            for p in self.patches:
-                if p.kf is not None and 0 <= p.kf < len(self.keyframes) and self.keyframes[p.kf].area == target_area:
-                    p.x = self.keyframes[p.kf].x + p.rel[0]
-                    p.y = self.keyframes[p.kf].y + p.rel[1]
-            self._shift_tracker(shift_x, shift_y)
-            self.current_area = target_area
-            self.areas = len({kf.area for kf in self.keyframes})
+            # (dx, dy) is the shift of the view centre (of the derotated pair, with track_rotation), and _last_rot
+            # the rotation of cur's view, i.e. of its area's orientation, against k's area (angle_deg convention)
+            rot = self._last_rot if self.track_rotation else 0.0
+            ex, ey = -dx, -dy  # measured position of j (cur) relative to i (k), in k's area's axes
+            self._join_area(cur.area, k.area, (cur.x, cur.y), (k.x + ex, k.y + ey), rot, cur.image.shape)
             self.last_event = "areas_joined"
-            self._rebuild_canvas()
             return (i, j, ex, ey, 1.0)
         return None
+
+    def _join_area(self, old: int, target: int, src: tuple, dst: tuple, rot: float, shape: tuple) -> None:
+        """Move area `old` into area `target`'s coordinates: the rigid transform that takes a view of size `shape`
+        at top-left `src` (old coordinates) to `dst` (target coordinates), turned by `rot` (angle_deg convention:
+        old's axes are those of a view at angle `rot` in target's). Applied to the area's keyframes (pose, stored
+        image, angle), the edges between them, its height patches, and the tracker (the camera is in that area).
+
+        The canvas is updated incrementally (_move_keyframes): only the moved keyframes, the keyframes whose
+        yield masks refer to them, and the moved patches are re-splatted, not the whole canvas, so the time the
+        caller holds the engine lock grows with the joined area, not with the mosaic."""
+        h, w = shape
+        c0 = (src[0] + (w - 1) / 2.0, src[1] + (h - 1) / 2.0)  # the joining view's centre, old coordinates
+        c1 = (dst[0] + (w - 1) / 2.0, dst[1] + (h - 1) / 2.0)  # ... and target coordinates
+
+        def place(x: float, y: float, hh: int, ww: int) -> tuple[float, float]:
+            """Top-left of an hh x ww rectangle at top-left (x, y), old -> target coordinates (about its centre)."""
+            vx, vy = self._to_mosaic(x + (ww - 1) / 2.0 - c0[0], y + (hh - 1) / 2.0 - c0[1], rot)
+            return c1[0] + vx - (ww - 1) / 2.0, c1[1] + vy - (hh - 1) / 2.0
+
+        turn = rot != 0.0  # _verified leaves 0 below ROT_MIN_DEG: nothing is resampled for an unturned area
+        members = [idx for idx, k in enumerate(self.keyframes) if k.area == old]
+        member_set = set(members)
+        self._move_keyframes({idx: place(self.keyframes[idx].x, self.keyframes[idx].y,
+                                         *self.keyframes[idx].image.shape) for idx in members},
+                             {idx: self._turned_views(self.keyframes[idx], rot) for idx in members} if turn else None)
+        for idx in members:
+            self.keyframes[idx].area = target
+            self.keyframes[idx].angle_deg += rot
+        if turn:  # relative positions measured inside the area are in its old axes
+            self.edges = [(i, j, *self._to_mosaic(ex, ey, rot), wt) if i in member_set and j in member_set
+                          else (i, j, ex, ey, wt) for i, j, ex, ey, wt in self.edges]
+        for p in self.patches:  # height patches follow their keyframe, turned with it
+            if p.kf is None or p.kf not in member_set:
+                continue
+            self._splat(p.edf, p.x, p.y, weight=-4.0)
+            if turn:
+                p.edf, p.height = _turn(p.edf, -rot), _turn(p.height, -rot, invalid=np.nan)
+                p.rel = self._to_mosaic(p.rel[0], p.rel[1], rot)
+            k = self.keyframes[p.kf]
+            p.x, p.y = k.x + p.rel[0], k.y + p.rel[1]
+            self._splat(p.edf, p.x, p.y, weight=4.0)
+        self._solve_offsets()  # the joined patches may now overlap others of their z_key: level them together
+        # the tracker: the camera is at the joining view, in the old area's coordinates and orientation
+        self.x, self.y = place(self.x, self.y, h, w)
+        self.prev_xy = place(*self.prev_xy, h, w)
+        if self.velocity is not None:
+            self.velocity = self._to_mosaic(*self.velocity, rot)
+        if self.last_good is not None:
+            gf, gb, gxy, gang = self.last_good
+            self.last_good = (gf, gb, place(*gxy, h, w), gang + rot)
+        self.angle_deg += rot
+        self.current_area = target
+        self.areas = len({kf.area for kf in self.keyframes})
+
+    def _turned_views(self, k: Keyframe, rot: float) -> tuple:
+        """(image, band-pass, rgb) of keyframe k turned from its area's orientation into one turned by -rot, the
+        same resampling _add_keyframe applies to a rotated view."""
+        f = _turn(k.image.astype(np.float32), -rot)
+        rgb = None if k.rgb is None else np.clip(_turn(k.rgb.astype(np.float32), -rot) + 0.5, 0, 255).astype(np.uint8)
+        return np.clip(f + 0.5, 0, 255).astype(np.uint8), self._bp(f).astype(np.float16), rgb
+
+    def _move_keyframes(self, poses: dict, views: dict | None = None) -> None:
+        """Give keyframes new positions (and, with `views`, new (image, band-pass, rgb)), keeping the canvas equal
+        to a rebuild: every keyframe whose contribution changes (the moved ones and those whose yield masks refer
+        to them) is un-splatted with what it splatted, updated, and splatted again."""
+        moved = set(poses)
+        resplat = moved | {idx for idx, k in enumerate(self.keyframes) if any(j in moved for j, _ in k.yields)}
+        # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
+        for idx, (x, y) in poses.items():
+            k = self.keyframes[idx]
+            k.x, k.y = float(x), float(y)
+            if views is not None:
+                k.image, k.bp, k.rgb = views[idx]
+                k.spectrum = None
+        for idx in resplat:
+            k = self.keyframes[idx]
+            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
 
     # Robust pose graph (Mosaic._relax). Residual scale floor: an edge is only down-weighted when it disagrees with
     # the graph by more than registration error can explain, even when the graph is so consistent that the measured
@@ -853,18 +924,8 @@ class Mosaic:
         if corr < 0.5:
             return
         dxc, dyc = sx[self.ref] - self.keyframes[self.ref].x, sy[self.ref] - self.keyframes[self.ref].y
-        moved_kfs = {idx for idx, (k, x, y) in enumerate(zip(self.keyframes, sx, sy)) if math.hypot(k.x - x, k.y - y) > 0.5}
-        resplat = moved_kfs | {idx for idx, k in enumerate(self.keyframes) if any(j in moved_kfs for j, _ in k.yields)}
-        # un-splat all affected keyframes BEFORE updating any coordinates so every mask matches what was splatted
-        for idx in resplat:
-            k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, weight=-1.0, mask=self._yield_mask(k), rgb=k.rgb)
-        for idx in moved_kfs:
-            k = self.keyframes[idx]
-            k.x, k.y = float(sx[idx]), float(sy[idx])
-        for idx in resplat:
-            k = self.keyframes[idx]
-            self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
+        self._move_keyframes({idx: (sx[idx], sy[idx]) for idx, k in enumerate(self.keyframes)
+                              if math.hypot(k.x - sx[idx], k.y - sy[idx]) > 0.5})
         moved = False
         for p in self.patches:  # height patches follow the keyframe they are attached to
             if p.kf is None or p.kf >= len(self.keyframes):
@@ -881,8 +942,8 @@ class Mosaic:
         self._shift_tracker(dxc, dyc)
 
     def _shift_tracker(self, dx: float, dy: float) -> None:
-        """The graph moved under the camera (relaxation, or a bridge that joined two areas): move every position the
-        tracker holds by the same amount. `last_good` is the reference for re-acquiring a lost track; left behind,
+        """The graph moved under the camera (relaxation): move every position the tracker holds by the same amount
+        (a join moves them with its rigid transform, _join_area). `last_good` is the reference for re-acquiring a lost track; left behind,
         the first frame after a loss would be placed where the graph used to be."""
         self.x, self.y = self.x + dx, self.y + dy
         self.prev_xy = (self.prev_xy[0] + dx, self.prev_xy[1] + dy)
@@ -1288,6 +1349,17 @@ def _feather(h: int, w: int) -> np.ndarray:
             _FEATHER.clear()
         _FEATHER[(h, w)] = f
     return f
+
+
+def _turn(img: np.ndarray, deg: float, invalid: float | None = None) -> np.ndarray:
+    """img turned about its centre by deg (cv2.getRotationMatrix2D convention), same size. Corners take the
+    reflected border (as for derotated keyframes) or, with `invalid`, that value (NaN for heights)."""
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0), deg, 1.0)
+    if invalid is None:
+        return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=invalid)
 
 
 def preview_factor(tiles: dict, tile: int, max_px: int) -> int:

@@ -8,6 +8,9 @@ races are forced with gates and monkeypatched hooks, never with timing."""
 
 from __future__ import annotations
 
+import copy
+import threading
+
 import cv2
 import numpy as np
 
@@ -15,8 +18,8 @@ from microtopos import objectives
 from microtopos.calibration import CalibrationStore
 from microtopos.camera import SimulatorSource
 from microtopos.kinematics import Override
-from microtopos.live import LiveEngine
-from microtopos.mosaic import Mosaic
+from microtopos.live import LiveEngine, _crop_rgb_to_view
+from microtopos.mosaic import Mosaic, preview_factor, render_tiles, render_tiles_rgb
 
 VH, VW = 240, 320
 OBJ = objectives.resolve("10x / 0.25", objset=objectives.default_set())
@@ -106,3 +109,83 @@ def test_a_sweep_spanning_an_open_session_carries_the_generation_its_pose_belong
     eng.flush()
     assert len(caps) == 1
     assert caps[0].mosaic_generation == gen_at_start != eng.mosaic_generation
+
+
+# ------------------------------------------------------------------------------------------ R3 torn renders
+
+
+def _gate_render(monkeypatch):
+    """Make live.render_tiles stop until released; returns (entered, release). The canvas is taken under the
+    engine lock before render_tiles is called, so while it waits the engine thread is free to splat."""
+    from microtopos import live
+
+    real = live.render_tiles
+    entered, release = threading.Event(), threading.Event()
+
+    def gated(*a, **k):
+        entered.set()
+        assert release.wait(10)
+        return real(*a, **k)
+
+    monkeypatch.setattr(live, "render_tiles", gated)
+    return entered, release
+
+
+def _same_image(a: np.ndarray, b: np.ndarray) -> bool:
+    return a.shape == b.shape and np.array_equal(a, b, equal_nan=True)
+
+
+def _grow_until_new_tile(eng: LiveEngine, s: _Stage, cx: float, rgb: bool = False) -> None:
+    """Engine thread: frames under the lock until one adds a keyframe that reaches into a tile not yet on the canvas
+    (and so also changes tiles that existed when the GUI took its canvas)."""
+    m = eng.mosaic
+    n = len(m.tiles)
+    with eng._lock:
+        while len(m.tiles) == n:
+            s.at(cx, rgb=rgb)
+            cx += 20
+
+
+def test_saving_renders_one_state_of_the_mosaic_while_the_engine_keeps_splatting(monkeypatch):
+    """mosaic_full (Save session) takes the canvas under the lock and renders it after releasing it. The engine
+    thread splats a keyframe in between that straddles a tile boundary; the saved image must be the mosaic of one
+    state (the one at the time of the call), not old tiles with new content in some of them."""
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    s = _Stage(_world(4, 800, 3000), m=eng.mosaic, y=100)
+    s.pan(100, 400)
+    m = eng.mosaic
+    before = render_tiles(copy.deepcopy(m.tiles), m.tile, 1)[0]
+    entered, release = _gate_render(monkeypatch)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("img", eng.mosaic_full()[0][0]))
+    t.start()
+    assert entered.wait(10)
+    _grow_until_new_tile(eng, s, 400.0)
+    after = render_tiles(copy.deepcopy(m.tiles), m.tile, 1)[0]
+    release.set()
+    t.join(10)
+    assert not _same_image(before, after)  # the engine really changed the canvas in between
+    assert _same_image(out["img"], before)
+
+
+def test_the_gui_render_of_the_view_shows_one_state_in_grey_and_colour(monkeypatch):
+    """_render_now (GUI thread: Open session, tests) renders the grey and the colour view after releasing the lock;
+    both must show the canvas of the moment the call took it, while the engine thread splats a new keyframe."""
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.color_mode = True
+    s = _Stage(_world(4, 800, 3000), m=eng.mosaic, y=100)
+    s.pan(100, 400, rgb=True)
+    m = eng.mosaic
+    tiles0, rgb0 = copy.deepcopy(m.tiles), copy.deepcopy(m.tiles_rgb)
+    view0 = render_tiles(tiles0, m.tile, preview_factor(tiles0, m.tile, 1600))
+    rgb_expect = _crop_rgb_to_view(render_tiles_rgb(rgb0, m.tile, view0[2]), rgb0, m.tile, view0)
+    entered, release = _gate_render(monkeypatch)
+    t = threading.Thread(target=eng._render_now)
+    t.start()
+    assert entered.wait(10)
+    _grow_until_new_tile(eng, s, 400.0, rgb=True)
+    release.set()
+    t.join(10)
+    (img, origin, d), *_ = eng.mosaic_image()
+    assert (origin, d) == (view0[1], view0[2]) and _same_image(img, view0[0])
+    assert np.array_equal(eng.mosaic_image_rgb(), rgb_expect)

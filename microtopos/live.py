@@ -254,16 +254,15 @@ class LiveEngine:
         self._render_now()
 
     def _render_now(self):
-        """Render the current mosaic state into the snapshot view (called from the GUI thread)."""
+        """Render the current mosaic state into the snapshot view (called from the GUI thread). The canvas is
+        snapshotted under the lock and rendered after it (copy-on-write: the engine thread cannot change it)."""
         with self._lock:
-            tiles = dict(self.mosaic.tiles)
-            tiles_low = dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None
-            tiles_rgb = dict(self.mosaic.tiles_rgb) if self.color_mode and self.mosaic.tiles_rgb else None
-            tile = self.mosaic.tile
-            patches = list(self.mosaic.patches)
-            ver = self.mosaic_version
-            nkf = len(self.mosaic.keyframes)
-        self._render(tiles, tile, patches, ver, nkf, tiles_low, tiles_rgb)
+            req = self._render_request()
+        self._render(*req)
+
+    def _render_request(self):
+        """Arguments of _render for the current state; call under the lock."""
+        return self.mosaic.canvas_snapshot(), self.mosaic_version, len(self.mosaic.keyframes)
 
     def _reset_motion(self):
         self.sm.reset()
@@ -341,13 +340,12 @@ class LiveEngine:
         return self._mosaic_view
 
     def mosaic_full(self):
-        """Full-resolution mosaic and its height partitions, e.g. for saving (takes the engine lock briefly)."""
+        """Full-resolution mosaic and its height partitions, e.g. for saving. The canvas is snapshotted under
+        the engine lock (briefly) and rendered after it: the image shows one state of the mosaic."""
         with self._lock:
-            tiles = dict(self.mosaic.tiles)
-            tiles_low = dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None
-            tile, patches = self.mosaic.tile, list(self.mosaic.patches)
-        img, origin, _ = render_tiles(tiles, tile, 1, tiles_low)
-        return (img, origin), height_partitions(patches)
+            snap = self.mosaic.canvas_snapshot()
+        img, origin, _ = render_tiles(snap.tiles, snap.tile, 1, snap.tiles_low)
+        return (img, origin), height_partitions(snap.patches)
 
     def add_height_patch(self, pose, edf_preview, height_preview, z_unit, z_key=None, rid="",
                          mosaic_generation: int | None = None):
@@ -423,9 +421,12 @@ class LiveEngine:
                            manual=self.sm.override == Override.Z, mosaic_generation=self._sweep_mgen)
                 self._buf = SweepBuffer()
 
-    def _render(self, tiles, tile, patches, version, nkf, tiles_low=None, tiles_rgb=None):
+    def _render(self, snap, version, nkf):
+        """Render a canvas snapshot (Mosaic.canvas_snapshot) into the views the GUI polls; runs without the lock."""
+        tiles, tile, patches = snap.tiles, snap.tile, snap.patches
+        tiles_rgb = snap.tiles_rgb if self.color_mode else None
         d = preview_factor(tiles, tile, 1600)
-        view = render_tiles(tiles, tile, d, tiles_low)  # (grey image, origin, d): the grey view is always there
+        view = render_tiles(tiles, tile, d, snap.tiles_low)  # (grey image, origin, d): the grey view is always there
         rgb = None
         if tiles_rgb:
             # the colour canvas, cut to the grey view's box so that both share its origin and its µm axes
@@ -614,11 +615,7 @@ class LiveEngine:
         if self.mosaic_version != self._view_version and now - self._view_t > 0.5:
             # rendering happens after the lock is released (at most twice a second, at display size)
             self._view_t = now
-            render = (dict(self.mosaic.tiles), self.mosaic.tile, list(self.mosaic.patches), self.mosaic_version,
-                      len(self.mosaic.keyframes),
-                      dict(self.mosaic.tiles_low) if self.mosaic.blending == "multiband" else None,
-                      dict(self.mosaic.tiles_rgb) if self.color_mode and self.mosaic.tiles_rgb else None,
-            )
+            render = self._render_request()
         if state == State.DWELL:
             self._dwell.append(full_u8)
             self._avg.append(prev)

@@ -17,6 +17,7 @@ increment, and its shift is turned into mosaic axes with that frame's angle.
 from __future__ import annotations
 
 import collections
+import copy
 import math
 from dataclasses import dataclass, field
 
@@ -80,6 +81,22 @@ class HeightPatch:
 
 
 @dataclass
+class CanvasSnapshot:
+    """What a render of the mosaic needs, frozen at one moment (Mosaic.canvas_snapshot).
+
+    The tile dicts hold the canvas arrays as they were when the snapshot was taken: the mosaic copies a tile before
+    its first write after a snapshot (copy-on-write), so these arrays are never modified afterwards and can be
+    rendered without any lock. Patches are shallow copies (their arrays are never modified in place)."""
+
+    tiles: dict
+    tiles_low: dict | None  # only in "multiband" mode
+    tiles_rgb: dict
+    tile: int
+    patches: list
+    insets: list
+
+
+@dataclass
 class Mosaic:
     tile: int = 512
     tiles: dict = field(default_factory=dict)  # (tx, ty) -> [num, den]
@@ -116,6 +133,10 @@ class Mosaic:
     lost_view: tuple | None = None  # (frame, band-pass) of the latest lost frame, for the steady-view test
     rep_cache: dict = field(default_factory=dict, repr=False)  # id(band-pass) -> (band-pass, repeat distance)
     _last_rot: float = field(default=0.0, repr=False)  # rotation (angle_deg convention) measured by the last verified match
+    # copy-on-write of the canvas (canvas_snapshot): a tile entry is written in place only if it was made in the
+    # current epoch; an older one may be shared with a snapshot and is copied first
+    _canvas_epoch: int = field(default=0, repr=False)
+    _tile_epoch: dict = field(default_factory=dict, repr=False)  # (canvas name, tile key) -> epoch it was made in
 
     def reset(self, keep_insets: bool = False) -> None:
         self.tiles.clear()
@@ -142,6 +163,28 @@ class Mosaic:
         self.prev_bp = None
         self.recent_b.clear()
         self.rep_cache.clear()
+        self._tile_epoch.clear()
+
+    def canvas_snapshot(self) -> CanvasSnapshot:
+        """The canvas of this moment, for rendering outside the lock that serialises access to the mosaic.
+
+        Must be called where nothing else touches the mosaic (the live engine calls it under its lock). It costs
+        dict copies only: the tile arrays are shared with the snapshot, and the next splat into a shared tile
+        copies that tile first (_tile), so the snapshot keeps showing exactly one state of the canvas."""
+        self._canvas_epoch += 1
+        return CanvasSnapshot(dict(self.tiles), dict(self.tiles_low) if self.blending == "multiband" else None,
+                              dict(self.tiles_rgb), self.tile, [copy.copy(p) for p in self.patches],
+                              list(self.insets))
+
+    def _tile(self, store: dict, name: str, key: tuple, shapes: tuple) -> list:
+        """The [num, den] entry of tile `key` in canvas `store`, safe to write in place (see canvas_snapshot)."""
+        e = store.get(key)
+        if e is None:
+            e = store[key] = [np.zeros(sh, np.float32) for sh in shapes]
+        elif self._tile_epoch.get((name, key)) != self._canvas_epoch:
+            e = store[key] = [a.copy() for a in e]  # may be shared with a snapshot: write into a private copy
+        self._tile_epoch[(name, key)] = self._canvas_epoch
+        return e
 
     def set_blending(self, mode: str) -> None:
         if mode not in ("feather", "multiband"):
@@ -875,26 +918,18 @@ class Mosaic:
                 dst = (slice(ay0 - ty * t, ay1 - ty * t), slice(ax0 - tx * t, ax1 - tx * t))
                 fea = feather[src]
                 if multiband:
-                    num, den = self.tiles.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
-                    low_num, sharp_den = self.tiles_low.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    num, den = self._tile(self.tiles, "grey", (tx, ty), ((t, t), (t, t)))
+                    low_num, sharp_den = self._tile(self.tiles_low, "low", (tx, ty), ((t, t), (t, t)))
                     num[dst] += high[src] * sharp_w[src]
                     low_num[dst] += low[src] * fea
                     den[dst] += fea
                     sharp_den[dst] += sharp_w[src]
                 else:
-                    num, den = self.tiles.setdefault(
-                        (tx, ty), [np.zeros((t, t), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    num, den = self._tile(self.tiles, "grey", (tx, ty), ((t, t), (t, t)))
                     num[dst] += img[src] * fea
                     den[dst] += fea
                 if rgb is not None and rgb.ndim == 3:
-                    rnum, rden = self.tiles_rgb.setdefault(
-                        (tx, ty), [np.zeros((t, t, 3), np.float32), np.zeros((t, t), np.float32)]
-                    )
+                    rnum, rden = self._tile(self.tiles_rgb, "rgb", (tx, ty), ((t, t, 3), (t, t)))
                     rnum[dst] += rgb[src].astype(np.float32) * fea[..., None]
                     rden[dst] += fea
 
@@ -908,6 +943,7 @@ class Mosaic:
         self.tiles.clear()
         self.tiles_low.clear()
         self.tiles_rgb.clear()
+        self._tile_epoch.clear()
         for k in self.keyframes:
             self._splat(k.image, k.x, k.y, mask=self._yield_mask(k), rgb=k.rgb)
         for p in self.patches:
@@ -923,7 +959,7 @@ class Mosaic:
     def image_rgb(self, d: int = 1) -> np.ndarray | None:
         """Assembled full-resolution colour mosaic (RGBA uint8; alpha marks valid area), or None when no colour
         keyframes have been added."""
-        return render_tiles_rgb(self.tiles_rgb, self.tile, d)  # renders a snapshot of the tile dict
+        return render_tiles_rgb(self.tiles_rgb, self.tile, d)
 
     def preview(self, max_px: int = 1600) -> tuple[np.ndarray, tuple[int, int], int]:
         """Mosaic rendered at a power-of-two reduction d so that its larger side is <= max_px (bounded memory).
@@ -1263,8 +1299,9 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
     """Assemble tiles reduced by d (weighted: num and den are reduced separately). When tiles_low is given
     ("multiband" mode, a two-band blend), each tile's high-frequency band is divided by sharp_den and added to the
     feathered low-frequency band; empty canvas is NaN and the result is cropped to the valid bounding box, exactly
-    as in feather mode. Works on a shallow copy of the tile dict, so the engine can render outside its lock.
-    Returns (image, full-resolution origin, d)."""
+    as in feather mode. The tile arrays are read in place: nothing may splat into them during the call, so render
+    the tiles of a Mosaic.canvas_snapshot (taken under the lock) or hold the lock (the dict is copied only so that
+    bounds and tiles come from the same set of keys). Returns (image, full-resolution origin, d)."""
     tiles = dict(tiles)  # bounds and tiles from the same snapshot
     if not tiles:
         return np.full((8, 8), np.nan, np.float32), (0, 0), d
@@ -1301,8 +1338,8 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
 
 
 def render_tiles_rgb(tiles_rgb: dict, tile: int, d: int = 1) -> np.ndarray | None:
-    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d. Works on a shallow copy of
-    the tile dict (bounds and tiles from the same snapshot), as render_tiles does."""
+    """Assemble the colour canvas (RGBA uint8; alpha = 255 where valid) reduced by d. Reads the tile arrays in
+    place, like render_tiles: pass the tiles of a Mosaic.canvas_snapshot or hold the lock."""
     tiles_rgb = dict(tiles_rgb)
     if not tiles_rgb:
         return None

@@ -96,3 +96,49 @@ def test_an_opened_mosaic_is_drawn_at_its_own_scale_whatever_objective_is_select
     assert f"{img.shape[1] * d * 0.9:.0f} × {img.shape[0] * d * 0.9:.0f} µm" in w.lbl_mosaic.text()
     assert "not tracking" in w.lbl_mosaic.text() and "10x / 0.25" in w.lbl_mosaic.text()
     assert len(w.engine.mosaic.keyframes) == len(m.keyframes)  # the live 40x frames were not tracked into it
+
+
+def _wait_mapping(qapp, w):
+    """The simulator is at rest: wait until the engine has a keyframe and is tracking into its mosaic."""
+    with w.sim_source.lock:
+        w.sim_source.script = []
+    assert _wait_for(qapp, lambda: w.engine.snapshot().preview is not None and len(w.engine.mosaic.keyframes) >= 1
+                     and w.engine.snapshot().mosaic_hold is None and not w.engine.snapshot().mosaic_lost)
+
+
+def test_an_inset_is_drawn_in_the_mosaic_tab(window, qapp):
+    """'Add inset (current view)' stored an inset nothing drew: the Mosaic tab was pixel-identical. A bright inset
+    placed 1000 preview px to the left of the mapped area must appear in the displayed image, there."""
+    w = window
+    _wait_mapping(qapp, w)
+    _draw_mosaic_tab(w)
+    before = w.p_mosaic.data.copy()
+    s = w.engine.snapshot()
+    um = w.engine.mosaic.um_per_px
+    (_img, origin, d0), *_ = w.engine.mosaic_image()
+    w.engine.add_mosaic_inset("other", um, (origin[0] - 1000) * um, origin[1] * um, np.full_like(s.preview, 255))
+    w._mosaic_add_inset()  # and the button's own inset, at the live view
+    w.engine._render_now()
+    _draw_mosaic_tab(w)
+    shown = w.p_mosaic.data
+    (_img2, origin2, d), *_ = w.engine.mosaic_image()
+    assert shown.shape[1] * d >= before.shape[1] * d0 + 1000 and origin2[0] <= origin[0] - 1000
+    x = (origin[0] - 1000 + s.preview.shape[1] // 2 - origin2[0]) // d  # inside the bright inset
+    y = (origin[1] + s.preview.shape[0] // 2 - origin2[1]) // d
+    assert tuple(shown[y, x]) == (255, 255, 255, 255)
+
+
+def test_an_objective_change_keeps_the_insets_and_the_overview(window, qapp):
+    """The objective handler called engine.set_objective (which added the old objective's overview as an inset)
+    and then engine.reset_mosaic() without keep_insets, which deleted it and every other inset whatever 'Keep insets
+    on reset' said. With the box ticked the user's inset and the overview of the old mosaic must survive."""
+    w = window
+    _wait_mapping(qapp, w)
+    w._mosaic_add_inset()
+    old, gen = w.obj, w.engine.mosaic_generation
+    assert w.chk_keep_insets.isChecked() and w.engine.keep_overview_insets
+    other = next(n for n in (w.cmb_obj.itemText(i) for i in range(w.cmb_obj.count()))
+                 if w.objset.get(n).magnification != old.magnification)
+    w.cmb_obj.setCurrentText(other)
+    assert w.engine.mosaic_generation > gen and w.engine.mosaic.objective == other  # restarted for it
+    assert sorted(it.objective for it in w.engine.mosaic.insets) == [old.name, old.name]  # the inset + the overview

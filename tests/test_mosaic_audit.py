@@ -20,7 +20,7 @@ from microtopos.calibration import CalibrationStore
 from microtopos.camera import SimulatorSource
 from microtopos.kinematics import Override
 from microtopos.live import LiveEngine, _crop_rgb_to_view
-from microtopos.mosaic import Mosaic, preview_factor, render_tiles, render_tiles_rgb
+from microtopos.mosaic import Mosaic, MosaicInset, preview_factor, render_tiles, render_tiles_rgb, underlay_insets
 
 VH, VW = 240, 320
 OBJ = objectives.resolve("10x / 0.25", objset=objectives.default_set())
@@ -453,3 +453,162 @@ def test_a_mosaic_records_the_objective_and_scale_it_is_made_with():
     assert (reopened.objective, reopened.um_per_px) == (OBJ.name, OBJ.nominal_um_per_px(VW))
     eng._render_now()
     assert eng.mosaic_view()[4] == OBJ.nominal_um_per_px(VW)
+
+
+# ------------------------------------------------------------------------------------------ R7 R8 insets
+
+OBJ40 = objectives.resolve("40x / 0.85", objset=objectives.default_set())
+
+
+def _mapped_engine(world: np.ndarray, xs, y: int = 200, color: bool = False) -> LiveEngine:
+    """An engine that has mapped the views at stage (x, y) for x in xs (320 x 240 previews, objective OBJ)."""
+    eng = LiveEngine(CalibrationStore(None), OBJ)
+    eng.color_mode = color
+    eng.sm.override = Override.PAN
+    for i, x in enumerate(xs):
+        eng.process_frame(_bgr(world, int(x), y), 0.04 * i, i + 1)
+    assert eng.snapshot().mosaic_hold is None and not eng.mosaic.lost
+    return eng
+
+
+def _checker(h: int, w: int, sq: int) -> np.ndarray:
+    yy, xx = np.mgrid[0:h, 0:w]
+    return np.where(((yy // sq) + (xx // sq)) % 2 == 0, 40.0, 220.0).astype(np.float32)
+
+
+def test_insets_are_drawn_under_the_canvas_at_their_scale_and_place_in_grey_and_colour():
+    """'Add inset' stored the view and saved it, but nothing ever drew it. An inset at half the magnification
+    (2 mosaic px per inset px) placed below the mapped strip must appear there in the grey and the colour view,
+    at its scale; another one over the mapped strip must stay under the canvas (the canvas is drawn over it)."""
+    world = _world(1, 800, 2000)
+    eng = _mapped_engine(world, range(100, 420, 20), color=True)
+    um = eng.mosaic.um_per_px
+    assert um == OBJ.nominal_um_per_px(VW)
+    eng._render_now()
+    (img0, o0, _), *_ = eng.mosaic_image()
+    rgb0 = eng.mosaic_image_rgb()
+    pattern = _checker(120, 160, 20)  # 6 x 8 squares of 20 inset px = 40 mosaic px
+    x0, y0 = o0[0] - 8, o0[1] + img0.shape[0] + 12  # below the strip, on no tile
+    eng.add_mosaic_inset("4x", 2 * um, x0 * um, y0 * um, pattern)
+    eng.add_mosaic_inset("4x", 2 * um, o0[0] * um, o0[1] * um, np.full((60, 80), 255.0, np.float32))
+    eng._render_now()
+    (img, (ox, oy), d), *_ = eng.mosaic_image()
+    rgb = eng.mosaic_image_rgb()
+    assert d == 1 and rgb.shape[:2] == img.shape
+    for j in range(6):  # the centre of every square, in mosaic px
+        for i in range(8):
+            X, Y = x0 + 40 * i + 20, y0 + 40 * j + 20
+            v = pattern[20 * j + 10, 20 * i + 10]
+            assert img[Y - oy, X - ox] == pytest.approx(v, abs=0.5)
+            assert tuple(rgb[Y - oy, X - ox]) == (round(v),) * 3 + (255,)
+    # the mapped strip is drawn over the bright inset: unchanged where it has data
+    sy, sx = o0[1] - oy, o0[0] - ox
+    canvas = img[sy:sy + img0.shape[0], sx:sx + img0.shape[1]]
+    ok = np.isfinite(img0)
+    assert np.array_equal(canvas[ok], img0[ok])
+    assert np.array_equal(rgb[sy:sy + img0.shape[0], sx:sx + img0.shape[1]][rgb0[..., 3] > 0], rgb0[rgb0[..., 3] > 0])
+    # an overview at a tenth of the magnification spans 3200 x 2400 mosaic px: the view is reduced to stay bounded
+    eng.add_mosaic_inset("1x", 10 * um, (o0[0] - 1600) * um, (o0[1] - 1200) * um, _checker(240, 320, 40))
+    eng._render_now()
+    (img, (ox, oy), d), *_ = eng.mosaic_image()
+    assert d == 2 and max(img.shape) <= 1600
+    X, Y = o0[0] - 1600 + 200, o0[1] - 1200 + 200  # centre of the overview's first square (40 px x 10)
+    assert img[(Y - oy) // d, (X - ox) // d] == pytest.approx(40.0, abs=0.5)
+    # an overview inset is NaN where the old mosaic was empty: nothing is drawn there, in grey or colour
+    holed = _checker(40, 40, 10)
+    holed[:, :20] = np.nan
+    (view, _origin, _d), rgb2 = underlay_insets((np.full((8, 8), np.nan, np.float32), (0, 0), 1),
+                                                np.zeros((8, 8, 4), np.uint8), [MosaicInset("x", um, 0, 0, holed)], um)
+    assert np.isnan(view[:, :20]).all() and (rgb2[:, :20, 3] == 0).all() and (rgb2[:, 20:, 3] == 255).all()
+
+
+def test_an_inset_placed_in_a_separate_area_moves_with_it_when_the_areas_join():
+    """An inset is placed in the coordinates of the area the camera is in; when that area joins another, its
+    keyframes move into the other's coordinates and the inset must move with them, or it is drawn where the
+    unconnected area used to be."""
+    pinned = {}
+
+    def record(cx, m):
+        if not pinned and m.areas == 2 and cx <= 1600:
+            m.um_per_px = 0.5
+            pinned.update(cx=cx)
+            m.add_inset("40x", 0.5, m.x * 0.5, m.y * 0.5, np.zeros((VH, VW), np.float32))
+
+    s = _pan_b_over_a(record)
+    off_a = s.truth[0][0] - s.m.keyframes[0].x  # stage x - mosaic x in A
+    assert abs(s.m.insets[0].x_um / 0.5 - (pinned["cx"] - off_a)) < 2.0
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_an_objective_change_keeps_the_overview_and_the_insets_in_the_new_mosaics_coordinates(keep):
+    """Mapped at 10x, an inset added at the camera, then 40x is selected. The objective change added the old
+    mosaic as an overview inset and the GUI's reset deleted it with every other inset. The overview must be kept,
+    the user's inset as 'Keep insets on reset' says, both placed in the NEW mosaic's coordinates: its first
+    keyframe is the next view (same stage position, centred objectives; the turret change lost the track, so the
+    last known position), and 40x preview px are a quarter of 10x ones. Ground truth: frames are windows of a world whose pixels are the 10x preview's, so every inset's world
+    position is known, and in the new mosaic world point P is at (first view centre) + (P - camera centre) x 4."""
+    world = _world(1, 800, 2000)
+    eng = _mapped_engine(world, range(100, 420, 20))
+    m = eng.mosaic
+    um10 = m.um_per_px
+    eng.add_mosaic_inset("40x / 0.85", um10 / 4, m.x * um10, m.y * um10, np.zeros((VH, VW), np.float32))
+    _img, origin = m.image()
+    other = _world(2, 800, 2000)
+    for i in range(4):  # the turret turns: views that match nothing, tracking is lost before 40x is selected
+        eng.process_frame(_bgr(other, 300 + 50 * i, 300), 2 + 0.04 * i, 50 + i)
+    assert m.lost and eng.snapshot().mosaic_hold is None
+    to_world = (100 - m.keyframes[0].x, 200 - m.keyframes[0].y)  # the first view was at stage (100, 200)
+    cam_world = (m.x + to_world[0] + (VW - 1) / 2, m.y + to_world[1] + (VH - 1) / 2)
+    user_world = (m.x + to_world[0], m.y + to_world[1])
+    over_world = (origin[0] + to_world[0], origin[1] + to_world[1])
+    assert eng.set_objective(OBJ40, restart_mosaic=True, keep_insets=keep)
+    assert not m.keyframes and m.objective == OBJ40.name
+    um40 = OBJ40.nominal_um_per_px(VW)
+
+    def expect(pw):  # µm in the new mosaic of world point pw
+        return tuple(((VW - 1, VH - 1)[a] / 2) * um40 + (pw[a] - cam_world[a]) * um10 for a in (0, 1))
+
+    got = {it.objective: (it.x_um, it.y_um) for it in m.insets}
+    assert set(got) == ({"40x / 0.85", OBJ.name} if keep else {OBJ.name})
+    assert got[OBJ.name] == pytest.approx(expect(over_world), abs=0.5 * um10)
+    if keep:
+        assert got["40x / 0.85"] == pytest.approx(expect(user_world), abs=0.5 * um10)
+
+
+def test_reset_keeps_insets_where_they_were_on_the_specimen():
+    """Reset mosaic with 'Keep insets on reset': the new mosaic starts at the camera's current view, so a kept inset
+    must be moved by where the camera is; left at its old coordinates it is drawn off by the camera's travel."""
+    world = _world(1, 800, 2000)
+    eng = _mapped_engine(world, range(100, 300, 20))
+    m = eng.mosaic
+    um = m.um_per_px
+    eng.add_mosaic_inset("40x / 0.85", um / 4, m.x * um, m.y * um, np.zeros((VH, VW), np.float32))
+    inset_world = m.x + 100 - m.keyframes[0].x
+    for i, x in enumerate(range(300, 700, 20)):  # travel on before resetting
+        eng.process_frame(_bgr(world, x, 200), 1 + 0.04 * i, 100 + i)
+    cam_world = m.x + 100 - m.keyframes[0].x
+    eng.reset_mosaic(keep_insets=True)
+    assert len(m.insets) == 1 and m.insets[0].x_um == pytest.approx((inset_world - cam_world) * um, abs=0.5 * um)
+    eng.process_frame(_bgr(world, 680, 200), 3.0, 200)  # the next view is the new mosaic's first keyframe, at 0
+    assert (m.keyframes[0].x, m.keyframes[0].y) == (0.0, 0.0)
+
+
+def test_a_restart_drops_insets_it_cannot_place_and_keeps_an_opened_mosaic_of_the_selected_objective():
+    """Insets are placed relative to the camera; when the camera is not tracked into the mosaic (an opened 10x
+    session while 40x is selected) nothing tells where they belong in a new mosaic: they are not kept. Selecting
+    the opened mosaic's own objective does not restart it (the GUI reset the mosaic on every objective change)."""
+    world = _world(3, 1200, 3000)
+    saved = _session_mosaic(world, OBJ.name, OBJ.nominal_um_per_px(320))
+    saved.add_inset("4x", 1.0, 0.0, 0.0, np.zeros((8, 8), np.float32))
+    eng = LiveEngine(CalibrationStore(None), OBJ40)
+    eng.load_mosaic_state(*saved.to_state_arrays())
+    eng.process_frame(_bgr(world, 500, 200), 0.0, 1)
+    assert eng.snapshot().mosaic_hold
+    assert eng.set_objective(OBJ, restart_mosaic=True, keep_insets=True) is False
+    assert len(eng.mosaic.keyframes) == len(saved.keyframes) and len(eng.mosaic.insets) == 1
+    eng.set_objective(OBJ40)
+    eng.process_frame(_bgr(world, 500, 200), 0.04, 2)
+    assert eng.snapshot().mosaic_hold
+    eng.reset_mosaic(keep_insets=True)
+    assert eng.mosaic.insets == [] and not eng.mosaic.keyframes
+    assert any("without its insets" in e for e in eng.events)

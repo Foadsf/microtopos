@@ -19,7 +19,16 @@ from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, bg
 from .camera import FrameSource
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
-from .mosaic import Mosaic, height_partitions, preview_factor, render_tiles, render_tiles_rgb
+from .mosaic import (
+    Mosaic,
+    MosaicInset,
+    height_partitions,
+    inset_boxes,
+    preview_factor,
+    render_tiles,
+    render_tiles_rgb,
+    underlay_insets,
+)
 from .optics import Objective
 from .stage import StageReadout
 
@@ -139,7 +148,8 @@ class LiveEngine:
         self.exposure: float | None = None
         self.linearize = False
         self.color_mode = False  # when True, colour frames flow through SweepBuffer.color_frames and the RGB mosaic
-        self.keep_overview_insets = True  # keep the previous objective's overview as an inset when the magnification changes
+        # when an objective change restarts the mosaic, keep the previous objective's mosaic as an overview inset
+        self.keep_overview_insets = True
         self.on_sweep = None  # callback(SweepCapture)
         self.on_objective_hint = None  # callback(ratio)
         self.sync_callbacks = False  # True: call on_sweep in the engine thread (deterministic batch processing)
@@ -209,32 +219,78 @@ class LiveEngine:
             self.mosaic_generation += 1
             self.mosaic_version += 1
 
-    def set_objective(self, obj: Objective):
+    def set_objective(self, obj: Objective, restart_mosaic: bool = False, keep_insets: bool = False) -> bool:
+        """Switch to `obj`. With restart_mosaic, a mosaic made with another objective (its pixels have another
+        scale, _mosaic_mismatch) is restarted for `obj`, keeping its insets if keep_insets and, if
+        keep_overview_insets is set and the magnification changes, adding the old mosaic as an overview inset, all
+        placed in the new mosaic's coordinates (_restart_mosaic). A mosaic made with `obj` (an opened session)
+        is kept and tracked into again. Returns whether the mosaic was restarted."""
         with self._lock:
             old_obj = self.objective
-            if self.keep_overview_insets and len(self.mosaic.keyframes) >= 1 and obj.magnification != old_obj.magnification:
-                img, origin = self.mosaic.image()
-                if np.isfinite(img).any():
-                    cal = self.store.get(old_obj)
-                    pw = self._snap.preview_shape[1] or PREVIEW_W
-                    um_old = cal.um_per_px(pw, old_obj, self._snap.preview_shape[0] or None)
-                    self.mosaic.add_inset(old_obj.name, um_old, origin[0] * um_old, origin[1] * um_old, img)
+            restart = restart_mosaic and self.mosaic.objective != obj.name
+            if restart:
+                self._restart_mosaic(keep_insets, obj, overview=self.keep_overview_insets
+                                     and obj.magnification != old_obj.magnification)
             self.objective = obj
             self._corrector_key = None
             self._cancel_calibration("the objective changed")
             self._reset_motion()
+            return restart
 
     def set_override(self, mode: Override):
         with self._lock:
             self.sm.override = mode
 
     def reset_mosaic(self, keep_insets: bool = False):
+        """Start a new mosaic; with keep_insets the insets are kept, placed in the new mosaic's coordinates."""
         with self._lock:
-            self.mosaic.reset(keep_insets=keep_insets)
-            self._areas_seen = 1
-            self._pending_patches.clear()
-            self.mosaic_generation += 1
-            self.mosaic_version += 1
+            self._restart_mosaic(keep_insets, self.objective)
+
+    def _preview_um(self, obj: Objective, shape) -> float:
+        """Lateral scale of a live preview of `shape` with `obj`: the calibration's, else nominal."""
+        return self.store.get(obj).um_per_px(shape[1], obj, shape[0])
+
+    def _restart_mosaic(self, keep_insets: bool, obj: Objective, overview: bool = False) -> None:
+        """Replace the mosaic by an empty one for `obj` (call under the lock).
+
+        Inset positions are in the old mosaic's µm frame. The new mosaic's first keyframe is the next view, at the
+        camera's current place, so every kept inset (and, with `overview`, the old mosaic itself as an inset at
+        its scale) is moved by the camera's view centre: from its place in the old frame to the first view's
+        centre in the new one. This assumes the stage does not move before the next frame and, across an
+        objective change, parcentred objectives. While tracking is lost the camera's last known position is used:
+        an objective change loses the track itself (the view changes) before the new objective is selected. When
+        the camera is not tracked into the old mosaic at all (another objective or camera mode) its position there
+        is unknown: then nothing can be placed and no inset is kept."""
+        m = self.mosaic
+        shape = m.frame_shape or (tuple(self._snap.preview_shape) if self._snap.preview_shape[0] else None)
+        um_new = self._preview_um(obj, shape) if shape else None
+        insets = list(m.insets) if keep_insets else []
+        if m.keyframes:
+            anchor = None
+            if m.um_per_px and self._mosaic_hold is None:
+                h, w = m.frame_shape
+                anchor = ((m.x + (w - 1) / 2.0) * m.um_per_px, (m.y + (h - 1) / 2.0) * m.um_per_px)
+            if overview and anchor is not None:
+                img, origin = m.image()
+                if np.isfinite(img).any():
+                    insets.append(MosaicInset(m.objective, m.um_per_px, origin[0] * m.um_per_px,
+                                              origin[1] * m.um_per_px, img, m.current_area))
+            if insets and (anchor is None or um_new is None):
+                self.log("mosaic restarted without its insets: where the camera is in the old mosaic is unknown")
+                insets = []
+            elif insets:
+                h, w = shape
+                sx, sy = (w - 1) / 2.0 * um_new - anchor[0], (h - 1) / 2.0 * um_new - anchor[1]
+                insets = [MosaicInset(it.objective, it.um_per_px, it.x_um + sx, it.y_um + sy, it.image, 0)
+                          for it in insets]
+        m.reset()
+        m.insets.extend(insets)
+        if um_new is not None:  # what the new mosaic's pixels will be (the engine refreshes it while tracking)
+            m.objective, m.um_per_px = obj.name, um_new
+        self._areas_seen = 1
+        self._pending_patches.clear()
+        self.mosaic_generation += 1
+        self.mosaic_version += 1
 
     def mosaic_state(self) -> tuple[dict, dict[str, np.ndarray]]:
         """Serialized pose graph of the live mosaic, taken under the engine lock (the engine thread mutates the
@@ -365,8 +421,9 @@ class LiveEngine:
         return None
 
     def mosaic_full(self):
-        """Full-resolution mosaic and its height partitions, e.g. for saving. The canvas is snapshotted under
-        the engine lock (briefly) and rendered after it: the image shows one state of the mosaic."""
+        """Full-resolution mosaic canvas and its height partitions, e.g. for saving. The canvas is snapshotted
+        under the engine lock (briefly) and rendered after it: the image shows one state of the mosaic. Insets are
+        not drawn into it (they are saved with the mosaic state; the live view draws them under the canvas)."""
         with self._lock:
             snap = self.mosaic.canvas_snapshot()
         img, origin, _ = render_tiles(snap.tiles, snap.tile, 1, snap.tiles_low)
@@ -450,12 +507,16 @@ class LiveEngine:
         """Render a canvas snapshot (Mosaic.canvas_snapshot) into the views the GUI polls; runs without the lock."""
         tiles, tile, patches = snap.tiles, snap.tile, snap.patches
         tiles_rgb = snap.tiles_rgb if self.color_mode else None
-        d = preview_factor(tiles, tile, 1600)
+        # insets are drawn under the canvas, at their scale in this mosaic's grid (unknown grid: not drawn)
+        insets = snap.insets if snap.um_per_px else []
+        d = preview_factor(tiles, tile, 1600, inset_boxes(insets, snap.um_per_px) if insets else [])
         view = render_tiles(tiles, tile, d, snap.tiles_low)  # (grey image, origin, d): the grey view is always there
         rgb = None
         if tiles_rgb:
             # the colour canvas, cut to the grey view's box so that both share its origin and its µm axes
             rgb = _crop_rgb_to_view(render_tiles_rgb(tiles_rgb, tile, d), tiles_rgb, tile, view)
+        if insets:
+            view, rgb = underlay_insets(view, rgb, insets, snap.um_per_px)
         self._mosaic_view = (view, height_partitions(patches), nkf, len(patches), snap.um_per_px)
         self._mosaic_rgb_view = rgb
         self._view_version = version
@@ -540,7 +601,7 @@ class LiveEngine:
                 continue
             self.mosaic.add_height_patch(pose[0], pose[1], e, hp, zu, zkey, rid)
             self.mosaic_version += 1
-        um = self.store.get(self.objective).um_per_px(prev.shape[1], self.objective, prev.shape[0])
+        um = self._preview_um(self.objective, prev.shape)
         hold = self._mosaic_mismatch(prev.shape)
         if hold != self._mosaic_hold:
             self.log(f"mosaic: live frames are not tracked into it: {hold}" if hold

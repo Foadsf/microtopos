@@ -19,7 +19,7 @@ from __future__ import annotations
 import collections
 import copy
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -57,13 +57,16 @@ class Keyframe:
 
 @dataclass
 class MosaicInset:
-    """Multi-scale inset reference view."""
+    """A reference view at its own scale (another objective, or the previous objective's whole mosaic), shown under
+    the mosaic canvas (underlay_insets). (x_um, y_um) is its top-left in the mosaic's µm frame: mosaic pixels times
+    Mosaic.um_per_px; um_per_px is the scale of its own pixels. It belongs to an area and moves with it on a join."""
 
     objective: str
     um_per_px: float
     x_um: float
     y_um: float
     image: np.ndarray
+    area: int = 0
 
 
 @dataclass
@@ -207,7 +210,8 @@ class Mosaic:
             self._rebuild_canvas()
 
     def add_inset(self, objective: str, um_per_px: float, x_um: float, y_um: float, image: np.ndarray) -> None:
-        self.insets.append(MosaicInset(objective, um_per_px, x_um, y_um, np.asarray(image).copy()))
+        """Add an inset placed in the coordinates of the area the camera is in (MosaicInset)."""
+        self.insets.append(MosaicInset(objective, um_per_px, x_um, y_um, np.asarray(image).copy(), self.current_area))
 
     # ---------------------------------------------------------------- matching
     @staticmethod
@@ -839,6 +843,15 @@ class Mosaic:
             p.x, p.y = k.x + p.rel[0], k.y + p.rel[1]
             self._splat(p.edf, p.x, p.y, weight=4.0)
         self._solve_offsets()  # the joined patches may now overlap others of their z_key: level them together
+        if self.um_per_px:  # insets placed in the joined area move with it (their position is in µm of this grid)
+            um = self.um_per_px
+            for n, it in enumerate(self.insets):
+                if it.area != old:
+                    continue
+                ih, iw = np.asarray(it.image).shape[:2]
+                x, y = place(it.x_um / um, it.y_um / um, ih * it.um_per_px / um, iw * it.um_per_px / um)
+                self.insets[n] = replace(it, x_um=x * um, y_um=y * um, area=target,
+                                         image=_turn(np.asarray(it.image, np.float32), -rot) if turn else it.image)
         # the tracker: the camera is at the joining view, in the old area's coordinates and orientation
         self.x, self.y = place(self.x, self.y, h, w)
         self.prev_xy = place(*self.prev_xy, h, w)
@@ -1110,6 +1123,7 @@ class Mosaic:
                     "um_per_px": float(it.um_per_px),
                     "x_um": float(it.x_um),
                     "y_um": float(it.y_um),
+                    "area": int(it.area),
                 }
                 for it in self.insets
             ],
@@ -1190,7 +1204,7 @@ class Mosaic:
         for i, im in enumerate(meta.get("insets", [])):
             self.insets.append(MosaicInset(str(im["objective"]), float(im["um_per_px"]),
                                            float(im["x_um"]), float(im["y_um"]),
-                                           arrays[f"inset_img_{i}"]))
+                                           arrays[f"inset_img_{i}"], int(im.get("area", 0))))
         if self.keyframes:
             self.prev_frame = self.keyframes[self.ref].image.astype(np.float32)
             self.prev_bp = self.keyframes[self.ref].bp
@@ -1380,13 +1394,32 @@ def _turn(img: np.ndarray, deg: float, invalid: float | None = None) -> np.ndarr
                           borderValue=invalid)
 
 
-def preview_factor(tiles: dict, tile: int, max_px: int) -> int:
-    """Smallest power-of-two reduction (<= tile) that keeps the rendered mosaic within max_px."""
-    if not tiles:
+def inset_boxes(insets: list, um_per_px: float) -> list[tuple[float, float, float, float]]:
+    """(x0, y0, width, height) of every inset in full-resolution pixels of a mosaic whose pixel is um_per_px µm."""
+    out = []
+    for it in insets:
+        h, w = np.asarray(it.image).shape[:2]
+        s = it.um_per_px / um_per_px
+        out.append((it.x_um / um_per_px, it.y_um / um_per_px, w * s, h * s))
+    return out
+
+
+def preview_factor(tiles: dict, tile: int, max_px: int, boxes: list = ()) -> int:
+    """Smallest power-of-two reduction (<= tile) that keeps the rendered mosaic, together with `boxes` drawn with
+    it ((x0, y0, w, h) in full-resolution pixels: inset_boxes), within max_px."""
+    if not tiles and not boxes:
         return 1
-    txs = [k[0] for k in tiles]
-    tys = [k[1] for k in tiles]
-    side = max(max(txs) - min(txs) + 1, max(tys) - min(tys) + 1) * tile
+    x0s, y0s, x1s, y1s = [], [], [], []
+    if tiles:
+        txs = [k[0] for k in tiles]
+        tys = [k[1] for k in tiles]
+        x0s, y0s, x1s, y1s = [min(txs) * tile], [min(tys) * tile], [(max(txs) + 1) * tile], [(max(tys) + 1) * tile]
+    for bx, by, bw, bh in boxes:
+        x0s.append(bx)
+        y0s.append(by)
+        x1s.append(bx + bw)
+        y1s.append(by + bh)
+    side = max(max(x1s) - min(x0s), max(y1s) - min(y0s))
     d = 1
     while side / d > max_px and d < tile:
         d *= 2
@@ -1434,6 +1467,57 @@ def render_tiles(tiles: dict, tile: int, d: int = 1,
         return out, (X0 * t, Y0 * t), d
     out = out[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
     return out, (X0 * t + int(cols[0]) * d, Y0 * t + int(rows[0]) * d), d
+
+
+def underlay_insets(view: tuple, rgb: np.ndarray | None, insets: list, um_per_px: float):
+    """A rendered view with the insets drawn UNDER it, each at its own scale and position.
+
+    `view` is render_tiles' (image, origin, d) and `rgb` its colour version on the same box (RGBA, or None). The
+    box is extended to the insets' boxes (the origin stays on the view's pixel grid); every inset is resampled to
+    the view's scale (inset µm/px over the mosaic's, divided by d) and painted in order, later ones on top, and
+    the canvas is painted over them wherever it has data (grey: finite; colour: alpha > 0). Insets are grey: in
+    the colour view they are opaque grey, except where they are NaN (empty). Returns (view, rgb) in the same
+    forms."""
+    img, (ox, oy), d = view
+    boxes = inset_boxes(insets, um_per_px)
+    has = bool(np.isfinite(img).any())
+    x0 = min([b[0] for b in boxes] + ([ox] if has else []))
+    y0 = min([b[1] for b in boxes] + ([oy] if has else []))
+    x1 = max([b[0] + b[2] for b in boxes] + ([ox + img.shape[1] * d] if has else []))
+    y1 = max([b[1] + b[3] for b in boxes] + ([oy + img.shape[0] * d] if has else []))
+    X0, Y0 = math.floor(x0), math.floor(y0)
+    if has:  # keep the canvas on whole pixels of the reduced view
+        X0, Y0 = ox - d * math.ceil((ox - X0) / d), oy - d * math.ceil((oy - Y0) / d)
+    H, W = math.ceil((y1 - Y0) / d), math.ceil((x1 - X0) / d)
+    out = np.full((H, W), np.nan, np.float32)
+    out_rgb = None if rgb is None else np.zeros((H, W, 4), np.uint8)
+    for it, (bx, by, bw, bh) in zip(insets, boxes):
+        tw, th = round(bw / d), round(bh / d)
+        if tw < 1 or th < 1:
+            continue
+        im = np.asarray(it.image, np.float32)
+        im = im.mean(axis=2) if im.ndim == 3 else im
+        im = cv2.resize(im, (tw, th), interpolation=cv2.INTER_AREA if tw < im.shape[1] else cv2.INTER_LINEAR)
+        px, py = round((bx - X0) / d), round((by - Y0) / d)
+        sx0, sy0, sx1, sy1 = max(0, -px), max(0, -py), min(tw, W - px), min(th, H - py)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+        part = im[sy0:sy1, sx0:sx1]
+        ok = np.isfinite(part)  # an overview inset is NaN where the old mosaic was empty: nothing is drawn there
+        out[py + sy0:py + sy1, px + sx0:px + sx1][ok] = part[ok]
+        if out_rgb is not None:
+            g = np.clip(part[ok] + 0.5, 0, 255).astype(np.uint8)
+            out_rgb[py + sy0:py + sy1, px + sx0:px + sx1][ok] = np.stack([g, g, g, np.full_like(g, 255)], -1)
+    if has:
+        vx, vy = (ox - X0) // d, (oy - Y0) // d
+        sub = out[vy:vy + img.shape[0], vx:vx + img.shape[1]]
+        ok = np.isfinite(img)
+        sub[ok] = img[ok]
+        if out_rgb is not None:
+            subr = out_rgb[vy:vy + rgb.shape[0], vx:vx + rgb.shape[1]]
+            a = rgb[..., 3] > 0
+            subr[a] = rgb[a]
+    return (out, (X0, Y0), d), out_rgb
 
 
 def render_tiles_rgb(tiles_rgb: dict, tile: int, d: int = 1) -> np.ndarray | None:

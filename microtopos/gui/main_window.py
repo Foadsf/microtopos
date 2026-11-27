@@ -1560,7 +1560,10 @@ class MainWindow(QMainWindow):
             return
         self.obj = obj
         self.settings.setValue("objective", name)
-        self.engine.set_objective(self.obj)
+        # a mosaic made with another objective restarts (keeping insets as the checkbox says, plus the old mosaic as
+        # an overview inset); one made with this objective (an opened session) is kept and tracked into again
+        restarted = self.engine.set_objective(self.obj, restart_mosaic=True,
+                                              keep_insets=self.chk_keep_insets.isChecked())
         if self.sim_source is not None:
             self.sim_source.set_objective(self.obj)
         self.sp_ls.blockSignals(True)
@@ -1568,9 +1571,9 @@ class MainWindow(QMainWindow):
         self.sp_ls.blockSignals(False)
         self._ls_user_set = False
         self._cancel_rotation_measure()
-        self.engine.reset_mosaic()
         self._refresh_checklist()
-        self.notify(f"Objective {name}. Mosaic restarted for the new magnification.")
+        self.notify(f"Objective {name}. " + ("Mosaic restarted for the new magnification." if restarted
+                                              else "The mosaic was made with this objective: mapping continues."))
 
     def _on_objective_hint(self, ratio):
         if ratio is not None and abs(math.log(ratio)) < math.log(1.6):
@@ -3095,6 +3098,9 @@ class MainWindow(QMainWindow):
         s = self.engine.snapshot()
         if s.preview is None:
             self.notify("No live image to inset yet.", "warning")
+            return
+        if s.mosaic_hold:  # the live view's position is in no mosaic coordinates
+            self.notify(f"No inset: the live view is not tracked into this mosaic ({s.mosaic_hold}).", "warning")
             return
         # The mosaic is in preview pixels, so the inset's scale is the preview's (the same one the Live view uses,
         # calibrated for this camera mode or nominal) and its position is the live view's mosaic position.

@@ -168,3 +168,54 @@ def test_theoretical_fwhm_of_a_response_narrower_than_two_samples(name, um_per_p
     got = theoretical_fwhm_um(obj, um_per_px, lambda im: np.full(im.shape, float(im.max() - im.min()), np.float32), tex)
     assert got is not None
     assert got == pytest.approx(hand, rel=0.01), (got, hand)
+
+
+# ------------------------------------------------------------------------------------------------ colour fusion
+def _two_frame_stack(h: int, w: int):
+    """Two integer-valued frames, each sharp on one half, and the complementary hard weight step."""
+    rng = np.random.default_rng(0)
+    tex = np.rint(rng.random((h, w)) * 255).astype(np.float32)
+    left = np.arange(w)[None, :] < w // 2
+    f0 = np.where(left, tex, 128.0).astype(np.float32)
+    f1 = np.where(~left, tex, 128.0).astype(np.float32)
+    w0 = np.broadcast_to(left, (h, w)).astype(np.float32)
+    return (f0, f1), (w0, 1.0 - w0)
+
+
+def test_colour_fusion_uses_the_same_pyramid_as_the_grey_fusion():
+    """EDFAccumulator took its pyramid depth from min(shape), which is 3 for (H, W, 3): the colour all-in-focus image
+    got 1 level instead of 5, so it was not the fusion the luma image got. Ground truth: frames whose three channels
+    equal a grey frame must fuse to the grey fusion, channel by channel."""
+    frames, weights = _two_frame_stack(256, 320)
+    grey, colour = sff.EDFAccumulator((256, 320)), sff.EDFAccumulator((256, 320, 3))
+    for f, wt in zip(frames, weights):
+        grey.add(f, wt)
+        colour.add(np.dstack([f] * 3), wt)
+    rg, rc = grey.result(), colour.result()
+    assert np.max(np.abs(rc - rg[..., None])) < 1e-3
+
+
+OBJ10 = resolve("10x / 0.25", objset=BUILTIN)
+
+
+def _grey_sweep(seed: int = 3):
+    """A 9-frame simulated 10x sweep, 320 x 240, as uint8 grey frames, and its true focus positions."""
+    sim = SpecimenSimulator(seed, OBJ10, out_w=320, out_h=240)
+    frames, zs = [], []
+    for z_k in sim.sweep_trajectory(n_frames=9):
+        sim.focus_z_um = float(z_k)
+        bgr, truth = sim.render()
+        frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        zs.append(truth.focus_z_um)
+    return frames, np.array(zs)
+
+
+def test_reconstructed_colour_edf_of_grey_frames_equals_the_grey_edf():
+    """End to end through zstack.reconstruct: colour frames that are the luma frames replicated into three channels
+    must give edf_rgb equal to the rounded luma edf in every channel."""
+    frames, zs = _grey_sweep()
+    r = zstack.reconstruct(frames, zs, OBJ10, 1.0, "um", color_frames=[np.dstack([f] * 3) for f in frames],
+                           settings=zstack.ZSettings(allow_tiling=False))
+    for c in range(3):
+        assert np.max(np.abs(r["edf_rgb"][..., c].astype(np.float32) - r["edf"])) <= 0.5 + 1e-3
+

@@ -284,12 +284,14 @@ class EDFAccumulator:
     """Streaming Laplacian-pyramid fusion: add (frame, weight) pairs one at a time, normalised at the end.
 
     Weights should already be normalised across the stack per pixel; they are low-pass filtered by the
-    Gaussian pyramid, which avoids seams between frames.
+    Gaussian pyramid, which avoids seams between frames. `shape` is (H, W) for grey frames or (H, W, channels)
+    for colour frames fused with a (H, W) weight; the pyramid depth depends on (H, W) only, so a colour fusion
+    uses the same levels as the grey one.
     """
 
-    def __init__(self, shape: tuple[int, int], levels: int = 5):
+    def __init__(self, shape: tuple[int, ...], levels: int = 5):
         self.shape = shape
-        self.levels = max(1, min(levels, int(np.log2(min(shape))) - 3))
+        self.levels = max(1, min(levels, int(np.log2(min(shape[:2]))) - 3))  # (H, W) or (H, W, channels)
         self.acc = None
         self.wsum = None
 

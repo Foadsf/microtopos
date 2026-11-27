@@ -142,9 +142,17 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
         with w.sim_source.lock:
             w.sim_source.sim.tremor_px = 0.6
     t0 = time.time()
-    while len(w.engine.dwell_frames()) < 8 and time.time() - t0 < 30:  # still frames for the dwell buffer
+    # the simulator plays its scripted refocus one step per frame: on a slow machine it is still moving the focus
+    # here, and the dwell buffer (16 frames) holds frames from different focus heights that do not register. Wait
+    # for the script to end, then for 16 more frames so that the buffer holds only frames of the still view.
+    while w.sim_source is not None and w.sim_source.busy() and time.time() - t0 < 60:
         pump(app, 0.2)
-    log.append(f"{'ok' if len(w.engine.dwell_frames()) >= 8 else 'FAIL'}    view still for super-resolution")
+    seq_still = w.engine.snapshot().seq
+    while ((w.engine.snapshot().seq < seq_still + 16 or len(w.engine.dwell_frames()) < 8)
+           and time.time() - t0 < 90):
+        pump(app, 0.2)
+    still = (w.sim_source is None or not w.sim_source.busy()) and len(w.engine.dwell_frames()) >= 8
+    log.append(f"{'ok' if still else 'FAIL'}    view still for super-resolution")
     sr_job_before = w.sr_job
 
     def start_sr():

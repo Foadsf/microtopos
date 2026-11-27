@@ -111,6 +111,12 @@ sweep is limited to 1.5 % and reported as a warning.</p>
 
 STEPS = ["Camera", "Objective", "Dark && flat", "Lateral scale", "Z scale", "Inspect"]
 
+# The profile-roughness cut-off used when the L-filter is off, in words built from the constants the code divides by
+# (the λc tooltip and the profile label both say this; neither may state another rule).
+DEFAULT_PROFILE_CUTOFF_TEXT = (f"the profile length / {metrology.PROFILE_TRAVERSE_CUTOFFS:g} "
+                               f"({metrology.PROFILE_EVAL_CUTOFFS:g} sections of λc plus "
+                               f"{metrology.PROFILE_RUN_CUTOFFS / 2:g} λc run-in and run-out)")
+
 
 class Bridge(QObject):
     sweep = Signal(object)
@@ -1195,8 +1201,8 @@ class MainWindow(QMainWindow):
         self.sp_lc.setSuffix(" µm")
         self.sp_lc.setSpecialValueText("off")
         self.sp_lc.setToolTip("L-filter nesting index λc (removes longer wavelengths, i.e. waviness). 0 = off. "
-                              "Also the cut-off of the profile roughness on the Height tab "
-                              "(0 = a fifth of the profile length)")
+                              "Also the cut-off of the profile roughness on the Height tab; "
+                              f"at 0 that cut-off is {DEFAULT_PROFILE_CUTOFF_TEXT}")
         self.sp_lc.valueChanged.connect(lambda _v: self._update_profile())
         f = QFormLayout()
         f.addRow("Mode", self.cmb_override)
@@ -2564,8 +2570,7 @@ class MainWindow(QMainWindow):
         lam_c = self.sp_lc.value()
         origin = "L-filter setting"
         if lam_c <= 0:
-            lam_c, origin = (length / metrology.PROFILE_TRAVERSE_CUTOFFS,
-                             "default: a sixth of the line (5 sections + λc/2 run-in and run-out)")
+            lam_c, origin = length / metrology.PROFILE_TRAVERSE_CUTOFFS, f"default: {DEFAULT_PROFILE_CUTOFF_TEXT}"
         lam_s = float(r.get("lambda_s_um") or 0.0)
         why = metrology.profile_cutoff_problem(n, step, lam_c)
         if why is not None:

@@ -555,6 +555,26 @@ def test_feature_checkbox_computes_spd_and_the_known_hill_count_and_area(window,
     assert "Spd_per_mm2" not in w.result and "Hill count" not in w.report.toPlainText()
 
 
+# ---------------------------------------------------------------- audit defects: words, height tools across maps, races
+
+def test_lambda_c_tooltip_and_profile_label_state_the_default_cutoff_the_code_applies(window, qapp, swept):
+    """With the L-filter off the profile roughness uses length / PROFILE_TRAVERSE_CUTOFFS (6: five sections plus
+    the λc/2 run-in and run-out). The λc tooltip said 'a fifth of the profile length'."""
+    w = window
+    rule = f"profile length / {metrology.PROFILE_TRAVERSE_CUTOFFS:g}"
+    assert rule in w.sp_lc.toolTip(), w.sp_lc.toolTip()
+    assert "fifth" not in w.sp_lc.toolTip()
+    um = swept["um_per_px"]
+    _install(qapp, w, swept, _two_sine_surface(um), form=0, mode=0)
+    w.sp_lc.setValue(0.0)
+    _pump(qapp, 5)
+    p0, p1 = w.prof_roi.getHandles()
+    length = float(np.hypot(p1.pos().x() - p0.pos().x(), p1.pos().y() - p0.pos().y()))
+    text = w.prof_label.text()
+    assert rule in text, text  # the label states the same rule as the tooltip ...
+    assert f"λc {length / metrology.PROFILE_TRAVERSE_CUTOFFS:.3g} µm" in text  # ... and applies it
+
+
 # ---------------------------------------------------------------- session save/load
 
 def test_mosaic_session_save_and_load_roundtrip(window, qapp, tmp_path):

@@ -739,6 +739,10 @@ def test_sdq_is_reported_as_the_dimensionless_rms_gradient(window, qapp, swept):
     assert unit == "", lines[k:k + 4]
     assert "root mean square gradient" in meaning.lower() and "dimensionless" in meaning
     assert "rad" not in unit and "mean surface slope" not in meaning.lower()
+    # Sdq and Sdr are hybrid parameters in ISO 25178-2 (they combine height and lateral information), not amplitude
+    heading = [ln for ln in lines[:k] if "ISO 25178-2" in ln][-1]
+    assert heading == "Hybrid (ISO 25178-2)", heading
+    assert lines.index("Sdr") > k and not [ln for ln in lines[k:lines.index("Sdr")] if "ISO 25178" in ln]
 
 
 # ---------------------------------------------------------------- session save/load

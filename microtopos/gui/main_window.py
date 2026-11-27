@@ -2717,7 +2717,8 @@ class MainWindow(QMainWindow):
             ("Sp", "Sp", zu, "Maximum peak height", "{:.4g}", "height"),
             ("Sv", "Sv", zu, "Maximum pit depth", "{:.4g}", "height"),
             ("Sz", "Sz", zu, "Maximum height (Sp + Sv)", "{:.4g}", "height"),
-            ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height"),
+            ("Ssk", "Ssk", "", "Skewness", "{:.4g}", "height"), ("Sku", "Sku", "", "Kurtosis", "{:.4g}", "height")])
+        body += table("Hybrid (ISO 25178-2)", [
             ("Sdq", "Sdq", "", "Root mean square gradient (dimensionless, 1 = 45° plane; needs z in µm)", "{:.4g}",
              "height"),
             ("Sdr", "Sdr_pct", "%", "Developed interfacial area ratio (needs z in µm)", "{:.4g}", "Sdr")])

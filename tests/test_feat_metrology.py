@@ -357,8 +357,11 @@ def test_step_height_regions_recovers_planted_step_and_standard_error():
     assert res["step_height"] == pytest.approx(3.5, abs=0.02)
     assert res["abs_step_height"] == pytest.approx(3.5, abs=0.02)
     assert res["std_a"] == pytest.approx(noise, rel=0.1) and res["std_b"] == pytest.approx(noise, rel=0.1)
-    # standard error of the difference of two region means: noise * sqrt(1/n_a + 1/n_b)
-    assert res["standard_error"] == pytest.approx(noise * math.sqrt(1 / 1800 + 1 / 1800), rel=0.1)
+    # standard error of the step with the shared tilt fitted from the same pixels: the difference of the two region
+    # means (noise^2 (1/n_a + 1/n_b)) plus the tilt's uncertainty carried over the 50 px between the region centres,
+    # dx^2 noise^2 / S_xx with S_xx = 2 regions x 60 rows x 30 (30^2 - 1) / 12 (within-region spread of x)
+    s_xx = 2 * 60 * 30 * (30**2 - 1) / 12
+    assert res["standard_error"] == pytest.approx(noise * math.sqrt(1 / 1800 + 1 / 1800 + 50**2 / s_xx), rel=0.03)
     assert (res["pixels_a"], res["pixels_b"]) == (1800, 1800)
 
 

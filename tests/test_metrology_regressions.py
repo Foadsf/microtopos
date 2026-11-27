@@ -163,3 +163,102 @@ def test_summit_density_of_a_tilted_plane_is_zero_and_of_an_egg_crate_is_exact()
     assert n_summits == 9 * 14 + 10 * 15
     e = metrology.analyze(crate.astype(np.float32), _edf(crate), d, "µm", 1.0, form_order=1, lam_s_um=0.0)
     assert e["Sds_per_mm2"] == pytest.approx(n_summits / area_mm2, rel=1e-9)
+
+
+# ---------------------------------------------------------------- interactive tools: mask rectangle, step height, 3-point
+
+
+@pytest.mark.parametrize("rect, cols, rows", [
+    ((-30, 10, -2, 20), (0, 0), (10, 20)),  # entirely left of the image
+    ((10, -40, 30, -1), (10, 30), (0, 0)),  # entirely above
+    ((90, 10, 120, 20), (80, 80), (10, 20)),  # entirely right
+    ((10, 60, 30, 90), (10, 30), (50, 50)),  # entirely below
+    ((-5, 10, 3, 20), (0, 3), (10, 20)),  # partly left: only columns 0..2 are on the image
+    ((3, 20, -5, 10), (0, 3), (10, 20)),  # the same, corners given the other way round
+    ((70, 45, 95, 70), (70, 80), (45, 50)),  # partly over the bottom-right corner
+])
+def test_mask_rectangle_off_the_image_is_clipped_not_wrapped(rect, cols, rows):
+    """A clipped end coordinate of -2 used to become the slice end -2 (Python counts from the end), so a rectangle
+    dragged entirely off the left edge masked 780 of 4000 pixels. Only the on-image part may be masked."""
+    z = np.zeros((50, 80), np.float32)
+    want = np.zeros((50, 80), bool)
+    want[rows[0]:rows[1], cols[0]:cols[1]] = True  # built with already clipped, non-negative bounds
+    assert np.array_equal(np.isnan(metrology.apply_exclusion_mask(z, rect)), want)
+    assert np.array_equal(np.isnan(metrology.apply_exclusion_mask(z, rect, invert=True)), ~want)
+
+
+def test_step_region_off_the_image_is_refused():
+    """A region dragged off the image used to wrap round and select most of the image (3950 px), and a step was
+    reported. It has no pixels and must be refused."""
+    z = np.zeros((50, 80), np.float32)
+    z[:, 40:] = 1.0
+    with pytest.raises(ValueError, match="region A has no pixels"):
+        metrology.step_height_regions(z, (-30, 0, -1, 50), (50, 0, 70, 50))
+    with pytest.raises(ValueError, match="region B has no pixels"):
+        metrology.step_height_regions(z, (5, 0, 30, 50), (50, -20, 70, -3))
+    # a region partly off the image keeps its on-image part: an exact step of 1 with no tilt
+    m = metrology.step_height_regions(z, (-10, 5, 10, 45), (50, 5, 90, 45))
+    assert m["step_height"] == pytest.approx(1.0, abs=1e-9)
+    assert (m["pixels_a"], m["pixels_b"]) == (10 * 40, 30 * 40)
+
+
+@pytest.mark.parametrize("ra, rb", [
+    ((5, 5, 25, 6), (5, 30, 25, 31)),  # one row each: y is a combination of the two indicators
+    ((5, 5, 6, 30), (30, 5, 31, 30)),  # one column each: x is
+])
+def test_step_height_on_parallel_one_pixel_regions_is_refused(ra, rb):
+    """With one-row (or one-column) regions the tilt column is collinear with the region indicators; lstsq returned
+    its minimum-norm solution, a step of 0.19 instead of 1.0 with a standard error of 3e-17. Refuse instead."""
+    yy, xx = np.mgrid[0:40, 0:40]
+    z = np.where(yy >= 20 if ra[3] - ra[1] == 1 else xx >= 20, 1.0, 0.0).astype(np.float32)
+    with pytest.raises(ValueError, match="parallel lines"):
+        metrology.step_height_regions(z, ra, rb)
+
+
+def test_step_height_on_a_row_and_a_column_is_exact():
+    """A one-row region and a one-column region are not parallel, so tilt and step are separable and the exact step
+    of a tilted ideal terrace is recovered: the rank test must not refuse a design that is identifiable."""
+    yy, xx = np.mgrid[0:40, 0:40].astype(np.float64)
+    z = (np.where(yy >= 20, 1.0, 0.0) + 0.01 * xx - 0.02 * yy).astype(np.float64)
+    m = metrology.step_height_regions(z, (5, 5, 25, 6), (30, 25, 31, 36))
+    assert m["step_height"] == pytest.approx(1.0, abs=1e-9)
+
+
+def _ols_contrast_se(z, ma, mb):
+    """Independent OLS standard error of c_b - c_a for z = c_a I_a + c_b I_b + gx x + gy y (raw coordinates)."""
+    yy, xx = np.mgrid[0:z.shape[0], 0:z.shape[1]].astype(np.float64)
+    both = ma | mb
+    X = np.column_stack([ma[both], mb[both], xx[both], yy[both]]).astype(np.float64)
+    y = z[both].astype(np.float64)
+    beta = np.linalg.solve(X.T @ X, X.T @ y)
+    r = y - X @ beta
+    s2 = r @ r / (y.size - 4)
+    C = np.linalg.inv(X.T @ X)
+    return beta[1] - beta[0], math.sqrt(s2 * (C[0, 0] + C[1, 1] - 2 * C[0, 1]))
+
+
+def test_step_height_standard_error_includes_the_fitted_tilt():
+    """Two 80 x 10 px terraces 80 rows apart on a tilted surface. The step is strongly correlated with the fitted
+    y-tilt, so its scatter over repeated noise is 15 x the sqrt(var_a/n_a + var_b/n_b) that v0.10 reported.
+    The reported SE must equal the OLS contrast standard error (independent computation) and match the Monte Carlo
+    scatter of the step over 300 noise realisations (sampling error of that SD about 4 %)."""
+    h, w, sigma = 100, 100, 0.05
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[0:h, 0:w]
+    truth = np.where(yy >= 50, 1.0, 0.0) + 0.002 * xx + 0.003 * yy
+    rect_a, rect_b = (10, 0, 90, 10), (10, 90, 90, 100)
+    ma = np.zeros((h, w), bool)
+    ma[0:10, 10:90] = True
+    mb = np.zeros((h, w), bool)
+    mb[90:100, 10:90] = True
+    steps, ses = [], []
+    for _ in range(300):
+        z = (truth + rng.normal(0, sigma, truth.shape)).astype(np.float32)
+        m = metrology.step_height_regions(z, rect_a, rect_b)
+        step_ref, se_ref = _ols_contrast_se(z, ma, mb)
+        assert m["step_height"] == pytest.approx(step_ref, abs=1e-9)
+        assert m["standard_error"] == pytest.approx(se_ref, rel=1e-6)
+        steps.append(m["step_height"])
+        ses.append(m["standard_error"])
+    assert np.mean(steps) == pytest.approx(1.0, abs=0.01)
+    assert np.mean(ses) == pytest.approx(np.std(steps, ddof=1), rel=0.15)

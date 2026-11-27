@@ -98,43 +98,79 @@ def level_three_points(z: np.ndarray, pts_xy_px: list[tuple[float, float]], radi
     return np.where(np.isfinite(z), z - plane, np.nan).astype(np.float32)
 
 
-def apply_exclusion_mask(z: np.ndarray, rect_px: tuple[int, int, int, int], invert: bool = False) -> np.ndarray:
-    """Mask out a rectangular region `(x0, y0, x1, y1)` in pixel coordinates (or keep only that region if `invert`)."""
-    h, w = z.shape
+def _rect_mask(shape: tuple[int, int], rect_px: tuple[int, int, int, int]) -> np.ndarray:
+    """Pixels of the rectangle `(x0, y0, x1, y1)` (corners in any order, end exclusive) that lie on the image.
+
+    Coordinates are clipped to the image, so a rectangle partly off the image keeps its on-image part and one
+    entirely off the image selects nothing (a clipped negative end must not become a Python negative index).
+    """
+    h, w = shape
     x0, y0, x1, y1 = rect_px
-    x0, x1 = max(0, min(x0, x1)), min(w, max(x0, x1))
-    y0, y1 = max(0, min(y0, y1)), min(h, max(y0, y1))
-    mask = np.zeros((h, w), bool)
-    mask[y0:y1, x0:x1] = True
+    xa, xb = (min(max(int(v), 0), w) for v in sorted((x0, x1)))
+    ya, yb = (min(max(int(v), 0), h) for v in sorted((y0, y1)))
+    m = np.zeros((h, w), bool)
+    m[ya:yb, xa:xb] = True
+    return m
+
+
+def apply_exclusion_mask(z: np.ndarray, rect_px: tuple[int, int, int, int], invert: bool = False) -> np.ndarray:
+    """Mask out a rectangular region `(x0, y0, x1, y1)` in pixel coordinates (or keep only that region if `invert`).
+
+    The part of the rectangle off the image is ignored (see _rect_mask)."""
+    mask = _rect_mask(z.shape, rect_px)
     out = z.copy()
     out[~mask if invert else mask] = np.nan
     return out
 
 
+# Relative singular value below which the step-height design cannot separate the step from the tilt
+STEP_DESIGN_RCOND = 1e-9
+
+
 def step_height_regions(z: np.ndarray, rect_a_px: tuple[int, int, int, int],
                         rect_b_px: tuple[int, int, int, int]) -> dict:
-    """ISO 5436-style two-region step height measurement with common-plane tilt removal."""
+    """ISO 5436-style two-region step height measurement with common-plane tilt removal.
+
+    Fits z = c_a I_a + c_b I_b + g_x x + g_y y by least squares over the valid pixels of both regions (I_a, I_b
+    are the region indicators, so both terraces share one tilt) and reports step = c_b - c_a. `standard_error` is
+    the ordinary-least-squares standard error of that contrast, σ̂ sqrt(C_aa + C_bb - 2 C_ab) with
+    C = (XᵀX)⁻¹ and σ̂² = residual sum of squares / (n - 4): it includes the uncertainty of the fitted tilt,
+    which dominates when the terraces are far apart along the tilt. It assumes independent pixel noise.
+    Raises ValueError when a region has no pixels on the image, fewer than 9 valid pixels, or when the two regions
+    lie on parallel lines (e.g. one row or one column each), where the tilt cannot be told apart from the step.
+    """
     h, w = z.shape
-
-    def mask_of(r):
-        x0, y0, x1, y1 = r
-        m = np.zeros((h, w), bool)
-        m[max(0, min(y0, y1)):min(h, max(y0, y1)), max(0, min(x0, x1)):min(w, max(x0, x1))] = True
-        return m & np.isfinite(z)
-
-    ma, mb = mask_of(rect_a_px), mask_of(rect_b_px)
+    fin = np.isfinite(z)
+    ma, mb = _rect_mask(z.shape, rect_a_px), _rect_mask(z.shape, rect_b_px)
+    for name, m in (("A", ma), ("B", mb)):
+        if not m.any():
+            raise ValueError(f"step-height region {name} has no pixels on the image")
+    ma, mb = ma & fin, mb & fin
     if ma.sum() < 9 or mb.sum() < 9:
         raise ValueError("each step-height region needs at least 9 valid pixels")
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     both = ma | mb
-    # Fit z = c_a * I_a + c_b * I_b + gx * x + gy * y so a shared tilt across both terraces is removed
-    X = np.column_stack([ma[both].astype(float), mb[both].astype(float), xx[both], yy[both]])
-    coef, *_ = np.linalg.lstsq(X, z[both].astype(np.float64), rcond=None)
-    ca, cb, gx, gy = coef
+    # Fit z = c_a * I_a + c_b * I_b + gx * x + gy * y so a shared tilt across both terraces is removed.
+    # Coordinates are centred and scaled only to condition the rank test; the step c_b - c_a does not change.
+    xc, yc = xx[both] - xx[both].mean(), yy[both] - yy[both].mean()
+    sx, sy = max(float(np.abs(xc).max()), 1.0), max(float(np.abs(yc).max()), 1.0)
+    X = np.column_stack([ma[both].astype(float), mb[both].astype(float), xc / sx, yc / sy])
+    sv = np.linalg.svd(X, compute_uv=False)
+    if sv[-1] < STEP_DESIGN_RCOND * sv[0]:
+        raise ValueError("the two step-height regions lie on parallel lines (e.g. one row or column each), so the "
+                         "tilt cannot be separated from the step; make each region at least 2 pixels in both "
+                         "directions")
+    zb = z[both].astype(np.float64)
+    coef, *_ = np.linalg.lstsq(X, zb, rcond=None)
+    ca, cb = coef[0], coef[1]
     step = float(cb - ca)
-    ra = z[ma] - (ca + gx * xx[ma] + gy * yy[ma])
-    rb = z[mb] - (cb + gx * xx[mb] + gy * yy[mb])
-    se = float(math.sqrt(np.var(ra) / ma.sum() + np.var(rb) / mb.sum()))
+    resid = zb - X @ coef
+    n = zb.size
+    dof = n - X.shape[1]
+    sigma2 = float(resid @ resid) / dof if dof > 0 else float("nan")
+    C = np.linalg.inv(X.T @ X)
+    se = float(math.sqrt(sigma2 * (C[0, 0] + C[1, 1] - 2 * C[0, 1])))
+    ra, rb = resid[ma[both]], resid[mb[both]]
     return {
         "step_height": step,
         "abs_step_height": abs(step),

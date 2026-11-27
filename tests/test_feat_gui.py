@@ -231,13 +231,20 @@ def _install(app, w, swept, height, form=0, mode=0, base=None):
 
 
 def _three_point_expected(z, pts, radius):
-    """Plane through the medians of the (2 radius + 1)-px square patches at the 3 points, subtracted from z."""
+    """Plane through the 3 patch samples, subtracted from z: each sample is the mean height of the valid pixels of the
+    (2 radius + 1)-px square patch within 3 x 1.4826 x MAD of the patch median, placed at those pixels' centroid
+    (metrology.level_three_points' definition, rebuilt here with plain numpy)."""
     rows, vals = [], []
     for px, py in pts:
         ix, iy = round(px), round(py)
-        patch = z[max(0, iy - radius):iy + radius + 1, max(0, ix - radius):ix + radius + 1]
-        rows.append([1.0, px, py])
-        vals.append(np.nanmedian(patch))
+        y0, x0 = max(0, iy - radius), max(0, ix - radius)
+        patch = z[y0:iy + radius + 1, x0:ix + radius + 1].astype(np.float64)
+        yy, xx = np.nonzero(np.isfinite(patch))
+        v = patch[yy, xx]
+        dev = np.abs(v - np.median(v))
+        keep = dev <= 3.0 * 1.4826 * np.median(dev)
+        rows.append([1.0, xx[keep].mean() + x0, yy[keep].mean() + y0])
+        vals.append(v[keep].mean())
     c0, cx, cy = np.linalg.solve(np.array(rows), np.array(vals, np.float64))
     yy, xx = np.mgrid[0:z.shape[0], 0:z.shape[1]].astype(np.float64)
     return z - (c0 + cx * xx + cy * yy)
@@ -298,8 +305,8 @@ def test_three_point_levelling_removes_the_tilt_whatever_layer_is_shown(window, 
     coef = np.linalg.lstsq(A, diff[ok].astype(np.float64), rcond=None)[0]
     assert np.abs(A @ coef - diff[ok]).max() < 1e-3
     assert np.allclose(c, -TILT, rtol=0.03)
-    # the plane is the one through the medians of three 10 um patches around the picked points, computed here
-    # independently with numpy; every parameter was recomputed from that height (Sa is the plain mean |z - mean|)
+    # the plane is the one through the outlier-trimmed means of three 10 um patches around the picked points, each at
+    # its pixels' centroid, computed here independently with numpy; every parameter was recomputed from that height (Sa is the plain mean |z - mean|)
     expected = _three_point_expected(tilted, pts, max(3, round(10 / um)))
     assert np.allclose(after["height"], expected, atol=2e-4, equal_nan=True)
     assert after["Sa"] == pytest.approx(_sa(expected), rel=1e-3)

@@ -484,8 +484,8 @@ class Mosaic:
             self.ref = len(self.keyframes) - 1
             self._loop_closure(win)
             return True, q
-        if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe
-            self.ref = self._nearest(self.x, self.y)
+        if moved > 0.45 * min(h, w):  # reference about to leave the view: switch to the nearest keyframe of this area
+            self.ref = self._nearest(self.x, self.y, area=self.current_area)
         return False, q
 
     def _derotate(self, bp: np.ndarray) -> np.ndarray:
@@ -535,10 +535,17 @@ class Mosaic:
         # re-acquisition from it would place frames in that area's coordinates under this area's id
         self.last_good = (f, fb, (x, y), self.angle_deg)
 
-    def _nearest(self, x, y, k: int = 1):
-        d = [math.hypot(x - kf.x, y - kf.y) for kf in self.keyframes]
-        order = np.argsort(d)
-        return int(order[0]) if k == 1 else [int(i) for i in order[:k]]
+    def _nearest(self, x, y, k: int = 1, area: int | None = None):
+        """Index (k = 1) or indices of the keyframes nearest (x, y); with `area`, only that area's keyframes.
+
+        Areas are not connected: a position in one area's coordinates says nothing about where another area's
+        keyframes are (a separate area is placed to the right of everything, and panning it moves its coordinates
+        over the others' keyframes). Whatever is anchored to the camera position (the tracking reference, a height
+        map) must use the camera's own area."""
+        idx = [i for i, kf in enumerate(self.keyframes) if area is None or kf.area == area]
+        d = [math.hypot(x - self.keyframes[i].x, y - self.keyframes[i].y) for i in idx]
+        order = np.argsort(d, kind="stable")
+        return idx[int(order[0])] if k == 1 else [idx[int(i)] for i in order[:k]]
 
     def _relocalize(self, f, fb, win) -> bool:
         """After losing track, try the keyframes nearest the last known position (bounded work per attempt)."""
@@ -1133,7 +1140,9 @@ class Mosaic:
         from . import units
 
         unit = units.canon(z_unit)
-        kf = self._nearest(x, y) if self.keyframes else None
+        # the camera's own area: a keyframe of another area does not move with this view when the areas are joined
+        mine = any(k.area == self.current_area for k in self.keyframes)
+        kf = self._nearest(x, y, area=self.current_area) if mine else None
         rel = (x - self.keyframes[kf].x, y - self.keyframes[kf].y) if kf is not None else (0.0, 0.0)
         self.patches.append(HeightPatch(x, y, edf.astype(np.float32), height.astype(np.float32), unit, 0.0, kf, rel,
                                         z_key or unit, rid))

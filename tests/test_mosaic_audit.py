@@ -189,3 +189,62 @@ def test_the_gui_render_of_the_view_shows_one_state_in_grey_and_colour(monkeypat
     (img, origin, d), *_ = eng.mosaic_image()
     assert (origin, d) == (view0[1], view0[2]) and _same_image(img, view0[0])
     assert np.array_equal(eng.mosaic_image_rgb(), rgb_expect)
+
+
+# ------------------------------------------------------------------------------------------ R6 area of a patch
+
+
+def _pan_b_over_a(record, blur=None):
+    """Area A mapped at stage x 300..700; area B started at stage x 1900 and panned left until it joins A. B is
+    placed to the right of A in mosaic coordinates, so panning it left moves its coordinates over A's keyframes.
+    record(stage x, mosaic) is called after every frame of the B pan; frames at stage x in the range `blur` are
+    blurred (motion blur: too soft for a keyframe, still tracked). Returns the stage."""
+    s = _Stage(_world(8, 900, 3200), y=300)
+    s.pan(300, 700)
+    s.at(1900, 46)
+    assert s.events == ["new_area"]
+    for cx in np.arange(1900, 600, -20):
+        if blur is not None and blur[0] <= cx <= blur[1]:
+            added, _ = s.m.track(cv2.GaussianBlur(s.frame(float(cx)), (0, 0), 1.5))
+            if added:
+                s.truth.append((float(cx), s.y))
+            s.events += [s.m.last_event] if s.m.last_event else []
+        else:
+            s.at(float(cx))
+        record(float(cx), s.m)
+    assert "areas_joined" in s.events and s.m.areas == 1
+    return s
+
+
+def test_a_height_map_pinned_in_a_separate_area_moves_with_it_when_the_areas_join():
+    """The height map is pinned while the camera is in B at mosaic coordinates nearer to one of A's keyframes than
+    to any of B's. Attached to that A keyframe, it stayed behind when B was moved into A's coordinates (824 px off).
+    After the join it must sit where its view is in A's coordinates: stage x minus A's stage-to-mosaic offset."""
+    pinned = {}
+
+    def record(cx, m):
+        if pinned or m.areas != 2:
+            return
+        d_other = min(np.hypot(k.x - m.x, k.y - m.y) for k in m.keyframes if k.area != m.current_area)
+        d_own = min(np.hypot(k.x - m.x, k.y - m.y) for k in m.keyframes if k.area == m.current_area)
+        if d_other < d_own:
+            pinned["cx"] = cx
+            m.add_height_patch(m.x, m.y, np.full((VH, VW), 80, np.float32), np.zeros((VH, VW), np.float32), "um")
+
+    s = _pan_b_over_a(record)
+    assert pinned, "the camera never came nearer to an A keyframe while in B (the case under test)"
+    off_a = s.truth[0][0] - s.m.keyframes[0].x  # stage x - mosaic x in A
+    assert abs(s.m.patches[0].x - (pinned["cx"] - off_a)) < 2.0
+
+
+def test_the_tracking_reference_stays_in_the_cameras_area():
+    """When the reference keyframe is about to leave the view and the frame is too soft for a new keyframe, the
+    tracker switches to the nearest keyframe. Taken from any area, that was one of A's while the camera was in B
+    (B's coordinates say nothing about A), and the next keyframe got an edge to it: a relative position between two
+    unconnected areas. Every pose-graph edge must agree with the true relative stage position of its keyframes."""
+    refs = []
+    s = _pan_b_over_a(lambda cx, m: refs.append((m.keyframes[m.ref].area, m.current_area)), blur=(900, 1500))
+    assert all(r == c for r, c in refs)
+    sx = [cx for cx, _ in s.truth]
+    bad = [(i, j, round(ex - (sx[j] - sx[i]), 1)) for i, j, ex, _ey, _w in s.m.edges if abs(ex - (sx[j] - sx[i])) > 3]
+    assert bad == []

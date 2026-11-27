@@ -145,12 +145,28 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
     while len(w.engine.dwell_frames()) < 8 and time.time() - t0 < 30:  # still frames for the dwell buffer
         pump(app, 0.2)
     log.append(f"{'ok' if len(w.engine.dwell_frames()) >= 8 else 'FAIL'}    view still for super-resolution")
-    step("super-resolution", w._run_sr)
+    sr_job_before = w.sr_job
+
+    def start_sr():
+        # a single frame that is not still empties the dwell buffer (live.py), so on a slow machine the tremor can
+        # take it below 8 frames between the check above and the press; _run_sr then only asks the user to hold
+        # still. Press again, as a user would, until the job has started.
+        t0 = time.time()
+        while w.sr_job is sr_job_before and time.time() - t0 < 30:
+            if len(w.engine.dwell_frames()) >= 8:
+                w._run_sr()
+            if w.sr_job is sr_job_before:
+                pump(app, 0.2)
+        assert w.sr_job is not sr_job_before, "no 8 still frames at a press within 30 s"
+
+    step("super-resolution", start_sr)
     t0 = time.time()
     while getattr(w, "sr_count", 0) == sr_before and time.time() - t0 < 30:
         pump(app, 0.2)
+    sr_state = ("not started" if w.sr_job is sr_job_before
+                else "still running" if w.sr_job.isRunning() else "finished")
     log.append(f"{'ok' if getattr(w, 'sr_count', 0) > sr_before else 'FAIL'}    super-resolution produced a new image"
-               f" ({w.lbl_job.text()[:120]})")
+               f" (job {sr_state}; {w.lbl_job.text()[:120]})")
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
     step("objective change", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
     pump(app, 1)

@@ -45,6 +45,20 @@ Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Pyth
 
 ## Status (v0.10, November 2026)
 
+v0.10.2 fixes defects found in two reviews of the code added since v0.9.0 (PR #22 and PR #23). The ones that change a measurement:
+
+- **Step height:** the standard error of a step height is computed from the least-squares covariance. It was about 15× too small before. A one-pixel-wide region no longer returns a wrong step.
+- **3-point levelling:** a clicked patch at the image edge no longer leaves a tilt.
+- **Masking:** a rectangle dragged past the image edge no longer wraps around.
+- **ISO 21920 profile:** the profile parameters follow the standard's conventions for the cut-off count, run-in and run-out, Rz sections and volume parameters, and Sds is 0 for a plane.
+- **Reversed hand sweeps:** a sweep that turns back near focus is detected at 40×.
+- **Stage Z labels:** an attached stage labels frames with its Z only during a Z sweep, so hand sweeps and replays can be reconstructed again.
+- **Grbl report units:** the Grbl driver reads the report-unit setting (`$13`), so positions reported in inches are converted. Before, they were read as millimetres, 25.4× too small. A feed hold, check mode or sleep is reported as an error, not as arrival. This was verified against a simulated controller only.
+
+The camera lists the resolutions the device reports (default 1920×1080) and remembers the choice. Mosaic insets are drawn and survive an objective change. Joining two areas applies the measured offset and, with rotation tracking on, the measured rotation. An opened mosaic is tracked into only with the same objective and preview size.
+
+Known limits: the breathing-scale correction overestimates by +3 to +20 % at small focus steps; it is an experimental option and off by default.
+
 v0.10.1 fixes a layout regression in v0.10.0: the main window could not be made narrower than 2361 px (device-independent pixels), so on a 1920 px screen it could not be resized and a maximised window lost its telemetry panel off the screen edge. The minimum width is now 1092 px and the tool bars wrap. Screens narrower than about 1092 px still overflow. This was checked from source on one Windows machine (125 % scaling) and in CI's offscreen tests; other screens and scalings have not been tried.
 
 v0.10.0 adds the capabilities listed under "New in v0.10.0" below (motorised stage drivers and a stage panel, colour pipeline, replay bar, mosaic bridging and insets, more ISO 25178 parameters), and fixes defects that came out of a review of the code behind them: a Grbl driver that blocked cancel and status calls during a move, dead jog buttons, complete Z sweeps thrown away because the stage moved afterwards, repeated z labels from a settling stage that left 70–90 % of height-map pixels invalid, a colour all-in-focus image that was shown but never saved, and an unsigned-integer overflow in the focus measures `brenner` and `tile_scores`. Tests no longer read or write the real user settings. Contributors: see "Contributing".

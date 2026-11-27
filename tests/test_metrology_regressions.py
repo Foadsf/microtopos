@@ -262,3 +262,30 @@ def test_step_height_standard_error_includes_the_fitted_tilt():
         ses.append(m["standard_error"])
     assert np.mean(steps) == pytest.approx(1.0, abs=0.01)
     assert np.mean(ses) == pytest.approx(np.std(steps, ddof=1), rel=0.15)
+
+
+@pytest.mark.parametrize("pts, radius", [
+    ([(0, 0), (299, 0), (0, 199)], 3),  # corner clicks: each patch clipped to a quarter
+    ([(2, 100), (297, 20), (150, 198)], 10),  # near-edge clicks, the GUI radius at 1 µm/px
+])
+def test_three_point_levelling_with_clipped_patches_removes_an_exact_plane(pts, radius):
+    """A patch clipped by the image edge has its median at the clipped patch's centre, not at the clicked point;
+    v0.10 used the clicked point and left a tilt of 0.12-0.30 on an exact plane of span 21."""
+    yy, xx = np.mgrid[0:200, 0:300].astype(np.float64)
+    z = (0.05 * xx - 0.03 * yy).astype(np.float32)
+    out = metrology.level_three_points(z, pts, radius_px=radius)
+    assert np.nanmax(np.abs(out)) < 1e-4
+
+
+def test_three_point_levelling_with_holes_and_a_spike_removes_an_exact_plane():
+    """Interior patches that are half invalid (their valid pixels are off-centre) and one that carries a spike: the
+    plane must still be removed exactly everywhere but at the spike."""
+    yy, xx = np.mgrid[0:120, 0:160].astype(np.float64)
+    z = (2.0 + 0.04 * xx + 0.07 * yy).astype(np.float32)
+    z[40:51, 20:26] = np.nan  # left half of the patch around (25, 45)
+    z[95:101, 120:131] = np.nan  # top half of the patch around (125, 100)
+    z[18, 82] = 500.0  # a spike inside the patch around (80, 20)
+    out = metrology.level_three_points(z, [(25, 45), (125, 100), (80, 20)], radius_px=5)
+    ok = np.isfinite(z)
+    ok[18, 82] = False
+    assert np.max(np.abs(out[ok])) < 1e-4

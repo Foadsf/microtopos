@@ -74,7 +74,15 @@ def remove_form(z: np.ndarray, order: int = 1) -> np.ndarray:
 
 
 def level_three_points(z: np.ndarray, pts_xy_px: list[tuple[float, float]], radius_px: int = 3) -> np.ndarray:
-    """Interactive 3-point levelling: subtract the plane passing through 3 user-selected points (or local patches)."""
+    """Interactive 3-point levelling: subtract the plane through 3 user-selected points, each sampled over a patch.
+
+    Each point is sampled over the (2 radius + 1)² patch around it, clipped to the image and to valid pixels.
+    Heights further than 3 robust standard deviations (1.4826 x MAD) from the patch median are dropped as
+    outliers; the sample is the mean height of the remaining pixels, placed at their centroid. The mean of any
+    set of points on a plane lies on that plane at their centroid, so an exact plane is removed exactly even
+    when a patch is clipped by the image edge or holed by invalid pixels (the clicked position is not where a
+    clipped patch's height belongs).
+    """
     if len(pts_xy_px) != 3:
         raise ValueError("3-point levelling requires exactly 3 points")
     h, w = z.shape
@@ -83,11 +91,14 @@ def level_three_points(z: np.ndarray, pts_xy_px: list[tuple[float, float]], radi
         ix, iy = round(x), round(y)
         x0, x1 = max(0, ix - radius_px), min(w, ix + radius_px + 1)
         y0, y1 = max(0, iy - radius_px), min(h, iy + radius_px + 1)
-        patch = z[y0:y1, x0:x1]
-        fin = patch[np.isfinite(patch)]
-        if not fin.size:
+        patch = z[y0:y1, x0:x1].astype(np.float64)
+        py, px = np.nonzero(np.isfinite(patch))
+        if not py.size:
             raise ValueError(f"point ({x:.1f}, {y:.1f}) has no valid height")
-        samples.append((float(x), float(y), float(np.median(fin))))
+        v = patch[py, px]
+        med = np.median(v)
+        keep = np.abs(v - med) <= 3.0 * 1.4826 * np.median(np.abs(v - med))
+        samples.append((float(np.mean(px[keep])) + x0, float(np.mean(py[keep])) + y0, float(np.mean(v[keep]))))
     A = np.array([[1.0, p[0], p[1]] for p in samples], np.float64)
     b = np.array([p[2] for p in samples], np.float64)
     if abs(np.linalg.det(A)) < 1e-9:

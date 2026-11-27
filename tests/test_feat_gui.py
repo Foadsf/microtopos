@@ -635,6 +635,42 @@ def _exclude(app, w, um, rect):
     w.btn_mask.click()
 
 
+def test_reset_height_tools_restores_the_reconstructed_height_of_a_reopened_session(window, qapp, swept, tmp_path):
+    """Save an edited map, open it again: Reset restores the height from before the edit. A file that does not
+    store that height (written before it was saved) says why instead of doing nothing."""
+    w = window
+    um = swept["um_per_px"]
+    original = _install(qapp, w, swept, _nodata(_relief(um)), form=0)
+    h0, sa0 = original["height"].copy(), original["Sa"]
+    _exclude(qapp, w, um, (200, 100, 350, 180))
+    _wait_jobs(qapp, w)
+    assert w.result["height_tools"] and np.isnan(w.result["height"][100:180, 200:350]).all()
+    edited = w.result
+    path = tmp_path / "edited.npz"
+    with mock.patch.object(w, "_save_path", return_value=str(path)):
+        w._save_session()
+    _open(qapp, w, path)
+    assert w.result is not edited and w.btn_tools_reset.isEnabled()
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    r = w.result
+    assert np.array_equal(r["height"], h0, equal_nan=True)
+    assert r["Sa"] == pytest.approx(sa0, rel=1e-6)
+    assert "height_tools" not in r and not any(m.startswith("Height edited") for m in r["warnings"])
+    assert not w.btn_tools_reset.isEnabled()
+
+    # an edited session that does not hold the pre-edit height (an older file): the button explains itself
+    old = tmp_path / "old.npz"
+    export.save_session(old, {k: v for k, v in edited.items() if k != "height_reconstructed"}, {})
+    _open(qapp, w, old)
+    shown = w.result
+    seen = _toasts(w)
+    w.btn_tools_reset.click()
+    _wait_jobs(qapp, w)
+    assert w.result is shown and np.isnan(shown["height"][100:180, 200:350]).all()
+    assert seen and seen[-1][0] == "warning" and "reconstruct again" in seen[-1][1], seen
+
+
 def test_height_edit_is_kept_when_the_feature_job_finishes_first(window, qapp, swept, monkeypatch):
     """Tick 'Feature parameters', then exclude an ROI while the feature job runs. The feature job finishing first
     must not make the exclusion disappear while the window says it was applied."""

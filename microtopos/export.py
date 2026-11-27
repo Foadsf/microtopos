@@ -276,8 +276,11 @@ def write_report_bundle(folder: Path | str, result: dict, versions: dict) -> lis
 
 
 SESSION_SCHEMA = 2
-SESSION_ARRAYS = ("edf", "edf_rgb", "edf_proc", "height", "height_raw", "sl_surface", "confidence", "support",
-                  "mosaic_image", "height_mosaic")
+# height_reconstructed: the height before the user's height tools (levelling, exclusions listed in height_tools), so
+# "Reset height tools" works on an opened session. Optional within schema 2: files written before it was stored open
+# with their edited height and no reset (the window says why); older programs ignore the extra array.
+SESSION_ARRAYS = ("edf", "edf_rgb", "edf_proc", "height", "height_raw", "height_reconstructed", "sl_surface",
+                  "confidence", "support", "mosaic_image", "height_mosaic")
 MOSAIC_ARRAY_PREFIX = "mosaic_"
 MOSAIC_META_KEY = "mosaic_meta"
 MOSAIC_ARRAYS_KEY = "mosaic_arrays"
@@ -353,7 +356,7 @@ def load_session(path: Path | str) -> tuple[dict, dict]:
         h = result["height"]
         if h.ndim != 2:
             raise ValueError("height map is not 2-D")
-        for k in ("height_raw", "confidence", "edf_proc", "sl_surface", "support"):
+        for k in ("height_raw", "height_reconstructed", "confidence", "edf_proc", "sl_surface", "support"):
             if k in result and result[k].shape != h.shape:
                 raise ValueError(f"{k} has shape {result[k].shape}, height has {h.shape}")
         rgb = result.get("edf_rgb")

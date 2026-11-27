@@ -239,31 +239,6 @@ def fit_depth(fv: np.ndarray, z: np.ndarray, conf_threshold: float = 0.25) -> De
 # ---------------------------------------------------------------------------------------------- refinement
 
 
-def weighted_guided_filter(p: np.ndarray, w: np.ndarray, guide: np.ndarray, radius: int, eps: float) -> np.ndarray:
-    """Guided filter (He et al.) with per-pixel data weights w; NaN in p counts as weight 0."""
-    w = np.where(np.isfinite(p), w, 0.0).astype(np.float32)
-    p0 = np.where(np.isfinite(p), p, 0.0).astype(np.float32)
-    I = guide.astype(np.float32)
-    k = (2 * radius + 1, 2 * radius + 1)
-
-    def box(x):
-        return cv2.boxFilter(x, cv2.CV_32F, k, normalize=False, borderType=cv2.BORDER_REFLECT)
-
-    sw = box(w) + 1e-6
-    mI = box(w * I) / sw
-    mp = box(w * p0) / sw
-    vI = box(w * I * I) / sw - mI * mI
-    cIp = box(w * I * p0) / sw - mI * mp
-    A = cIp / (vI + eps)
-    B = mp - A * mI
-    n = box(np.ones_like(I))
-    support = box((w > 0).astype(np.float32)) / n
-    A = box(A) / n
-    B = box(B) / n
-    out = A * I + B
-    return np.where(support > 0.15, out, np.nan).astype(np.float32)
-
-
 def refine_depth(z: np.ndarray, conf: np.ndarray, guide: np.ndarray, radius: int,
                  *, backend: str = "cpu") -> tuple[np.ndarray, set[str]]:
     """Edge-aware smoothing guided by the all-in-focus image, with one round of outlier rejection.

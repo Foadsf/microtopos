@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -770,7 +771,7 @@ def _make_replay_recording(tmp_path, n=10, dt=0.1):
 
 
 class _Tap(ReplaySource):
-    """A ReplaySource that logs what reaches the consumer: (recording frame index, perf_counter) per published
+    """A ReplaySource that logs what reaches the consumer: (recording frame index, source clock time) per published
     frame. Everything the tests assert is read from this output, never from the source's internal state."""
 
     def __init__(self, *a, **k):
@@ -780,7 +781,7 @@ class _Tap(ReplaySource):
 
     def _publish(self, frame, truth=None, ts=None, step=1):
         with self._log_lock:
-            self._log.append((int(frame[0, 0, 0]), time.perf_counter()))
+            self._log.append((int(frame[0, 0, 0]), self._now()))
         super()._publish(frame, truth, ts, step)
 
     def idx(self) -> list[int]:
@@ -917,23 +918,81 @@ def test_replay_resume_after_a_paused_seek_continues_with_the_next_frame(replay)
     assert rs.idx()[n:n + 2] == [41, 42]  # frame 40 is on screen already; it is not published a second time
 
 
+class _VirtualClock:
+    """Time that moves only when the playback thread waits, or when a stubbed decode spends it. The replay schedule
+    then makes the same decisions on any machine, and the published times are exact: a wall-clock version of these
+    tests measured the CI runner (26.7 ms/frame where 5 ms was asked on a loaded macOS runner), not the scheduler."""
+
+    def __init__(self):
+        self.t = 0.0
+        self._actions: list[tuple[float, object]] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        end = self.t + max(s, 0.0)
+        due = [a for a in self._actions if a[0] <= end]
+        for a in due:
+            self._actions.remove(a)
+        self.t = end
+        for _, action in due:  # what happened while the thread slept is seen when it wakes, as with a real sleep
+            action()
+        time.sleep(0)  # let the test thread run
+
+    def at(self, t: float, action) -> None:
+        self._actions.append((t, action))
+
+
+EXACT = 1e-6  # s; the virtual schedule is exact up to float rounding, far inside 5 % of the shortest interval (250 us)
+
+
+@pytest.mark.characterization("the speed-change re-anchoring is on main already; this guards it on a virtual clock")
 @pytest.mark.parametrize("before, after", [(1.0, 4.0), (4.0, 0.5)])
 def test_replay_speed_change_takes_effect_without_stall_or_burst(replay, before, after):
     dt = 0.02
-    rs = replay(n=240, dt=dt, speed=before)
+    clock = _VirtualClock()
+    t_change = 12.5 * dt / before  # half way between frames 12 and 13
+    rs = replay(n=240, dt=dt, speed=before, clock=clock.now, sleep=clock.sleep)
+    clock.at(t_change, lambda: rs.set_speed(after))
     rs.start()
-    assert _until(lambda: len(rs.idx()) >= 12)
-    n0 = len(rs.idx())
-    t_change = time.perf_counter()
-    rs.set_speed(after)
-    assert _until(lambda: len(rs.idx()) >= n0 + 14)
+    assert _until(lambda: len(rs.idx()) >= 30)
     t = rs.times()
-    expected = dt / after
-    longest_gap = max(b - a for a, b in zip(t[n0 - 1:n0 + 14], t[n0:n0 + 15]))
-    assert longest_gap <= 3 * max(dt / before, expected) + 0.1, f"playback stalled {longest_gap:.2f} s after the speed change"
-    assert t[n0] >= t_change
-    span = t[n0 + 12] - t[n0 + 2]  # ten intervals, clear of the frame that was already in flight
-    assert 0.7 * 10 * expected <= span <= 3 * 10 * expected + 0.1, f"{span / 10 * 1000:.1f} ms/frame, wanted {expected * 1000:.1f}"
+    assert rs.idx()[:30] == list(range(30))
+    k = next(i for i, ti in enumerate(t) if ti > t_change)  # the first frame published after the change
+    assert k == 13
+    gap = t[k] - t[k - 1]
+    assert gap <= max(dt / before, dt / after) + EXACT, f"playback stalled {gap * 1000:.1f} ms at the speed change"
+    intervals = [b - a for a, b in itertools.pairwise(t[k:k + 13])]
+    assert all(abs(i - dt / after) <= EXACT for i in intervals), \
+        f"{[round(i * 1000, 3) for i in intervals]} ms/frame after the change, wanted {dt / after * 1000:.1f}"
+
+
+def test_replay_that_falls_behind_sends_no_catch_up_burst(replay, monkeypatch):
+    """Frame 10 takes 150 ms to decode (six intervals at 25 ms): a slow disk, an oversleep, a loaded machine. Playback
+    resumes at the recorded interval from that frame; catching up sent the overdue frames back to back (v0.10.1 on
+    macOS CI: 2.9 ms/frame where 5 ms was wanted, after the playback thread overslept)."""
+    import microtopos.recording as rec
+
+    dt, held, late = 0.025, 10, 0.15
+    clock = _VirtualClock()
+    real_decode = rec.decode
+
+    def slow_decode(path):
+        if path.name == f"{held:06d}.png":
+            clock.t += late
+        return real_decode(path)
+
+    monkeypatch.setattr(rec, "decode", slow_decode)
+    rs = replay(n=40, dt=dt, clock=clock.now, sleep=clock.sleep)
+    rs.start()
+    assert _until(lambda: len(rs.idx()) >= held + 6)
+    assert rs.idx()[:held + 6] == list(range(held + 6))  # every frame, none skipped
+    t = rs.times()
+    assert abs(t[held] - (held * dt + late)) <= EXACT  # the held frame is shown as soon as it is decoded
+    intervals = [b - a for a, b in itertools.pairwise(t[held:held + 6])]
+    assert all(abs(i - dt) <= EXACT for i in intervals), \
+        f"catch-up burst after falling behind: {[round(i * 1000, 3) for i in intervals]} ms, wanted {dt * 1000:.0f}"
 
 
 def test_replay_loop_wraps_without_skipping_or_repeating_a_frame(replay):
@@ -1115,6 +1174,8 @@ def test_capture_z_sweep_needs_a_stage_attached_to_the_source():
     assert eng.sm.override == Override.AUTO  # the capture was ended again after the failure
 
 
+@pytest.mark.characterization("a failing or closed stage already left frames unlabelled; the test now sets the "
+                              "motorised-sweep flag that labelling requires (tests/test_gui_regressions.py)")
 def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
     class _Broken(SimulatedStageDriver):
         def pose(self):
@@ -1122,6 +1183,7 @@ def test_frames_are_unlabelled_not_invented_when_the_stage_fails(monkeypatch):
 
     src = FrameSource()
     src.stage_driver = _Broken()
+    src.label_with_stage = True  # inside a motorised Z sweep (stage.capture_z_sweep), where frames get stage labels
     src._publish(np.zeros((4, 4, 3), np.uint8))
     assert src.latest()[3] is None
     ok = SimulatedStageDriver()

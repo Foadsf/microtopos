@@ -164,6 +164,7 @@ class LiveEngine:
         self._held = None  # an incomplete sweep kept for HOLD_FRAMES in case focusing resumes
         self._pending_patches: list = []
         self._mosaic_view = ((np.full((8, 8), np.nan, np.float32), (0, 0), 1), [], 0, 0)
+        self._mosaic_rgb_view: np.ndarray | None = None
         self._view_version = -1
         self._view_t = 0.0
         self._areas_seen = 1
@@ -412,12 +413,34 @@ class LiveEngine:
 
     def _render(self, tiles, tile, patches, version, nkf, tiles_low=None, tiles_rgb=None):
         d = preview_factor(tiles, tile, 1600)
+        view = render_tiles(tiles, tile, d, tiles_low)  # (grey image, origin, d): the grey view is always there
+        rgb = None
         if tiles_rgb:
-            view = render_tiles_rgb(tiles_rgb, tile, d)
-        else:
-            view = render_tiles(tiles, tile, d, tiles_low)
+            # the colour canvas, cut to the grey view's box so that both share its origin and its µm axes
+            rgb = _crop_rgb_to_view(render_tiles_rgb(tiles_rgb, tile, d), tiles_rgb, tile, view)
         self._mosaic_view = (view, height_partitions(patches), nkf, len(patches))
+        self._mosaic_rgb_view = rgb
         self._view_version = version
+
+    def mosaic_image_rgb(self) -> np.ndarray | None:
+        """Colour rendering (RGBA uint8, alpha = valid) aligned pixel for pixel with `mosaic_image()`'s image, or
+        None when no colour keyframes were added. Prepared by the engine thread like `mosaic_image`."""
+        return self._mosaic_rgb_view
+
+    # The GUI changes the mosaic through these, under the engine lock: the engine thread splats into the same tiles.
+    def set_mosaic_blending(self, mode: str):
+        with self._lock:
+            self.mosaic.set_blending(mode)
+            self.mosaic_version += 1
+
+    def set_mosaic_track_rotation(self, on: bool):
+        with self._lock:
+            self.mosaic.track_rotation = bool(on)
+
+    def add_mosaic_inset(self, objective: str, um_per_px: float, x_um: float, y_um: float, image: np.ndarray):
+        with self._lock:
+            self.mosaic.add_inset(objective, um_per_px, x_um, y_um, image)
+            self.mosaic_version += 1
 
     def _process(self, bgr, truth, fps_in, fps_proc, seq, ts):
         raw = bgr_to_luma(bgr, self.linearize)
@@ -561,9 +584,12 @@ class LiveEngine:
         if state in (State.PAN, State.DWELL, State.OBJECTIVE_CHANGE) and self.sm.override != Override.PAUSE:
             was_lost = self.mosaic.lost
             added, _ = self.mosaic.track(prev, rgb=prev_rgb)
-            if added and self.mosaic.areas != self._areas_seen:
-                self._areas_seen = self.mosaic.areas
-                self.log(f"mosaic: started separate area {self.mosaic.areas} (position of this view unknown)", seq)
+            ev = self.mosaic.last_event  # set by this track() call: a join also changes `areas`, the other way
+            if ev == "new_area":
+                self.log(f"mosaic: started separate area ({self.mosaic.areas} now; position of this view unknown)", seq)
+            elif ev == "areas_joined":
+                self.log(f"mosaic: this view links two areas; they are joined ({self.mosaic.areas} now)", seq)
+            self._areas_seen = self.mosaic.areas
             if self.mosaic.lost != was_lost:
                 self.log("mosaic tracking LOST" if self.mosaic.lost else "mosaic tracking recovered", seq)
             if added:
@@ -598,6 +624,24 @@ class LiveEngine:
             engine_error=self.error, source_generation=self.source_generation,
             mosaic_generation=self.mosaic_generation, raw_p995=raw_p995)
         return render
+
+
+def _crop_rgb_to_view(rgb: np.ndarray | None, tiles_rgb: dict, tile: int, view) -> np.ndarray | None:
+    """Cut the uncropped colour canvas (`render_tiles_rgb`, which starts at its own top-left tile) to the box of the
+    grey view (`render_tiles`: image cropped to the valid area, origin in full-resolution mosaic pixels, reduction
+    d). Pixels of that box with no colour data are transparent (alpha 0)."""
+    if rgb is None:
+        return None
+    img, (ox, oy), d = view
+    x0 = min(k[0] for k in tiles_rgb) * tile  # full-resolution position of the colour canvas's top-left pixel
+    y0 = min(k[1] for k in tiles_rgb) * tile
+    out = np.zeros((img.shape[0], img.shape[1], 4), np.uint8)
+    cx, cy = (ox - x0) // d, (oy - y0) // d  # the grey box's top-left in colour-canvas pixels
+    sx0, sy0 = max(0, cx), max(0, cy)
+    sx1, sy1 = min(rgb.shape[1], cx + img.shape[1]), min(rgb.shape[0], cy + img.shape[0])
+    if sx1 > sx0 and sy1 > sy0:
+        out[sy0 - cy:sy1 - cy, sx0 - cx:sx1 - cx] = rgb[sy0:sy1, sx0:sx1]
+    return out
 
 
 def _completeness(tiles: list) -> float:

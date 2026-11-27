@@ -23,6 +23,25 @@ def monotonic_segments_from_z(z: np.ndarray, min_len: int = 5) -> list[tuple[int
     return sorted(segs, key=lambda s: s[1] - s[0], reverse=True) or [(0, len(z))]
 
 
+# Largest mirror / travel ratio (see _mirror_travel) at which a turnaround located from focus peaks that include a
+# maximum at the first or last frame is accepted. Such a maximum is also what a single pass that starts or ends
+# sharp on another layer (dust, a cover slip) shows in every tile, so it needs the mirror evidence a peak inside the
+# sweep does not. Measured on simulated hand sweeps (seeds 10-25, 10x / 0.25 and 40x / 0.85, tremor on): true
+# turnarounds 0.08-0.39; single passes with a decaying layer at either end (tests/test_reported_bugs.py B8,
+# 30-300 % of the surface's contrast) 0.62-0.80. find_optical_reversal searches every frame without peak evidence and
+# keeps its stricter 0.35.
+BOUNDARY_PEAK_MIRROR_MAX = 0.5
+
+
+def _mirror_travel(v: np.ndarray, t: int, cap: int) -> tuple[float, float]:
+    """Mean distance between the standardised tile vectors of frames t-m and t+m (mirror) and of t-m and t
+    (travel), over m = 1 .. min(t, n-1-t, cap). At a turnaround mirror is small while travel is not."""
+    arm = min(t, len(v) - 1 - t, cap)
+    m = np.arange(1, arm + 1)
+    return (float(np.linalg.norm(v[t - m] - v[t + m], axis=1).mean()),
+            float(np.linalg.norm(v[t - m] - v[t], axis=1).mean()))
+
+
 def find_optical_reversal(tiles: np.ndarray, min_arm: int = 4) -> int | None:
     """Turnaround index of a sweep with unknown z, from per-tile focus vectors (n_frames x n_tiles).
 
@@ -37,10 +56,7 @@ def find_optical_reversal(tiles: np.ndarray, min_arm: int = 4) -> int | None:
     noise = np.median(np.linalg.norm(np.diff(v, axis=0), axis=1)) + 1e-6
     best, best_score = None, 0.35
     for t in range(min_arm, n - min_arm):
-        arm = min(t, n - 1 - t, 12)
-        m = np.arange(1, arm + 1)
-        mirror = np.linalg.norm(v[t - m] - v[t + m], axis=1).mean()
-        travel = np.linalg.norm(v[t - m] - v[t], axis=1).mean()
+        mirror, travel = _mirror_travel(v, t, 12)
         if travel < 3 * noise:
             continue
         score = mirror / travel
@@ -49,39 +65,72 @@ def find_optical_reversal(tiles: np.ndarray, min_arm: int = 4) -> int | None:
     return best
 
 
-def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5) -> int | None:
+def _agreeing_median(mids: list[float], n: int, n_tiles: int) -> float | None:
+    """Median turnaround of the per-tile midpoints when enough tiles give one and most of them agree."""
+    if len(mids) < max(3, 0.25 * n_tiles):
+        return None
+    mids_a = np.array(mids)
+    med = float(np.median(mids_a))
+    if (np.abs(mids_a - med) <= max(3.0, 0.06 * n)).mean() < 0.6:
+        return None
+    return med
+
+
+def find_reversal(tiles: np.ndarray, min_prominence: float = 0.5, min_arm: int = 4) -> int | None:
     """Turnaround index from tiles that come into focus twice (forward pass and return pass).
 
     For each tile with two clear focus peaks at frames a < b, the turnaround lies near (a + b) / 2.
     A tile with two height levels can also show two peaks, so a reversal is accepted only when such
     midpoints agree across many tiles; the estimate is then refined with the mirror score.
+
+    When the user turns back and stops near focus, the return pass's peak is the last frame: the curve is still
+    rising there. Such an end maximum (or a start maximum, for a sweep that starts near focus) counts as a peak
+    when it is prominent, but only if peaks inside the sweep did not already decide, and only if the frames
+    around the turnaround mirror each other (BOUNDARY_PEAK_MIRROR_MAX), because a single pass that starts or ends
+    sharp on another layer has the same maximum in every tile. Its midpoint (a + last) / 2 is a lower bound of the
+    turnaround (the return peak lies at or beyond the last frame), so the search extends towards that end.
     """
     from scipy.signal import find_peaks
 
     n = len(tiles)
     lt = np.log(tiles + 1e-6)
-    mids = []
+    mids, mids_ends, sides = [], [], [0, 0]  # sides: tiles whose second peak is the first / the last frame
     for j in range(lt.shape[1]):
         tr = np.convolve(np.pad(lt[:, j], 1, mode="edge"), np.ones(3) / 3, mode="valid")
         pk, _ = find_peaks(tr, prominence=min_prominence, distance=4)
         if len(pk) >= 2:
             mids.append(0.5 * (pk[0] + pk[-1]))
-    if len(mids) < max(3, 0.25 * lt.shape[1]):
-        return find_optical_reversal(tiles)
-    mids = np.array(mids)
-    med = float(np.median(mids))
-    agree = np.abs(mids - med) <= max(3.0, 0.06 * n)
-    if agree.mean() < 0.6:
-        return find_optical_reversal(tiles)
+            mids_ends.append(mids[-1])
+            continue
+        # a maximum at either end of the sweep is a peak of the curve mirrored about that end (full reflection,
+        # so its prominence is measured against the trough on its one real side)
+        pe, _ = find_peaks(np.pad(tr, n - 1, mode="reflect"), prominence=min_prominence, distance=4)
+        pe = np.unique(pe[(pe >= n - 1) & (pe <= 2 * n - 2)] - (n - 1))
+        if len(pe) == 2 and len(pk) == 1 and (pe[0] == 0) != (pe[1] == n - 1):  # one inner peak, one end
+            mids_ends.append(0.5 * (pe[0] + pe[1]))
+            sides[int(pe[1] == n - 1)] += 1
     v = (lt - lt.mean(0)) / (lt.std(0) + 1e-6)
-    best, best_s = round(med), np.inf
-    for t in range(max(2, int(med) - 6), min(n - 2, int(med) + 7)):
-        arm = min(t, n - 1 - t, 15)
-        m = np.arange(1, arm + 1)
-        s = np.linalg.norm(v[t - m] - v[t + m], axis=1).mean()
-        if s < best_s:
-            best, best_s = t, s
-    return best
+    med = _agreeing_median(mids, n, lt.shape[1])
+    if med is not None:
+        best, best_s = round(med), np.inf
+        for t in range(max(2, int(med) - 6), min(n - 2, int(med) + 7)):
+            s, _ = _mirror_travel(v, t, 15)
+            if s < best_s:
+                best, best_s = t, s
+        return best
+    med = _agreeing_median(mids_ends, n, lt.shape[1])
+    if med is not None and n >= 2 * min_arm + 1:
+        lo = min_arm if sides[0] > sides[1] else max(min_arm, int(med) - 6)
+        hi = n - min_arm if sides[1] > sides[0] else min(n - min_arm, int(med) + 7)
+        best, best_score = None, BOUNDARY_PEAK_MIRROR_MAX
+        for t in range(lo, hi):
+            mirror, travel = _mirror_travel(v, t, 12)
+            score = mirror / max(travel, 1e-12)
+            if score < best_score:
+                best, best_score = t, score
+        if best is not None:
+            return best
+    return find_optical_reversal(tiles)
 
 
 def drop_pauses(tiles: np.ndarray, rel: float = 0.25) -> np.ndarray:
@@ -301,8 +350,10 @@ def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.nda
     simulated sweeps).
 
     Method: the (already in-focus-ish) all-in-focus texture is blurred with the objective's defocus model at
-    defocus steps of dof/3 over +-4 dof, `measure_fn` is applied to every blurred copy, and the width at half of
-    the maximum is read off by linear interpolation. Hand-checkable limit: for a pure sinusoid of spatial
+    defocus steps of dof/3 over +-4 dof, `measure_fn` is applied to every blurred copy, and each half-maximum
+    crossing is located between its two bracketing samples by bisection on the same model response (to 1/256 of a
+    step), so a response narrower than two steps (100x / 1.25 oil) still has a width. Hand-checkable limit: for a
+    pure sinusoid of spatial
     frequency f (cycles/px) and a measure that is its peak-to-peak amplitude, the response is the Gaussian
     exp(-2 pi^2 f^2 s^2) with s = |dz| tan(theta) / (2 um_per_px), so FWHM = 2 sqrt(2 ln 2) um_per_px /
     (pi f tan(theta)) (tests/test_feat_zstack_backend.py checks this to 1 % for two objectives).
@@ -332,26 +383,37 @@ def theoretical_fwhm_um(objective, um_per_px: float, measure_fn, texture: np.nda
     c = min(h, w, 256) // 2
     tex = texture[h // 2 - c:h // 2 + c, w // 2 - c:w // 2 + c].astype(np.float32)
     airy = objective.airy_sigma_um
-    resp = []
-    for d in search:
+
+    def response(d: float) -> float:
         # extra blur on top of the in-focus PSF already present in the texture
         s = float(np.sqrt(max(objective.defocus_sigma_um(d) ** 2 - airy * airy, 0.0))) / um_per_px
         img = cv2.GaussianBlur(tex, (0, 0), s) if s > 0.05 else tex
-        resp.append(float(np.percentile(measure_fn(img)[20:-20, 20:-20], 75)))
-    resp = np.array(resp, np.float64)
+        return float(np.percentile(measure_fn(img)[20:-20, 20:-20], 75))
+
+    resp = np.array([response(d) for d in search], np.float64)
     if not np.all(np.isfinite(resp)) or resp.max() <= 1e-9:
         return None
     half = float(resp.max()) / 2.0
     above = np.nonzero(resp >= half)[0]
-    if above.size < 2 or above[0] == 0 or above[-1] == len(resp) - 1:  # not bracketed: no defined width
+    # one sample above half is enough (a high-NA response can be narrower than two steps); the half maximum must
+    # still be crossed inside the search range on both sides
+    if above.size == 0 or above[0] == 0 or above[-1] == len(resp) - 1:  # not bracketed: no defined width
         return None
 
     def cross(i: int) -> float:
-        """Linear crossing of `half` between samples i and i+1 in defocus units."""
-        r0, r1 = resp[i], resp[i + 1]
-        den = r1 - r0
-        t = (half - r0) / den if abs(den) > 1e-9 else 0.5
-        return float(search[i] + t * (search[i + 1] - search[i]))
+        """Crossing of `half` between samples i and i+1 in defocus units: the bracket is narrowed by bisection on
+        the model response to 1/256 of a step, then interpolated linearly."""
+        a, b, ra, rb = float(search[i]), float(search[i + 1]), resp[i], resp[i + 1]
+        for _ in range(8):
+            m = 0.5 * (a + b)
+            rm = response(m)
+            if (rm >= half) == (ra >= half):
+                a, ra = m, rm
+            else:
+                b, rb = m, rm
+        den = rb - ra
+        t = (half - ra) / den if abs(den) > 1e-12 * half else 0.5
+        return a + t * (b - a)
 
     # above[0] is the first sample >= half: the upward crossing lies between above[0]-1 and above[0];
     # above[-1] is the last sample >= half: the downward crossing lies between above[-1] and above[-1]+1.

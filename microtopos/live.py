@@ -157,6 +157,7 @@ class LiveEngine:
         self._seq_hist = collections.deque(maxlen=8)  # sequence numbers of the newest frames given to the state machine
         self._buf = SweepBuffer()
         self._sweep_pose = (0.0, 0.0)
+        self._sweep_mgen = 0  # mosaic generation the open sweep's pose belongs to (sampled when it started)
         self._sweep_simulated = False
         self._sweep_manual = False  # the open sweep (if any) was captured under manual Z override
         self._n_preroll = 0
@@ -240,11 +241,15 @@ class LiveEngine:
             return self.mosaic.to_state_arrays()
 
     def load_mosaic_state(self, meta: dict, arrays: dict[str, np.ndarray]):
-        """Replace the mosaic with a serialized pose graph (keyframes, edges, patches, insets) and re-render."""
+        """Replace the mosaic with a serialized pose graph (keyframes, edges, patches, insets) and re-render.
+
+        The replaced mosaic's coordinates mean nothing in the loaded one, so this is a new mosaic generation: a
+        height map from a sweep captured before the load is not pinned into it (as after reset_mosaic)."""
         with self._lock:
             self.mosaic.load_state_arrays(meta, arrays)
             self._areas_seen = self.mosaic.areas
             self._pending_patches.clear()
+            self.mosaic_generation += 1
             self.mosaic_version += 1
         self._render_now()
 
@@ -304,14 +309,20 @@ class LiveEngine:
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
 
-    def _emit(self, buf: SweepBuffer, pose, n_pre, shape, simulated, prev_shape, manual: bool = False):
+    def _emit(self, buf: SweepBuffer, pose, n_pre, shape, simulated, prev_shape, manual: bool = False,
+              mosaic_generation: int | None = None):
+        """Deliver a sweep. `pose` is the mosaic position when the sweep started and `mosaic_generation` the
+        generation of the mosaic that position is in (sampled at the same moment: a mosaic restarted or replaced
+        during the sweep makes the pose stale, and the height map is then not pinned)."""
         if len(buf) - n_pre < 8 or not self.on_sweep:
             return
         z = None if any(v is None for v in buf.z) else np.array(buf.z)
         c_frames = list(buf.color_frames) if self.color_mode and all(c is not None for c in buf.color_frames) else None
         cap = SweepCapture(list(buf.frames), z, pose, self.objective.name, shape, simulated, _completeness(buf.tiles),
                            list(buf.seqs), list(buf.stamps), getattr(self.source, "source_id", ""),
-                           self.source_generation, self.mosaic_generation, self.exposure, self.linearize, prev_shape,
+                           self.source_generation,
+                           self.mosaic_generation if mosaic_generation is None else mosaic_generation,
+                           self.exposure, self.linearize, prev_shape,
                            self.objective, manual=manual, color_frames=c_frames)
         if self.sync_callbacks:
             self.on_sweep(cap)
@@ -402,13 +413,14 @@ class LiveEngine:
         with self._lock:
             if self._held is not None:
                 held, self._held = self._held, None
-                self._emit(held[0], held[1], held[2], held[4], held[5], held[6], manual=held[7])
+                self._emit(held[0], held[1], held[2], held[4], held[5], held[6], manual=held[7],
+                           mosaic_generation=held[8])
             elif self.sm.state == State.Z_SWEEP and len(self._buf) \
                     and _completeness(self._buf.tiles) >= MIN_COMPLETENESS:
                 h, w = self._buf.frames[0].shape
                 sim = self._sweep_simulated
                 self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim, self._snap.preview_shape,
-                           manual=self.sm.override == Override.Z)
+                           manual=self.sm.override == Override.Z, mosaic_generation=self._sweep_mgen)
                 self._buf = SweepBuffer()
 
     def _render(self, tiles, tile, patches, version, nkf, tiles_low=None, tiles_rgb=None):
@@ -521,6 +533,7 @@ class LiveEngine:
                     self._buf, self._sweep_pose, self._n_preroll = self._held[:3]
                     self._sweep_simulated = self._held[5]
                     self._sweep_manual = self._held[7]
+                    self._sweep_mgen = self._held[8]
                     self._held = None
                     self.log("sweep resumed (merged with the previous incomplete part)", seq)
                 else:
@@ -529,6 +542,7 @@ class LiveEngine:
                         self._buf.append(*item)
                     self._n_preroll = len(self._buf)
                     self._sweep_pose = (self.mosaic.x, self.mosaic.y)
+                    self._sweep_mgen = self.mosaic_generation
                     self._sweep_simulated = simulated
                     self._sweep_manual = self.sm.override == Override.Z
                     self._cov = None
@@ -552,13 +566,14 @@ class LiveEngine:
                     self._held = None
                     if comp >= MIN_COMPLETENESS:
                         self.log("the frames before the motion are a complete sweep: kept", seq)
-                        self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape)
+                        self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape,
+                                   mosaic_generation=self._sweep_mgen)
                 elif manual or comp >= MIN_COMPLETENESS:
                     self._emit(self._buf, self._sweep_pose, self._n_preroll, (h, w), sim_sweep, prev.shape,
-                               manual=manual)
+                               manual=manual, mosaic_generation=self._sweep_mgen)
                 else:  # incomplete: hold it for a few seconds in case focusing resumes
                     self._held = (self._buf, self._sweep_pose, self._n_preroll, seq + HOLD_FRAMES, (h, w), sim_sweep,
-                                  prev.shape, manual)
+                                  prev.shape, manual, self._sweep_mgen)
                 self._buf = SweepBuffer()
             elif ev.kind == "objective_change":
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
@@ -568,7 +583,7 @@ class LiveEngine:
         if self._held is not None and (seq > self._held[3] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
-                self._emit(held[0], held[1], held[2], held[4], held[5], held[6])
+                self._emit(held[0], held[1], held[2], held[4], held[5], held[6], mosaic_generation=held[8])
 
         in_focus = None
         if state == State.Z_SWEEP:

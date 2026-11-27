@@ -48,7 +48,12 @@ SNR_MIN_CORRELATION = 0.5
 MAX_ROT_DEG = 2.0
 MAX_SCALE_DEV = 0.03
 BREATHING_MAX_SIDE = 480  # the pair scale used for breathing is measured at up to this size: the 160 px default reads
-# +9..18 % high on exact 0.1..0.4 % zoom steps (area-downsampling bias), 480 px reads within 1 %
+# +9..18 % high on exact 0.1..0.4 % zoom steps. 480 px is better but still biased high while a pair's displacement at
+# the frame edge is below about one pixel. Measured on exact zoom pairs at 480 px (random textures of 0.5-2 px
+# correlation length, 960 px frames area-reduced 2x or rendered at 480 px): +3..+20 % at 0.1 % steps, +2..+14 % at
+# 0.2 %, -0.5..+7 % at 0.4 %. The cause is ECC's sub-pixel (interpolation) bias, periodic in the displacement, which
+# averages out once the edge displacement spans a pixel; it is not ECC's termination epsilon (1e-4 down to 1e-10 and
+# 30 to 1000 iterations give the same scale). A sweep correction built from such pairs is too large by the same factor.
 BREATHING_MAX_TOTAL = 0.015  # largest total magnification excursion a sweep correction applies (see estimate_breathing_scales)
 BREATHING_MIN_TOTAL = 0.005  # below this total drift no correction is applied
 

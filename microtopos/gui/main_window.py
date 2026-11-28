@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, export, metrology, units, zstack
 from .. import objectives as objlib
-from ..calibration import CalibrationStore, CalStatus, radiometric_key, today
+from ..calibration import CalibrationStore, CalStatus, radiometric_key, today, white_balance_gains
 from ..camera import (
     CameraSource,
     ReplaySource,
@@ -64,7 +64,7 @@ from ..kinematics import Override, State, guess_objective
 from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
 from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, capture_z_sweep, list_serial_ports
-from ..superres import dwell_superres
+from ..superres import dwell_superres, max_useful_scale
 from .objectives_dialog import ObjectivesDialog
 from .theme import DARK, LIGHT, hex_rgb, stylesheet
 from .widgets import (
@@ -146,10 +146,10 @@ class Job(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-def _sr_job(frames, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True):
+def _sr_job(frames, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None):
     if progress:
         progress(0.1, "Registering dwell frames and drizzling...")
-    return dwell_superres(frames, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve)
+    return dwell_superres(frames, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve, oversampling=oversampling)
 
 
 def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
@@ -226,6 +226,7 @@ class MainWindow(QMainWindow):
         self.engine = LiveEngine(self.store, self.obj)
         self.bridge = Bridge()
         self.engine.verbose = verbose
+        self._load_white_balance()
         self.engine.on_sweep = self.bridge.sweep.emit
         self.engine.on_objective_hint = self.bridge.objective_hint.emit
         self.bridge.sweep.connect(self._on_sweep)
@@ -500,6 +501,14 @@ class MainWindow(QMainWindow):
         self.chk_rgb.setToolTip("Render the camera's colour frame instead of the luma channel (needs a colour camera)")
         self.chk_rgb.toggled.connect(self._set_color_mode)
         h.addWidget(self.chk_rgb)
+        self.btn_wb = QPushButton("White balance")
+        self.btn_wb.setToolTip("Set the colour balance from the current view (grey world: the mean of the pixels that "
+                               "are neither dark nor clipped becomes neutral). Applies to colour images only, never to "
+                               "the measurement. Right-click to reset.")
+        self.btn_wb.clicked.connect(self._set_white_balance)
+        self.btn_wb.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_wb.customContextMenuRequested.connect(lambda _p: self._set_white_balance(reset=True))
+        h.addWidget(self.btn_wb)
         self.cmb_sr_scale = QComboBox()
         self.cmb_sr_scale.addItems(["2×", "3×", "4×"])
         self.cmb_sr_scale.setCurrentText("2×")
@@ -2258,6 +2267,7 @@ class MainWindow(QMainWindow):
                 "source_id": cap.source_id, "source_generation": cap.source_generation,
                 "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
                 "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
+                "white_balance": list(cap.white_balance) if cap.white_balance else None,
                 "z_source": zsrc or (cal.z_source if zstat == CalStatus.ESTIMATED.value else ""),
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
@@ -2453,8 +2463,16 @@ class MainWindow(QMainWindow):
         cal = self.store.get(self.obj)
         um = (self.obj.nominal_um_per_px(w) if self.sim_source is not None
               else cal.um_per_px(w, self.obj, h))
+        osr = self.obj.optical_oversampling(um)
+        if self.sr_scale > max_useful_scale(osr):
+            scale_kind = ("measured" if self.sim_source is None and cal.lateral_status_for(w, h) == CalStatus.CALIBRATED
+                          else "nominal")
+            self.notify(f"{self.sr_scale}× super-resolution adds no detail here: at {um:.3g} µm/px ({scale_kind}) the "
+                        f"camera samples {self.obj.name} {osr:.1f}× finer than the optics resolve (λ/4NA = "
+                        f"{self.obj.nyquist_pixel_um:.3g} µm). Use 'Stack still frames' instead.", "warning")
+            return
         job = Job(_sr_job, crops, self.obj.psf_sigma_px(um),
-                  scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve,
+                  scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve, oversampling=osr,
                   label="Super-resolution")
         self.sr_job = job
         scale = int(self.sr_scale)  # the drizzle output grid is `scale` times finer in each direction
@@ -2974,6 +2992,36 @@ class MainWindow(QMainWindow):
             self.notify(f"Could not open session: {e}", "danger")
 
     # ================================================================== Slice 5: capability wiring
+    def _load_white_balance(self):
+        g = self.settings.value("white_balance", None)
+        try:
+            gains = tuple(float(v) for v in g) if g else None
+        except (TypeError, ValueError):
+            gains = None
+        self.engine.wb_gains = gains if gains is not None and len(gains) == 3 and all(v > 0 for v in gains) else None
+
+    def _set_white_balance(self, reset: bool = False):
+        """Grey-world white balance from the newest camera frame (calibration.white_balance_gains), stored in the
+        settings; reset=True removes it."""
+        if reset:
+            self.engine.wb_gains = None
+            self.settings.remove("white_balance")
+            self.notify("White balance reset: colour images show the camera's own balance.", "success")
+            return
+        item = self.source.latest() if self.source is not None else None
+        if item is None or item[0] is None or item[0].ndim != 3:
+            self.notify("White balance needs a colour frame from the camera.", "warning")
+            return
+        try:
+            gains = white_balance_gains(item[0][::2, ::2])
+        except ValueError as e:
+            self.notify(f"White balance not set: {e}.", "warning")
+            return
+        self.engine.wb_gains = gains
+        self.settings.setValue("white_balance", list(gains))
+        self.notify(f"White balance set from this view: gains B {gains[0]:.3f}, G 1, R {gains[2]:.3f} "
+                    "(colour images only).", "success")
+
     def _set_color_mode(self, on: bool):
         self.color_mode = bool(on)
         self.engine.color_mode = bool(on)  # without this the engine never kept colour frames and the colour EDF was unreachable

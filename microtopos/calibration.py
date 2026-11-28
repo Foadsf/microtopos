@@ -271,6 +271,37 @@ def bgr_to_luma(bgr: np.ndarray, linearize: bool = False) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
 
+WB_LOW_DN, WB_HIGH_DN = 10.0, 245.0  # pixels darker or brighter than this in any channel do not set white balance
+
+
+def white_balance_gains(bgr: np.ndarray) -> tuple[float, float, float]:
+    """Per-channel gains (B, G, R; G = 1) that make the mean of the usable pixels neutral (grey world).
+
+    Pixels near black or clipped in any channel are left out: a clipped channel no longer carries its colour. The
+    gains act on the camera's encoded values; for a power-law tone curve a neutral grey stays neutral in linear
+    light too. Raises ValueError when fewer than 1 % of the pixels are usable (a dark or saturated view)."""
+    f = bgr.astype(np.float32) * ((1.0 / 257.0) if bgr.dtype == np.uint16 else 1.0)
+    if f.ndim != 3 or f.shape[2] != 3:
+        raise ValueError("white balance needs a colour (3-channel) frame")
+    ok = np.all((f > WB_LOW_DN) & (f < WB_HIGH_DN), axis=2)
+    if ok.mean() < 0.01:
+        raise ValueError(f"only {ok.mean():.1%} of the pixels are between {WB_LOW_DN:.0f} and {WB_HIGH_DN:.0f} DN in "
+                         "every channel: adjust the exposure first")
+    m = f[ok].mean(axis=0)
+    return float(m[1] / m[0]), 1.0, float(m[1] / m[2])
+
+
+def apply_white_balance(bgr: np.ndarray, gains: tuple[float, float, float] | None) -> np.ndarray:
+    """Multiply each channel by its gain (B, G, R). uint8 stays uint8 (rounded, clipped); other types become float32.
+    None returns the input unchanged."""
+    if gains is None or bgr.ndim != 3:
+        return bgr
+    g = np.asarray(gains, np.float32)
+    if bgr.dtype == np.uint8:
+        return np.clip(bgr.astype(np.float32) * g + 0.5, 0, 255).astype(np.uint8)
+    return (bgr.astype(np.float32) * g).astype(np.float32)
+
+
 def bgr_to_rgb_u8(bgr: np.ndarray) -> np.ndarray:
     """Convert BGR or grayscale array (uint8, uint16, float32) to uint8 RGB."""
     scale = (1.0 / 257.0) if bgr.dtype == np.uint16 else 1.0

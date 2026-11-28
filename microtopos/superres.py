@@ -139,14 +139,35 @@ def subpixel_bins(shifts: list[tuple[float, float]], scale: int) -> int:
     return len({(int(np.round(dx * scale)) % scale, int(np.round(dy * scale)) % scale) for dx, dy in shifts})
 
 
+MAX_SR_SCALE = 4
+
+
+def max_useful_scale(oversampling: float) -> int:
+    """Largest linear super-resolution factor that can add detail, from Objective.optical_oversampling.
+
+    The optics pass no spatial frequency above 2 NA / lambda. A camera that already samples that cutoff at the Nyquist
+    rate (oversampling >= 1) loses nothing to its pixel grid, so a finer grid can only hold interpolated values: 1.
+    Otherwise the finest grid worth reconstructing is the Nyquist pixel: ceil(1 / oversampling), at most MAX_SR_SCALE.
+    """
+    if not oversampling > 0:
+        raise ValueError(f"optical oversampling must be positive, got {oversampling}")
+    return min(MAX_SR_SCALE, max(1, math.ceil(1.0 / oversampling - 1e-9)))
+
+
 def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2, pixfrac: float = 0.7,
-                   deconvolve: bool = True) -> dict:
+                   deconvolve: bool = True, oversampling: float | None = None) -> dict:
     """Drizzle + Richardson-Lucy of still frames. `scale` is linear (2 = 2x per axis, 4x the pixel count).
 
     Frames whose registration is not a valid ECC match are excluded; fewer than MIN_SR_FRAMES valid frames, or
     shifts that cover too few sub-pixel phases to add information, raise ValueError instead of returning a
-    resampled image that only looks sharper.
+    resampled image that only looks sharper. `oversampling` (Objective.optical_oversampling of the frames' pixel
+    size), when given, refuses a scale above max_useful_scale: a camera that already samples the optics' cutoff
+    gains no detail from a finer grid.
     """
+    if oversampling is not None and scale > max_useful_scale(oversampling):
+        raise ValueError(f"the camera already samples this objective {oversampling:.2f}x finer than the optics resolve "
+                         f"(pixel vs lambda/4NA), so a {scale}x grid adds no detail (useful: "
+                         f"{max_useful_scale(oversampling)}x); stack the still frames instead")
     ref = frames[0].astype(np.float32)
     # ECC translation (sub-pixel, unbiased) initialised by phase correlation; content shift = warp translation
     regs = [register_pair(ref, f.astype(np.float32), 1) for f in frames[1:]]

@@ -15,7 +15,14 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, bgr_to_rgb_u8, radiometric_key
+from .calibration import (
+    CalibrationStore,
+    RadiometricCorrector,
+    apply_white_balance,
+    bgr_to_luma,
+    bgr_to_rgb_u8,
+    radiometric_key,
+)
 from .camera import FrameSource
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
@@ -65,7 +72,8 @@ class SweepCapture:
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
     manual: bool = False  # True when captured under manual Z override (Space)
-    color_frames: list | None = None  # raw colour (BGR) frames matching `frames`, when the engine runs in colour mode
+    color_frames: list | None = None  # colour (BGR) frames matching `frames`, when the engine runs in colour mode
+    white_balance: tuple[float, float, float] | None = None  # (B, G, R) gains already applied to color_frames
 
     @property
     def usable(self) -> bool:
@@ -148,6 +156,9 @@ class LiveEngine:
         self.exposure: float | None = None
         self.linearize = False
         self.color_mode = False  # when True, colour frames flow through SweepBuffer.color_frames and the RGB mosaic
+        # (B, G, R) gains applied to every colour output (preview, sweep colour frames, colour mosaic), never to luma:
+        # the measurement, darks and flats stay independent of the white balance
+        self.wb_gains: tuple[float, float, float] | None = None
         # when an objective change restarts the mosaic, keep the previous objective's mosaic as an overview inset
         self.keep_overview_insets = True
         self.on_sweep = None  # callback(SweepCapture)
@@ -380,7 +391,8 @@ class LiveEngine:
                            self.source_generation,
                            self.mosaic_generation if mosaic_generation is None else mosaic_generation,
                            self.exposure, self.linearize, prev_shape,
-                           self.objective, manual=manual, color_frames=c_frames)
+                           self.objective, manual=manual, color_frames=c_frames,
+                           white_balance=self.wb_gains if c_frames is not None else None)
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -584,8 +596,9 @@ class LiveEngine:
         ph = round(h * pw / w)
         prev = cv2.resize(corr, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else corr
         prev_rgb = None
+        cbgr = apply_white_balance(bgr, self.wb_gains) if self.color_mode else None
         if self.color_mode:
-            rgb_full = bgr_to_rgb_u8(bgr)
+            rgb_full = bgr_to_rgb_u8(cbgr)
             prev_rgb = cv2.resize(rgb_full, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else rgb_full
 
         while self._pending_patches:
@@ -673,7 +686,7 @@ class LiveEngine:
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
-        self._preroll.append((full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None))
+        self._preroll.append((full_u8, z_true, tiles, seq, ts, cbgr))
         if self._held is not None and (seq > self._held[3] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
@@ -686,7 +699,7 @@ class LiveEngine:
                     self._buf.thin()  # sequence numbers are thinned too, so z spacing stays in source frames
                     self._n_preroll = (self._n_preroll + 1) // 2
                     self._stride *= 2
-                self._buf.append(full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None)
+                self._buf.append(full_u8, z_true, tiles, seq, ts, cbgr)
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov

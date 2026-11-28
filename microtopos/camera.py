@@ -185,6 +185,7 @@ class FrameSource:
         self._lock = threading.Lock()
         self._frame = None
         self._jpeg = None  # (seq, the camera's JPEG bytes or the recorded .jpg path) of the newest frame, when known
+        self.camera_name = ""  # the physical camera behind the frames (live or recorded), "" when there is none
         self._seq = 0
         self._running = False
         self._thread: threading.Thread | None = None
@@ -261,6 +262,7 @@ class CameraSource(FrameSource):
     def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25):
         super().__init__()
         self.info = info
+        self.camera_name = info.name
         self.req = (width, height, fps)
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
@@ -559,6 +561,7 @@ class ReplaySource(FrameSource):
         from .recording import load_manifest
 
         self.manifest = load_manifest(folder)
+        self.camera_name = str(self.manifest.meta.get("camera", "") or "")
         self.folder = self.manifest.folder
         self.files = self.manifest.files
         self.stamps = self.manifest.stamps

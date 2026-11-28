@@ -47,9 +47,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, export, metrology, stills, units, zstack
+from .. import __version__, export, metrology, response, stills, units, zstack
 from .. import objectives as objlib
-from ..calibration import CalibrationStore, CalStatus, bgr_to_rgb_u8, radiometric_key, today, white_balance_gains
+from ..calibration import (
+    FLAT_ESTIMATED,
+    CalibrationStore,
+    CalStatus,
+    bgr_to_rgb_u8,
+    flat_source,
+    radiometric_key,
+    today,
+    white_balance_gains,
+)
 from ..camera import (
     CameraSource,
     ReplaySource,
@@ -145,6 +154,38 @@ class Job(QThread):
             self.failed.emit("Cancelled.")
         except Exception as e:  # surfaced to the user, never silently dropped  # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+BRACKET_TIMEOUT_S = 180.0
+BRACKET_SETTLE_FRAMES = 5   # settled: the last 5 frame means lie within 1 % of each other ...
+BRACKET_SETTLE_REL = 0.01
+BRACKET_SETTLE_MIN = 6      # ... after at least 6 frames (the MikrOkular overshoots for ~10 frames after a change)
+BRACKET_SETTLE_MAX = 60     # ... or after 60 frames at most
+RESPONSE_EXPOSURES, RESPONSE_FRAMES = 8, 3
+HDR_EXPOSURES, HDR_FRAMES = 5, 2
+
+
+def _response_job(frames, times, progress=None, cancelled=None):
+    if progress:
+        progress(0.1, "Solving for the camera response...")
+    return response.estimate_response(frames, times)
+
+
+def _hdr_job(frames, times, curve, progress=None, cancelled=None):
+    if progress:
+        progress(0.1, "Merging the exposure bracket...")
+    m = response.merge_hdr(frames, times, curve)
+    rad = m["radiance"]
+    disp = response.tonemap_for_display(np.nan_to_num(rad, nan=0.0)).astype(np.float32)
+    w = np.array([0.0722, 0.7152, 0.2126], np.float32)
+    lum = rad @ w if rad.ndim == 3 else rad
+    return {"image": disp @ w if disp.ndim == 3 else disp, "colour": disp if disp.ndim == 3 else None,
+            "radiance": lum.astype(np.float32), "radiance_colour": rad if rad.ndim == 3 else None,
+            "unusable_fraction": float(m["unusable"].mean()), "frames_used": len(frames), "frames_rejected": 0,
+            "rl_iterations": 0, "values": "relative radiance (measured camera response; arbitrary unit)",
+            "notes": [(f"{len(set(times))} exposures {min(times) * 1e3:.1f}-{max(times) * 1e3:.1f} ms, "
+                       f"{float(m['unusable'].mean()):.1%} of pixels unusable in every exposure"),
+                      "display: tone-mapped"]}
 
 
 def _stack_job(still, psf, progress=None, cancelled=None):
@@ -843,7 +884,13 @@ class MainWindow(QMainWindow):
                                           "saturation, then keep it locked")
         self.lbl_exp.setText(f"{self.sl_exp.value() / 10:.1f} ms")
         self.chk_linear = QCheckBox("Linearise gamma (radiometric luminance)")
-        self.chk_linear.setToolTip("Off: Rec.601 luma of the camera's gamma-encoded output. On: inverts gamma 2.2 first.")
+        self.chk_linear.setToolTip("Off: Rec.601 luma of the camera's gamma-encoded output. On: linear luminance, "
+                                   "through this camera's measured response when there is one, else assuming "
+                                   "gamma 2.2")
+        self.btn_measure_resp = self._btn("Measure camera response", self._measure_response,
+                                          "Keep the view still: the exposure is stepped through its range and the "
+                                          "camera's tone curve is measured from the frames (stored per camera and "
+                                          "capture size). Refused when the frames do not agree with the exposures.")
         self.chk_linear.toggled.connect(lambda c: setattr(self.engine, "linearize", c))
         self.lbl_readback = QLabel("—")
         self.lbl_readback.setObjectName("muted")
@@ -954,7 +1001,7 @@ class MainWindow(QMainWindow):
         self.stage_details.setVisible(False)
         self.stage_box = section("Stage", drv_row, self.stage_details)
         return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
-                       self.lbl_readback, self.demo_box, self.stage_box,
+                       self.btn_measure_resp, self.lbl_readback, self.demo_box, self.stage_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
                             "because both would corrupt focus measurements.")
 
@@ -1151,11 +1198,16 @@ class MainWindow(QMainWindow):
         self.btn_flat = self._btn("Record flat  (blank, defocused)", lambda: self._record("flat"),
                                   "Average 24 frames of a featureless, defocused area (a mirror or polished blank): "
                                   "removes vignetting and dust")
+        self.btn_flat_est = self._btn("Estimate flat while panning", self._toggle_flat_estimate,
+                                      "No blank at hand: start, then pan the specimen slowly in two directions over "
+                                      "2-3 field widths. The shading is separated from the moving specimen and stored "
+                                      "as this objective's flat, labelled 'estimated'. Needs a locked exposure.")
         self.btn_clear_rad = self._btn("Clear for this objective", self._clear_radiometric)
         self.lbl_rad = QLabel()
         self.lbl_rad.setObjectName("muted")
         self.lbl_rad.setWordWrap(True)
-        return section("3. Dark & flat", self.btn_dark, self.btn_flat, self.btn_clear_rad, self.lbl_rad,
+        return section("3. Dark & flat", self.btn_dark, self.btn_flat, self.btn_flat_est, self.btn_clear_rad,
+                       self.lbl_rad,
                        hint="Stored per objective, capture size and exposure. Recommended before measuring roughness; "
                             "optional for viewing.")
 
@@ -1208,6 +1260,10 @@ class MainWindow(QMainWindow):
                                    "Align the last still frames and merge them, rejecting outliers: lower noise on "
                                    "the camera's own pixel grid. With 'Deconvolve' on (SR strip), Richardson-Lucy "
                                    "sharpening up to the optics' resolution follows.")
+        self.btn_hdr = self._btn("HDR still (exposure bracket)", self._run_hdr,
+                                 "Keep the view still: frames at several exposures are merged into one relative "
+                                 "radiance image through the measured camera response (needs one for this camera "
+                                 "and capture size), so shiny areas that clip and dark areas both keep detail")
         self.btn_export_still = self._btn("Export still image…", self._export_still,
                                           "Save the shown still image (stack / super-resolution): 32-bit float TIFF "
                                           "of the luma, 16-bit RGB TIFF of the colour when there is one, and "
@@ -1248,7 +1304,7 @@ class MainWindow(QMainWindow):
         f.addRow("L-filter λc", self.sp_lc)
         self.btn_recompute = self._btn("Recompute metrology", self._recompute)
         return section("6. Inspect", f, self.btn_manual, self.btn_repeat, self.btn_recompute, self.btn_stack,
-                       self.btn_sr, self.btn_export_still,
+                       self.btn_sr, self.btn_hdr, self.btn_export_still,
                        hint="Move X-Y to grow the mosaic. Turn the fine focus slowly through the surface to build a "
                             "height map; it is reconstructed automatically when the focus stops.")
 
@@ -1562,6 +1618,123 @@ class MainWindow(QMainWindow):
         self._apply_exposure()
         QTimer.singleShot(700, self._auto_exposure_step)  # let a few frames with the new exposure arrive
 
+    # ---------------------------------------------------------------- exposure brackets (response, HDR)
+    def _bracket_camera_ok(self, what: str) -> bool:
+        if not isinstance(self.source, CameraSource) or self.source.exposure_range() is None:
+            self.notify(f"{what} needs a real camera whose exposure time can be set.", "warning")
+            return False
+        if getattr(self, "_brk", None) is not None:
+            self.notify("An exposure bracket is already running.", "warning")
+            return False
+        return True
+
+    def _bracket(self, exposures: list[int], n_frames: int, on_done, label: str):
+        """Step the camera through `exposures` (device units, 100 us), wait at each until the brightness has
+        settled (BRACKET_SETTLE_*), keep `n_frames` new frames, then restore the user's exposure and call
+        on_done(frames (uint8 BGR), exposure times in s). Runs on GUI timers; never blocks."""
+        self._brk = {"exp": list(exposures), "i": 0, "n": n_frames, "frames": [], "times": [], "state": "set",
+                     "seq": -1, "means": [], "t0": time.time(), "on_done": on_done, "label": label,
+                     "gen": self.engine.source_generation, "override": self.engine.sm.override}
+        # the brightness steps are not motion: motion detection is paused, so they start no sweep, cut or mosaic
+        # event, and the user's override comes back afterwards
+        self.engine.sm.override = Override.PAUSE
+        self.btn_measure_resp.setEnabled(False)
+        self.btn_hdr.setEnabled(False)
+        QTimer.singleShot(0, self._bracket_step)
+
+    def _bracket_end(self, error: str | None = None):
+        b, self._brk = self._brk, None
+        self.engine.sm.override = b["override"]
+        self.btn_measure_resp.setEnabled(True)
+        self.btn_hdr.setEnabled(True)
+        self._apply_exposure()  # the user's exposure (or automatic exposure) again
+        if error:
+            self.notify(f"{b['label']} stopped: {error}", "warning")
+            return
+        b["on_done"](b["frames"], b["times"])
+
+    def _bracket_step(self):
+        b = getattr(self, "_brk", None)
+        if b is None:
+            return
+        if self.engine.source_generation != b["gen"] or not isinstance(self.source, CameraSource):
+            self._bracket_end("the camera changed")
+            return
+        if time.time() - b["t0"] > BRACKET_TIMEOUT_S:
+            self._bracket_end(f"no settled frames within {BRACKET_TIMEOUT_S:.0f} s")
+            return
+        item = self.source.latest()
+        e = b["exp"][b["i"]]
+        if b["state"] == "set":
+            self.source.set_manual_exposure(e)
+            b.update(state="settle", means=[], seq=item[2] if item else -1)
+        elif item is not None and item[2] != b["seq"]:
+            b["seq"] = item[2]
+            if b["state"] == "settle":
+                m = b["means"]
+                m.append(float(item[0][::8, ::8].mean()))
+                tail = m[-BRACKET_SETTLE_FRAMES:]
+                if (len(m) >= BRACKET_SETTLE_MIN and max(tail) - min(tail) <= BRACKET_SETTLE_REL * max(np.mean(tail), 1.0)
+                        or len(m) >= BRACKET_SETTLE_MAX):
+                    b["state"] = "collect"
+            else:
+                b["frames"].append(np.ascontiguousarray(item[0]))
+                b["times"].append(e * 1e-4)
+                if len(b["frames"]) >= b["n"] * (b["i"] + 1):
+                    b["i"] += 1
+                    if b["i"] == len(b["exp"]):
+                        self._bracket_end()
+                        return
+                    b["state"] = "set"
+        self.lbl_job.setText(f"{b['label']}: exposure {b['i'] + 1}/{len(b['exp'])} ({e / 10:.1f} ms, {b['state']})")
+        QTimer.singleShot(30, self._bracket_step)
+
+    def _exposure_series(self, n: int) -> list[int]:
+        lo, hi = self.source.exposure_range()
+        return sorted({round(float(v)) for v in np.geomspace(lo, hi, n)})
+
+    def _measure_response(self):
+        if not self._bracket_camera_ok("Measuring the camera response"):
+            return
+        self.notify("Keep the view still: stepping the exposure through its range…")
+        self._bracket(self._exposure_series(RESPONSE_EXPOSURES), RESPONSE_FRAMES, self._on_response_frames,
+                      "Camera response")
+
+    def _on_response_frames(self, frames, times):
+        shape = frames[0].shape[:2]
+        cam = self.source.camera_name
+        small = [f[::2, ::2] for f in frames]  # the curve needs levels, not detail: half size is ample
+        job = Job(_response_job, small, times, label="Camera response")
+
+        def done(curve):
+            self.store.set_response(cam, shape, curve)
+            self.engine.forget_response()
+            self.notify(f"Camera response measured for {cam} at {shape[1]}x{shape[0]}: gamma-equivalent "
+                        f"{curve.gamma_equivalent():.2f}, consistency {curve.inconsistency_dn:.1f} DN.", "success")
+        self._start_job(job, done)
+
+    def _run_hdr(self):
+        if not self._bracket_camera_ok("HDR"):
+            return
+        item = self.source.latest()
+        shape = item[0].shape[:2] if item else None
+        curve = self.store.get_response(self.source.camera_name, shape) if shape else None
+        if curve is None:
+            self.notify("HDR needs a measured response of this camera at this capture size: use 'Measure camera "
+                        "response' on the Camera page first (it is refused for cameras whose exposure setting does "
+                        "not give the brightness it states).", "warning")
+            return
+        self.notify("Keep the view still: taking an exposure bracket…")
+        self._bracket(self._exposure_series(HDR_EXPOSURES), HDR_FRAMES,
+                      lambda f, t: self._on_hdr_frames(f, t, curve), "HDR")
+
+    def _on_hdr_frames(self, frames, times, curve):
+        h, w = frames[0].shape[:2]
+        cal = self.store.get(self.obj)
+        um = cal.um_per_px(w, self.obj, h)
+        job = Job(_hdr_job, frames, times, curve, label="HDR merge")
+        self._start_job(job, lambda r: self._on_sr({**r, "kind": "hdr", "um_per_px": um, "scale": 1}))
+
     def _apply_exposure(self):
         auto = self.chk_autoexp.isChecked()
         self.sl_exp.setEnabled(not auto)
@@ -1702,12 +1875,26 @@ class MainWindow(QMainWindow):
         self.engine.request_calibration(kind, 24)
         self.notify(f"Recording {kind} frame: keep still…")
 
+    def _toggle_flat_estimate(self):
+        if self.engine.flat_estimate_progress() is not None or self.engine._flat_req is not None:
+            self.engine.cancel_flat_estimate("cancelled")
+            self.btn_flat_est.setText("Estimate flat while panning")
+            return
+        if self.sim_source is None and self.chk_autoexp.isChecked():
+            self.notify("Lock the exposure first (untick Automatic exposure): automatic exposure changes the "
+                        "brightness between frames, which the estimate would take for shading.", "warning")
+            return
+        self.engine.start_flat_estimate()
+        self.btn_flat_est.setText("Cancel flat estimate")
+        self.notify("Pan the specimen slowly in two directions over 2-3 field widths.")
+
     def _clear_radiometric(self):
         if self._reject_simulator_cal():
             return
         c = self.store.get(self.obj)
         c.darks.clear()
         c.flats.clear()
+        c.flat_sources.clear()
         self.store.touch(self.obj)
         self.store.save()
         self.engine._corrector_key = None
@@ -1929,7 +2116,9 @@ class MainWindow(QMainWindow):
             + (f"  cover {o.cover}" if o.cover else "") + f"\nRayleigh {o.rayleigh_um:.2f} µm\n"
             f"Optical cutoff λ/2NA {o.lateral_cutoff_um:.2f} µm\nDepth of field {o.dof_um:.2f} µm\n"
             f"Pixel {um_full:.3f} µm at 1920 px ({lat_status.value.lower()})")
-        lines = [f"{k}: dark {'✓' if k in c.darks else '—'}, flat {'✓' if k in c.flats else '—'}"
+        lines = [f"{k}: dark {'✓' if k in c.darks else '—'}, flat "
+                 + (("✓ (estimated from panning)" if flat_source(c, k).startswith(FLAT_ESTIMATED) else "✓")
+                    if k in c.flats else "—")
                  for k in sorted(set(c.darks) | set(c.flats))]
         self.lbl_rad.setText("\n".join(lines) or "Nothing recorded for this objective.")
         self.lbl_lat.setText(f"{lat_status.value}: {c.lateral_source or 'nominal'}"
@@ -2045,6 +2234,15 @@ class MainWindow(QMainWindow):
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))
         if s.brenner_hist:
             self.spark_curve.setData(np.asarray(s.brenner_hist, float))
+        fp = self.engine.flat_estimate_progress()
+        if fp is not None:
+            self.lbl_job.setText(f"Estimating flat: {fp['pairs']} pairs, {fp['travel']:.1f} fields of travel"
+                                 + (f" · still needs: {'; '.join(fp['missing'])}" if fp["missing"] else ""))
+        elif self.engine.flat_status and self.engine.flat_status != getattr(self, "_flat_status_shown", None):
+            self._flat_status_shown = self.engine.flat_status
+            self.btn_flat_est.setText("Estimate flat while panning")
+            self.notify(self.engine.flat_status, "warning" if "cancelled" in self.engine.flat_status else "success")
+            self._refresh_checklist()
         cp = self.engine.calibration_progress()
         if cp:
             self.lbl_job.setText(f"Recording {cp[0]}: {cp[1]}/{cp[2]} frames")
@@ -2295,6 +2493,7 @@ class MainWindow(QMainWindow):
                 "mosaic_generation": cap.mosaic_generation, "calibration_revision": cal.revision,
                 "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
                 "white_balance": list(cap.white_balance) if cap.white_balance else None,
+                "linearization": cap.linearization,
                 "z_source": zsrc or (cal.z_source if zstat == CalStatus.ESTIMATED.value else ""),
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
@@ -2525,7 +2724,9 @@ class MainWindow(QMainWindow):
         if self.job is None or not self.job.isRunning():
             self.prog.setValue(1000)
             k = r.get("scale", 2)
-            if r.get("kind") == "stack":
+            if r.get("kind") == "hdr":
+                self.lbl_job.setText(f"HDR: {r['frames_used']} frames merged; " + "; ".join(r["notes"][:1]))
+            elif r.get("kind") == "stack":
                 self.lbl_job.setText(f"Stack: {r['frames_used']} frames used, {r['frames_rejected']} rejected, "
                                      f"noise {r['noise_sigma_single']:.2f} → {r['noise_sigma_stack']:.2f} DN, "
                                      f"{r['pixels_clipped_fraction']:.1%} samples rejected as outliers"
@@ -2568,7 +2769,10 @@ class MainWindow(QMainWindow):
                 self.p_edf.set_image(np.clip(sr["image"], 0, 255), sr["um_per_px"], levels=(0, 255), unit="DN",
                                      autorange=True)
             self.p_edf.set_overlay(None)
-            if sr.get("kind") == "stack":
+            if sr.get("kind") == "hdr":
+                self.lbl_edf.setText("HDR still: relative radiance through the measured camera response, shown "
+                                     "tone-mapped · " + "; ".join(sr.get("notes", [])[:1]))
+            elif sr.get("kind") == "stack":
                 self.lbl_edf.setText(f"Stack of {sr['frames_used']} still frames on the camera's pixel grid"
                                      + (" + Richardson-Lucy" if sr["rl_iterations"] else "")
                                      + " · " + "; ".join(sr.get("notes", [])))
@@ -2932,7 +3136,11 @@ class MainWindow(QMainWindow):
                 "noise_sigma_single": sr.get("noise_sigma_single"), "noise_sigma_stack": sr.get("noise_sigma_stack"),
                 "rl_iterations": sr.get("rl_iterations"), "values": sr.get("values", "camera DN")}
         try:
-            paths = export.export_still(p, sr["image"], sr["um_per_px"], prov, sr.get("colour"))
+            if sr.get("kind") == "hdr":  # the radiance itself, not the tone-mapped display image
+                paths = export.export_still(p, sr["radiance"], sr["um_per_px"], prov, sr.get("radiance_colour"),
+                                            colour_float=True)
+            else:
+                paths = export.export_still(p, sr["image"], sr["um_per_px"], prov, sr.get("colour"))
             self.notify(f"Saved {paths[0]} (+ {len(paths) - 1} file(s))", "success")
         except OSError as e:
             self.notify(f"Export failed, nothing written: {e}", "danger")

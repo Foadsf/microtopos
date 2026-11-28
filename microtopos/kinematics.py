@@ -40,6 +40,11 @@ class Features:
     luma_change: float  # relative change of mean brightness
     brenner: float
     z_score: float
+    # signed content shift since the previous frame as a fraction of the field (x in widths, y in heights), in the
+    # phase-correlation convention this(x) = previous(x - d); coarse (analysis image), for gating only
+    dx_field: float = 0.0
+    dy_field: float = 0.0
+    cut: bool = False  # the view decorrelated from the previous frame (no motion could be measured)
 
 
 @dataclass
@@ -138,7 +143,7 @@ class StateMachine:
         sd_sh = sd_sh or 0.3
         moving = shift > max(1.0, 6 * sd_sh) and resp > 0.08
         z_like = abs(trend) > 4.0 and not moving and dl < 0.05 and not cut
-        feats = Features(shift, resp, dlb, dl, b, trend)
+        feats = Features(shift, resp, dlb, dl, b, trend, dx / s.shape[1], dy / s.shape[0], cut)
 
         if self.override != Override.AUTO:
             forced = {Override.PAN: State.PAN, Override.Z: State.Z_SWEEP, Override.PAUSE: State.DWELL}[self.override]

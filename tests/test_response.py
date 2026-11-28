@@ -293,3 +293,17 @@ def test_tonemap_is_monotonic_and_blanks_unusable_pixels():
     assert np.all(np.diff(flat.astype(int)) >= 0) and flat[0] == 0 and flat[-1] == 255
     # log scaling: the middle of the log range maps to the middle of the display range
     assert abs(int(out.ravel()[500]) - 128) <= 2
+
+
+def test_exposures_that_do_not_change_the_brightness_are_refused():
+    """The MikrOkular (measured 2026-11-28) gives identical frames for every exposure setting from 7.8 to 20.4 ms.
+    A camera that quantises its exposure like that can still yield a smooth, self-consistent but wrong curve, so
+    the series is refused at the first pair of distinct exposures that did not brighten the frames."""
+    rng = np.random.default_rng(3)
+    scene = np.linspace(0.02, 1.0, 64 * 48).reshape(48, 64)
+    stated = np.array([78, 108, 148, 204, 282, 388, 535, 738]) * 1e-4
+    applied = np.array([78, 78, 156, 156, 312, 312, 624, 624]) * 1e-4  # coarse steps, as the bridge does
+    frames = [np.clip(255 * np.clip(scene * a / 0.04, 0, 1) ** (1 / 2.0) + rng.normal(0, 0.5, scene.shape) + 0.5,
+                      0, 255).astype(np.uint8) for a in applied]
+    with pytest.raises(ValueError, match="gave the same brightness"):
+        estimate_response(frames, stated)

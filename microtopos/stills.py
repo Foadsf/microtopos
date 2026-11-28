@@ -39,7 +39,7 @@ def prepare(still: DwellStill, restore_jpeg: bool = True) -> dict:
             rs = list(ex.map(lambda j: jpegq.restore_frame(_jpeg_bytes(j), DEBLOCK_ITERATIONS, colour=need_bgr),
                              still.jpegs))
         if still.linearize:  # the same luminance the live pipeline measures, from the restored colour
-            lum = [bgr_to_luma(np.clip(r["bgr"], 0, 255).astype(np.float32), True) for r in rs]
+            lum = [bgr_to_luma(np.clip(r["bgr"], 0, 255).astype(np.float32), True, still.response) for r in rs]
         else:
             lum = [r["y"] for r in rs]  # the JPEG's own luma Y' (Rec.601), as live, without the 8-bit BGR round trip
         frames = [still.corrector(y) if still.corrector is not None else y.astype(np.float32) for y in lum]

@@ -46,6 +46,8 @@ REFERENCE_DN = 128  # g(REFERENCE_DN) = 1 when that level is measured in every c
 MONOTONIC_TOLERANCE = 0.02  # a raw solution that falls by more than this fraction is refused, not repaired
 BLACK_DN = 4  # merge weight is zero at and below this level ...
 CLIP_DN = 250  # ... and at and above this one (specular highlights clip at 255)
+STEP_CLIP_DN = 240  # pixels at or above this in either frame do not judge whether an exposure step brightened
+MIN_STEP_RISE_DN = 1.0  # a longer exposure that raises the median unclipped pixel by less than this did not apply
 CONSISTENCY_DN = (16, 240)  # levels used for the still-scene check
 MAX_INCONSISTENCY_DN = 4.0  # worst per-exposure median |DN - predicted DN| accepted as a still scene
 CONSISTENCY_PIXELS = 250_000  # pixels used for that check
@@ -252,6 +254,7 @@ def estimate_response(frames, exposures_s, *, samples: int = DEFAULT_SAMPLES,
     size in linear units explodes in the dark frames this camera delivers.
     """
     stack, t = _check_series(frames, exposures_s)
+    _check_exposures_take_effect(stack, t)
     n, h, w, nc = stack.shape
     flat = stack.reshape(n, h * w, nc)
     raw = []
@@ -285,6 +288,28 @@ def estimate_response(frames, exposures_s, *, samples: int = DEFAULT_SAMPLES,
                          f" DN (median); at most {MAX_INCONSISTENCY_DN:g} DN is accepted for a still scene. Was the scene, the light or "
                          "the camera's automatic exposure changing during the series?")
     return curve
+
+
+def _check_exposures_take_effect(stack: np.ndarray, t: np.ndarray) -> None:
+    """Every longer exposure must make the frames brighter. Wrong exposure ratios cannot be caught after the fact:
+    a different smooth curve absorbs them and still looks self-consistent (the response and the exposure ratios are
+    determined only together). But two distinct exposures that give the same brightness prove that the camera did
+    not apply the exposure it reports; the MikrOkular, for one, gives identical frames for every setting from 7.8 to
+    20.4 ms (measured 2026-11-28). Compared on pixels below STEP_CLIP_DN in both, so saturation does not hide a step.
+    """
+    times = np.unique(t)
+    means = []
+    for tj in times:
+        means.append(stack[t == tj].astype(np.float32).mean(axis=0).mean(axis=-1))  # per pixel, over frames/channels
+    for a, b, ta, tb in zip(means, means[1:], times, times[1:]):
+        ok = (a < STEP_CLIP_DN) & (b < STEP_CLIP_DN) & (b > BLACK_DN)
+        if ok.mean() < 0.01:
+            continue  # nothing comparable: everything clipped (judged by the other checks)
+        rise = float(np.median(b[ok] - a[ok]))
+        if rise < MIN_STEP_RISE_DN:
+            raise ValueError(f"the exposures {ta * 1e3:.1f} ms and {tb * 1e3:.1f} ms gave the same brightness (median "
+                             f"rise {rise:.2f} DN): the camera does not apply the exposure time it reports, so its "
+                             "response cannot be measured from its exposure setting")
 
 
 def _inconsistency_dn(stack: np.ndarray, t: np.ndarray, curve: ResponseCurve) -> float:

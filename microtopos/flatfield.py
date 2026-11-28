@@ -160,6 +160,12 @@ class FlatEstimator:
         self._frames += 1
         return True
 
+    def break_chain(self) -> None:
+        """Forget the previous frame (the caller lost track of the motion): the next offered frame starts a new
+        chain with shift None. Pairs already accumulated are kept."""
+        self._prev = None
+        self._pending[:] = 0.0
+
     def _add_pair(self, prev: tuple[np.ndarray, np.ndarray], cur: tuple[np.ndarray, np.ndarray],
                   d: np.ndarray) -> None:
         h, w = self.shape

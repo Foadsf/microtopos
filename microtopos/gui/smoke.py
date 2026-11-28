@@ -1,5 +1,5 @@
-"""Offscreen GUI smoke test: drives the simulator through pan, sweep, reversal, super-resolution, theme switch,
-metrology recompute and exports, and fails on any uncaught exception (including ones raised in Qt slots)."""
+"""Offscreen GUI smoke test: drives the simulator through pan, sweep, reversal, super-resolution, stacking, theme
+switch, metrology recompute and exports, and fails on any uncaught exception (including ones raised in Qt slots)."""
 
 from __future__ import annotations
 
@@ -175,6 +175,23 @@ def run_gui_smoke(seconds: float = 60.0, out=print) -> bool:
                 else "still running" if w.sr_job.isRunning() else "finished")
     log.append(f"{'ok' if getattr(w, 'sr_count', 0) > sr_before else 'FAIL'}    super-resolution produced a new image"
                f" (job {sr_state}; {w.lbl_job.text()[:120]})")
+    stack_job_before, stack_count = w.sr_job, getattr(w, "sr_count", 0)
+
+    def start_stack():  # the same still buffer; pressed again, as for super-resolution, until the job starts
+        t0 = time.time()
+        while w.sr_job is stack_job_before and time.time() - t0 < 30:
+            if len(w.engine.dwell_frames()) >= 8 and not (w.sr_job is not None and w.sr_job.isRunning()):
+                w._run_stack()
+            if w.sr_job is stack_job_before:
+                pump(app, 0.2)
+        assert w.sr_job is not stack_job_before, "no 8 still frames at a press within 30 s"
+
+    step("stack still frames", start_stack)
+    t0 = time.time()
+    while getattr(w, "sr_count", 0) == stack_count and time.time() - t0 < 60:
+        pump(app, 0.2)
+    stacked = getattr(w, "sr_count", 0) > stack_count and (w.sr_result or {}).get("kind") == "stack"
+    log.append(f"{'ok' if stacked else 'FAIL'}    stack produced a new image ({w.lbl_job.text()[:120]})")
     step("theme toggle twice", lambda: (w._toggle_theme(), w._toggle_theme()))
     step("objective change", lambda: w.cmb_obj.setCurrentText("40x / 0.85"))
     pump(app, 1)

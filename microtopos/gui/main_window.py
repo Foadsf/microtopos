@@ -155,10 +155,19 @@ def _stack_job(still, psf, progress=None, cancelled=None):
     return {**r, "notes": prep["notes"]}
 
 
-def _sr_job(frames, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None):
+SR_CROP = 512  # super-resolution works on the centre crop: its output has scale^2 times the pixels
+
+
+def _sr_job(still, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None):
     if progress:
         progress(0.1, "Registering dwell frames and drizzling...")
-    return dwell_superres(frames, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve, oversampling=oversampling)
+    frames = stills.prepare(still)
+    h, w = frames["frames"][0].shape
+    c = min(SR_CROP, h, w)
+    y0, x0 = (h - c) // 2, (w - c) // 2
+    crops = [f[y0:y0 + c, x0:x0 + c] for f in frames["frames"]]
+    r = dwell_superres(crops, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve, oversampling=oversampling)
+    return {**r, "input": crops[0], "notes": frames["notes"]}
 
 
 def _metrology_job(r, form_order, lam_s, lam_c, progress=None, cancelled=None):
@@ -2483,14 +2492,11 @@ class MainWindow(QMainWindow):
         if self.sr_job is not None and self.sr_job.isRunning():
             self.notify("Super-resolution is already running.", "warning")
             return
-        frames = self.engine.dwell_frames()
-        if len(frames) < 8:
+        still = self.engine.dwell_still()
+        if len(still.frames) < 8:
             self.notify("Hold still for a moment (needs 8 still frames).", "warning")
             return
-        h, w = frames[0].shape
-        c = min(512, h, w)
-        y0, x0 = (h - c) // 2, (w - c) // 2
-        crops = [f[y0:y0 + c, x0:x0 + c].astype(np.float32) for f in frames]
+        h, w = still.frames[0].shape
         cal = self.store.get(self.obj)
         um = (self.obj.nominal_um_per_px(w) if self.sim_source is not None
               else cal.um_per_px(w, self.obj, h))
@@ -2502,12 +2508,12 @@ class MainWindow(QMainWindow):
                         f"camera samples {self.obj.name} {osr:.1f}× finer than the optics resolve (λ/4NA = "
                         f"{self.obj.nyquist_pixel_um:.3g} µm). Use 'Stack still frames' instead.", "warning")
             return
-        job = Job(_sr_job, crops, self.obj.psf_sigma_px(um),
+        job = Job(_sr_job, still, self.obj.psf_sigma_px(um),
                   scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve, oversampling=osr,
                   label="Super-resolution")
         self.sr_job = job
         scale = int(self.sr_scale)  # the drizzle output grid is `scale` times finer in each direction
-        self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / scale, "scale": scale, "input": crops[0]}))
+        self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / scale, "scale": scale}))
 
     def _on_sr(self, r):
         self.sr_result = r

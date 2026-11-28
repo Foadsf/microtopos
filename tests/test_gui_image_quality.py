@@ -93,3 +93,28 @@ def test_super_resolution_is_refused_where_the_camera_oversamples_the_optics(qap
         assert _wait_for(qapp, lambda: not w.sr_job.isRunning(), 60)
     finally:
         _close(qapp, w)
+
+
+def test_stack_button_merges_the_still_frames_and_lowers_the_noise(qapp, tmp_path):
+    """The simulator holds still after its demo: 'Stack still frames' merges the dwell buffer; the per-pixel noise of
+    the stack falls by about sqrt(frames) (at least 2x for 16 frames) and the result is shown as a stack."""
+    w, notes = _open(qapp, tmp_path)
+    try:
+        assert _wait_for(qapp, lambda: w.sim_source is not None and not w.sim_source.busy(), 60)
+        # no hand tremor: the frames then differ by sensor noise only, so the stack's scatter is that noise (with
+        # tremor on these undersampled frames, resampling error adds to it; tests/test_stacking.py covers that case)
+        w.sim_source.sim.tremor_px = 0.0
+        seq0 = w.engine.snapshot().seq
+        assert _wait_for(qapp, lambda: w.engine.snapshot().seq > seq0 + 20 and len(w.engine.dwell_frames()) >= 16, 60)
+        w.sr_deconvolve = False
+        before = w.sr_job
+        w.btn_stack.click()
+        assert w.sr_job is not before, notes[-1:]
+        assert _wait_for(qapp, lambda: not w.sr_job.isRunning() and w.sr_result is not None, 60)
+        r = w.sr_result
+        assert r["kind"] == "stack" and r["scale"] == 1 and r["frames_used"] >= 8
+        assert r["noise_sigma_stack"] < r["noise_sigma_single"] / 2
+        assert r["image"].shape == w.engine.dwell_frames()[0].shape  # the camera's own grid, full frame
+        assert w.cmb_edf.currentIndex() == 1 and w.lbl_edf.text().startswith("Stack of")
+    finally:
+        _close(qapp, w)

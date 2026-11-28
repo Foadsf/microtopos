@@ -88,7 +88,8 @@ def test_noise_falls_as_expected_for_sixteen_shifted_frames(seed):
     assert measured == pytest.approx(expected, rel=0.025)
     # the reported stack noise is the frame-to-frame (random) part only: it must match `noise`, not include bias
     assert res["noise_sigma_stack"] == pytest.approx(noise, rel=0.025)
-    assert res["noise_sigma_single"] == pytest.approx(s, rel=0.03)
+    # one resampled sample's frame-to-frame noise: s times the RMS bilinear noise gain of the shifts
+    assert res["noise_sigma_single"] == pytest.approx(noise * np.sqrt(n), rel=0.03)
 
 
 def test_known_subpixel_shifts_are_measured_and_aligned():
@@ -228,3 +229,43 @@ def test_jpeg_simulator_frames_register_to_the_true_tremor():
     rel = true[res["frame_indices"]] - true[res["reference"]]
     assert np.abs(rel).max() > 2.0  # enough motion that a 5 % scale error would exceed the tolerance below
     np.testing.assert_allclose(np.array(res["shifts"]), rel, atol=0.05)
+
+
+def test_spatially_correlated_noise_is_reported_at_its_true_level():
+    """Camera noise is correlated between neighbouring pixels (demosaicing, JPEG). Still frames with noise blurred by
+    a Gaussian of 1.2 px: the reported single-frame noise is the per-pixel standard deviation of that noise (measured
+    on the noise fields themselves), and the stack's is that over sqrt(16). A white-noise estimator reads it ~3x low."""
+    rng = np.random.default_rng(21)
+    at = _texture(21)
+    n = 16
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.rfftfreq(W)[None, :]
+    g = np.exp(-2 * (np.pi * 1.2) ** 2 * (fx ** 2 + fy ** 2))
+    noise = [np.fft.irfft2(np.fft.rfft2(rng.normal(0, 8.0, (H, W))) * g, s=(H, W)) for _ in range(n)]
+    sigma = float(np.std(np.array(noise)))  # the true per-pixel noise of one frame
+    frames = [(at(0.0, 0.0) + e).astype(np.float32) for e in noise]
+    res = stack_frames(frames)
+    assert res["noise_sigma_single"] == pytest.approx(sigma, rel=0.03)
+    assert res["noise_sigma_stack"] == pytest.approx(sigma / np.sqrt(n), rel=0.03)
+    assert _rms(res["image"], at(0.0, 0.0), res["valid"]) == pytest.approx(sigma / np.sqrt(n), rel=0.05)
+
+
+def test_frame_brightness_flicker_is_divided_out():
+    """Lamp flicker / automatic exposure: frames scaled by up to +-4 %. The reported gains equal the true ones relative
+    to the reference within 0.2 %, and the stack matches the reference-brightness truth as closely as without flicker
+    (a merge that ignores the gains is off by the mean gain error over the image, ~1-2 DN, and is clipped unevenly)."""
+    rng = np.random.default_rng(5)
+    at = _texture(5)
+    n, s = 16, 2.0
+    t = rng.uniform(-1.5, 1.5, (n, 2))
+    k = rng.uniform(0.96, 1.04, n)
+    frames = [((at(*d)) * kk + rng.normal(0, s, (H, W))).astype(np.float32) for d, kk in zip(t, k)]
+    res = stack_frames(frames)
+    r = res["reference"]
+    true_gains = [k[i] / k[r] for i in res["frame_indices"]]
+    assert res["gains"] == pytest.approx(true_gains, rel=0.002)
+    steady = stack_frames([(at(*d) * k[r] + rng.normal(0, s, (H, W))).astype(np.float32) for d in t])
+    truth = at(*t[r]) * k[r]
+    e_flicker = _rms(res["image"], truth, res["valid"])
+    e_steady = _rms(steady["image"], truth, steady["valid"])
+    assert e_flicker < 1.1 * e_steady

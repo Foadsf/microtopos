@@ -33,6 +33,7 @@ MAD_TO_SIGMA = 1.4826  # median absolute deviation of a Gaussian sample times th
 # on a 1/32-pixel grid, so a tap outside the frame carries a weight of at least 1/32 and an all-ones frame warped with
 # a zero border reads at most 1 - 1/32 there; this threshold separates the two cases with margin.
 FULL_SUPPORT = 1.0 - 1.0 / 64.0
+GAIN_LOW_DN, GAIN_HIGH_DN = 5.0, 250.0  # pixels outside this range do not set a frame's brightness gain
 _ROWS_PER_CHUNK = 64  # the per-pixel sort runs on bands of rows to bound memory on full-resolution frames
 
 
@@ -68,9 +69,9 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
     translation model used. "first" uses frame 0 and fails if frame 0 is not usable.
 
     clip_sigma: per pixel, samples farther than clip_sigma * scale from the median of that pixel's samples are
-    rejected and the rest are averaged. scale = max(1.4826 * MAD of that pixel's samples, single-frame noise
-    sigma): the MAD follows local excess spread (residual mis-registration at edges, JPEG ringing), and the
-    noise floor keeps a pixel whose few samples happen to agree closely from rejecting good data. A transient
+    rejected and the rest are averaged. scale = max(1.4826 * MAD of that pixel's samples, the noise of one
+    unresampled sample (the larger of the median MAD scale and Immerkaer's estimate)): the MAD follows local excess spread (residual mis-registration at
+    edges, JPEG ringing), and the noise floor keeps a pixel whose few samples happen to agree closely from rejecting good data. A transient
     (a passing particle) or a frame that registered wrongly is rejected where it differs; where it does not differ
     it does no harm.
 
@@ -89,7 +90,11 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
       frames_used, frame_indices (input indices used, ascending), frames_rejected, reference (input index).
       shifts: per used frame, the content shift (dx, dy) in pixels relative to the reference: frame k shows the
         reference content moved by +shift (the translation of its registration warp).
-      noise_sigma_single: median Immerkaer noise sigma of the used input frames.
+      noise_sigma_single: frame-to-frame noise of one resampled sample, RMS over `valid` of the per-pixel standard
+        deviation of the kept samples (a temporal estimate, right for spatially correlated camera noise; for a still
+        view it is the camera's noise, with sub-pixel shifts bilinear resampling lowers it).
+      gains: per used frame, its brightness relative to the reference (lamp flicker, automatic exposure), divided
+        out before the merge.
       noise_sigma_stack: RMS over `valid` of each pixel's standard error, sqrt(sample variance / samples kept), from
         the scatter of the kept samples about their mean. It measures the frame-to-frame (random) part of the error
         only; blur and any error common to all frames are not in it.
@@ -150,8 +155,32 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
         S[i] = _warp(lum[k], W, size)
         S[i][_warp(ones, W, size) < FULL_SUPPORT] = np.nan
 
-    noise_single = float(np.median([immerkaer_sigma(lum[k]) for k in keep]))
-    floor = max(noise_single, 1e-6)
+    # ---- brightness: lamp flicker and automatic exposure scale whole frames; each frame's gain relative to the
+    # reference (ratio of their means over the pixels both observe, clipped and near-black pixels excluded) is
+    # divided out
+    iref = keep.index(ref)
+    sref = S[iref]
+    gains = np.ones(nu)
+    for i in range(nu):
+        if i != iref:
+            m = np.isfinite(S[i]) & (S[i] > GAIN_LOW_DN) & (S[i] < GAIN_HIGH_DN) & (sref > GAIN_LOW_DN) \
+                & (sref < GAIN_HIGH_DN)
+            if m.sum() > 0.1 * h * w:
+                # ratio of means, not least squares: noise and the bilinear smoothing of a resampled frame are
+                # zero-mean, but they lower a least-squares slope against the noisy reference (regression dilution)
+                gains[i] = float(S[i][m].astype(np.float64).sum() / sref[m].astype(np.float64).sum())
+                S[i] /= np.float32(gains[i])
+
+    # ---- the clip floor: the noise of one unresampled sample, bounded from below by two estimates that each read
+    # low in one case: the spread of every pixel's samples (temporal; low when sub-pixel shifts smooth the resampled
+    # samples) and Immerkaer's single-frame estimate (spatial; low for the spatially correlated noise that
+    # demosaicing and JPEG give a real camera). The larger keeps good samples of the noisiest frame.
+    sub = S[:, ::4, ::4]
+    full = np.all(np.isfinite(sub), axis=0)
+    xs = sub[:, full]
+    temporal = float(np.median(MAD_TO_SIGMA * np.median(np.abs(xs - np.median(xs, axis=0)), axis=0))) \
+        if xs.shape[1] else 0.0
+    floor = max(temporal, float(np.median([immerkaer_sigma(lum[k]) for k in keep])), 1e-6)
 
     # ---- robust merge, in bands of rows
     image = np.empty((h, w), np.float32)
@@ -181,15 +210,17 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
     rows, cols = np.flatnonzero(valid.any(axis=1)), np.flatnonzero(valid.any(axis=0))
     common_box = (int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1) if rows.size else (0, 0, 0, 0)
     se_valid = se2[valid]
-    se_valid = se_valid[np.isfinite(se_valid)]
-    noise_stack = float(math.sqrt(se_valid.mean())) if se_valid.size else float("nan")
+    nk_valid = kept_n[valid]
+    fin = np.isfinite(se_valid)
+    noise_stack = float(math.sqrt(se_valid[fin].mean())) if fin.any() else float("nan")
+    noise_single = float(math.sqrt((se_valid[fin] * nk_valid[fin]).mean())) if fin.any() else float("nan")
     clipped = 1.0 - float(kept_n.sum()) / float(count.sum())
 
     col_out = None
     if colour is not None:
         col_out = np.zeros((h, w, 3), np.float64)
         for i, (k, W) in enumerate(zip(keep, warps)):
-            c = _warp(np.asarray(colour[k]).astype(np.float32), W, size)
+            c = _warp(np.asarray(colour[k]).astype(np.float32), W, size) / np.float32(gains[i])
             col_out += np.where(kept[i][..., None], c, 0.0)
         col_out = (col_out / kept_n[..., None]).astype(np.float32)
 
@@ -199,4 +230,5 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
     return {"image": out.astype(np.float32), "stacked": image, "colour": col_out, "count": count, "valid": valid,
             "common_box": common_box, "frames_used": nu, "frame_indices": keep, "frames_rejected": n - nu,
             "reference": ref, "shifts": shifts, "noise_sigma_single": noise_single, "noise_sigma_stack": noise_stack,
+            "gains": [float(g) for g in gains],
             "pixels_clipped_fraction": clipped, "rl_iterations": iters}

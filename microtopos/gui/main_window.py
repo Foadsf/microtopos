@@ -47,9 +47,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, export, metrology, units, zstack
+from .. import __version__, export, metrology, stills, units, zstack
 from .. import objectives as objlib
-from ..calibration import CalibrationStore, CalStatus, radiometric_key, today, white_balance_gains
+from ..calibration import CalibrationStore, CalStatus, bgr_to_rgb_u8, radiometric_key, today, white_balance_gains
 from ..camera import (
     CameraSource,
     ReplaySource,
@@ -63,6 +63,7 @@ from ..focus import MEASURES
 from ..kinematics import Override, State, guess_objective
 from ..live import MIN_COMPLETENESS, LiveEngine, SweepCapture
 from ..objectives import resolve, resolve_result
+from ..stacking import stack_frames
 from ..stage import GrblStageDriver, SimulatedStageDriver, StageDriver, capture_z_sweep, list_serial_ports
 from ..superres import dwell_superres, max_useful_scale
 from .objectives_dialog import ObjectivesDialog
@@ -144,6 +145,14 @@ class Job(QThread):
             self.failed.emit("Cancelled.")
         except Exception as e:  # surfaced to the user, never silently dropped  # noqa: BLE001
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+def _stack_job(still, psf, progress=None, cancelled=None):
+    if progress:
+        progress(0.1, "Aligning and merging the still frames...")
+    prep = stills.prepare(still)
+    r = stack_frames(prep["frames"], colour=prep["colour"], deconvolve_psf_sigma=psf)
+    return {**r, "notes": prep["notes"]}
 
 
 def _sr_job(frames, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None):
@@ -592,7 +601,7 @@ class MainWindow(QMainWindow):
         self.chk_grains.toggled.connect(self._show_result)
         h.addWidget(self.chk_grains)
         self.cmb_edf = QComboBox()
-        self.cmb_edf.addItems(["All-in-focus", "Super-resolution (experimental)"])
+        self.cmb_edf.addItems(["All-in-focus", "Still image (stack / super-resolution)"])
         self.cmb_edf.currentIndexChanged.connect(self._show_result)
         h.addWidget(self.cmb_edf)
         self.lbl_edf = QLabel()
@@ -1186,6 +1195,10 @@ class MainWindow(QMainWindow):
         self.btn_manual = self._btn("Start Z capture  (Space)", self._toggle_manual, "Capture a focus sweep manually")
         self.btn_repeat = self._btn("Repeat sweep here", self._arm_repeat,
                                     "Repeat a sweep at the same spot to measure repeatability (σ_inst)")
+        self.btn_stack = self._btn("Stack still frames", self._run_stack,
+                                   "Align the last still frames and merge them, rejecting outliers: lower noise on "
+                                   "the camera's own pixel grid. With 'Deconvolve' on (SR strip), Richardson-Lucy "
+                                   "sharpening up to the optics' resolution follows.")
         self.btn_sr = self._btn("Super-resolve current view (experimental)", self._run_sr,
                                 "Drizzle + Richardson-Lucy on the last still frames, 512×512 centre crop. Gains only "
                                 "where the camera undersamples the optics (low magnification).")
@@ -1221,7 +1234,8 @@ class MainWindow(QMainWindow):
         f.addRow("S-filter λs", self.sp_ls)
         f.addRow("L-filter λc", self.sp_lc)
         self.btn_recompute = self._btn("Recompute metrology", self._recompute)
-        return section("6. Inspect", f, self.btn_manual, self.btn_repeat, self.btn_recompute, self.btn_sr,
+        return section("6. Inspect", f, self.btn_manual, self.btn_repeat, self.btn_recompute, self.btn_stack,
+                       self.btn_sr,
                        hint="Move X-Y to grow the mosaic. Turn the fine focus slowly through the surface to build a "
                             "height map; it is reconstructed automatically when the focus stops.")
 
@@ -2448,6 +2462,23 @@ class MainWindow(QMainWindow):
         self.lbl_job.setText("Feature parameters computed.")
         self._show_result()
 
+    def _run_stack(self):
+        if self.sr_job is not None and self.sr_job.isRunning():
+            self.notify("A still-image job is already running.", "warning")
+            return
+        still = self.engine.dwell_still()
+        if len(still.frames) < 8:
+            self.notify("Hold still for a moment (needs 8 still frames).", "warning")
+            return
+        h, w = still.frames[0].shape
+        cal = self.store.get(self.obj)
+        um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w, self.obj, h)
+        psf = self.obj.psf_sigma_px(um) if self.sr_deconvolve else None
+        job = Job(_stack_job, still, psf, label="Stack")
+        self.sr_job = job
+        self._start_job(job, lambda r: self._on_sr({**r, "kind": "stack", "um_per_px": um, "scale": 1,
+                                                     "input": still.frames[0]}))
+
     def _run_sr(self):
         if self.sr_job is not None and self.sr_job.isRunning():
             self.notify("Super-resolution is already running.", "warning")
@@ -2484,7 +2515,13 @@ class MainWindow(QMainWindow):
         if self.job is None or not self.job.isRunning():
             self.prog.setValue(1000)
             k = r.get("scale", 2)
-            self.lbl_job.setText(f"Super-resolution ({k}× linear, {k * k}× pixels): {r['frames_used']} frames used, "
+            if r.get("kind") == "stack":
+                self.lbl_job.setText(f"Stack: {r['frames_used']} frames used, {r['frames_rejected']} rejected, "
+                                     f"noise {r['noise_sigma_single']:.2f} → {r['noise_sigma_stack']:.2f} DN, "
+                                     f"{r['pixels_clipped_fraction']:.1%} samples rejected as outliers"
+                                     + (f", RL {r['rl_iterations']} iterations" if r["rl_iterations"] else ""))
+            else:
+                self.lbl_job.setText(f"Super-resolution ({k}× linear, {k * k}× pixels): {r['frames_used']} frames used, "
                                  f"{r['frames_rejected']} rejected, {r['subpixel_bins']} sub-pixel phases, "
                                  f"RL {r['rl_iterations']} iterations, PSF σ {r['psf_sigma_lr']:.2f} px ({r['psf_source']})")
         self.cmb_edf.setCurrentIndex(1)
@@ -2515,10 +2552,19 @@ class MainWindow(QMainWindow):
         self._update_card()
         if self.cmb_edf.currentIndex() == 1 and self.sr_result is not None:
             sr = self.sr_result
-            self.p_edf.set_image(np.clip(sr["image"], 0, 255), sr["um_per_px"], levels=(0, 255), unit="DN", autorange=True)
+            if sr.get("colour") is not None and self.chk_rgb.isChecked():
+                self.p_edf.set_image(bgr_to_rgb_u8(np.clip(sr["colour"], 0, 255)), sr["um_per_px"], unit="DN", rgb=True)
+            else:
+                self.p_edf.set_image(np.clip(sr["image"], 0, 255), sr["um_per_px"], levels=(0, 255), unit="DN",
+                                     autorange=True)
             self.p_edf.set_overlay(None)
-            self.lbl_edf.setText(f"Experimental: {sr.get('scale', 2)}× (linear) drizzle + Richardson-Lucy of the centre "
-                                 "crop; a display image, not a measured resolution gain")
+            if sr.get("kind") == "stack":
+                self.lbl_edf.setText(f"Stack of {sr['frames_used']} still frames on the camera's pixel grid"
+                                     + (" + Richardson-Lucy" if sr["rl_iterations"] else "")
+                                     + " · " + "; ".join(sr.get("notes", [])))
+            else:
+                self.lbl_edf.setText(f"Experimental: {sr.get('scale', 2)}× (linear) drizzle + Richardson-Lucy of the "
+                                     "centre crop; a display image, not a measured resolution gain")
         elif r is not None:
             um_cap = r["um_per_px_capture"]
             edf_rgb = r.get("edf_rgb")  # colour all-in-focus (fused with the grey weights) when the sweep was colour

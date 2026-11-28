@@ -130,8 +130,13 @@ MIN_SR_FRAMES = 4
 
 
 def subpixel_bins(shifts: list[tuple[float, float]], scale: int) -> int:
-    """Number of distinct (x, y) sub-pixel phases (on the 1/scale grid) covered by the frame shifts."""
-    return len({(int(np.floor((dx % 1.0) * scale)), int(np.floor((dy % 1.0) * scale))) for dx, dy in shifts})
+    """Number of distinct (x, y) sub-pixel phases (on the 1/scale grid) covered by the frame shifts.
+
+    A shift belongs to the nearest point of the 1/scale grid (round, not floor): a still view registers with
+    shifts that scatter by a few thousandths of a pixel on both sides of zero, and flooring put -0.004 px
+    (fraction 0.996) and +0.004 px in different phases, so a microscope nobody touched passed as moving.
+    """
+    return len({(int(np.round(dx * scale)) % scale, int(np.round(dy * scale)) % scale) for dx, dy in shifts})
 
 
 def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2, pixfrac: float = 0.7,

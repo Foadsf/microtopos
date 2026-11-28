@@ -12,8 +12,6 @@ import math
 
 import cv2
 import numpy as np
-from scipy.optimize import least_squares
-from scipy.special import erf
 
 from .registration import register_pair
 
@@ -30,43 +28,16 @@ def immerkaer_sigma(img: np.ndarray) -> float:
 
 
 def fit_edge_psf_sigma(img: np.ndarray, nominal: float) -> tuple[float, str]:
-    """PSF sigma from an erf fit across the strongest straight edge; falls back to the nominal value."""
-    img = img.astype(np.float32)
-    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
-    mag = np.hypot(gx, gy)
-    m = 12
-    if min(img.shape) < 4 * m:
-        return nominal, "nominal (image too small)"
-    roi = mag[m:-m, m:-m]
-    y, x = np.unravel_index(int(np.argmax(roi)), roi.shape)
-    y, x = y + m, x + m
-    g = float(mag[y, x])
-    if g < 20:
-        return nominal, "nominal (no strong edge)"
-    ux, uy = float(gx[y, x]) / g, float(gy[y, x]) / g
-    s = np.linspace(-8, 8, 33).astype(np.float32)
-    # average 7 parallel profiles along the edge to beat noise
-    profs = []
-    for t in np.linspace(-3, 3, 7):
-        mx = (x + s * ux - t * uy).astype(np.float32).reshape(1, -1)
-        my = (y + s * uy + t * ux).astype(np.float32).reshape(1, -1)
-        profs.append(cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT).ravel())
-    p = np.mean(profs, axis=0)
-
-    def res(q):
-        a, b, x0, sg = q
-        return a + b * erf((s - x0) / (math.sqrt(2) * sg)) - p
+    """PSF sigma (px, pixel aperture removed) from a straight edge in the image by the slanted-edge method
+    (edgemtf.measure_edge); the nominal value when the image holds no measurable edge. The earlier erf fit of one
+    resampled profile kept the pixel aperture and interpolation blur in its sigma (+18 % at sigma 0.8 px)."""
+    from .edgemtf import measure_edge
 
     try:
-        q0 = [float(p.mean()), float(p[-1] - p[0]) / 2, 0.0, max(nominal, 0.6)]
-        r = least_squares(res, q0, bounds=([-1e3, -1e3, -3, 0.3], [1e3, 1e3, 3, 8]))
-        r2 = 1 - np.var(r.fun) / (np.var(p) + 1e-9)
-        if r.success and r2 > 0.95:
-            return float(r.x[3]), f"measured edge fit (R2={r2:.3f})"
-    except (ValueError, RuntimeError):
-        pass
-    return nominal, "nominal (edge fit rejected)"
+        m = measure_edge(np.asarray(img, np.float32))
+    except ValueError as e:
+        return nominal, f"nominal ({e})"
+    return float(m["psf_sigma_px"]), f"slanted edge in the image (MTF50 {m['mtf50_cyc_per_px']:.3f} cyc/px)"
 
 
 def drizzle(frames: list[np.ndarray], shifts: list[tuple[float, float]], scale: int = 2,
@@ -155,14 +126,15 @@ def max_useful_scale(oversampling: float) -> int:
 
 
 def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2, pixfrac: float = 0.7,
-                   deconvolve: bool = True, oversampling: float | None = None) -> dict:
+                   deconvolve: bool = True, oversampling: float | None = None, psf_source: str = "nominal") -> dict:
     """Drizzle + Richardson-Lucy of still frames. `scale` is linear (2 = 2x per axis, 4x the pixel count).
 
     Frames whose registration is not a valid ECC match are excluded; fewer than MIN_SR_FRAMES valid frames, or
     shifts that cover too few sub-pixel phases to add information, raise ValueError instead of returning a
     resampled image that only looks sharper. `oversampling` (Objective.optical_oversampling of the frames' pixel
     size), when given, refuses a scale above max_useful_scale: a camera that already samples the optics' cutoff
-    gains no detail from a finer grid.
+    gains no detail from a finer grid. psf_source: "nominal" lets a straight edge in the frames refine the PSF
+    (fit_edge_psf_sigma); any other value (a measured PSF of this objective) is used as given.
     """
     if oversampling is not None and scale > max_useful_scale(oversampling):
         raise ValueError(f"the camera already samples this objective {oversampling:.2f}x finer than the optics resolve "
@@ -183,7 +155,10 @@ def dwell_superres(frames: list[np.ndarray], psf_sigma_lr: float, scale: int = 2
         raise ValueError(f"the frames cover only {bins} of {scale * scale} sub-pixel phases: there is not enough "
                          "sub-pixel motion between them for super-resolution")
     driz, cover = drizzle(frames, shifts, scale, pixfrac)
-    sigma_lr, src = fit_edge_psf_sigma(np.mean(frames, axis=0), psf_sigma_lr)
+    if psf_source == "nominal":
+        sigma_lr, src = fit_edge_psf_sigma(np.mean(frames, axis=0), psf_sigma_lr)
+    else:
+        sigma_lr, src = psf_sigma_lr, psf_source
     out, iters = driz, 0
     noise = immerkaer_sigma(driz)
     if deconvolve:

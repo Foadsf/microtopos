@@ -54,6 +54,10 @@ def prepare(still: DwellStill, restore_jpeg: bool = True) -> dict:
         notes = ["the live pipeline's corrected 8-bit frames" + (" (no JPEG data)" if still.jpegs is None else "")]
         if still.colour is not None:
             colour = [apply_white_balance(c.astype(np.float32), still.wb_gains) for c in still.colour]
+    if colour is not None and still.lateral_ca is not None:
+        colour = [still.lateral_ca.apply(c) for c in colour]
+        notes.append(f"colour fringes corrected (lateral chromatic aberration, {still.lateral_ca.fringe_px_at_corner():.2f} "
+                     "px at the corner)")
     if colour is not None:
         notes.append("colour white-balanced" if still.wb_gains else "colour: the camera's balance")
     return {"frames": frames, "colour": colour, "notes": notes}

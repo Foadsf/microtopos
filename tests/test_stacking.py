@@ -40,20 +40,35 @@ def _rms(a, b, mask):
     return float(np.sqrt(np.mean((np.asarray(a, np.float64) - b)[mask] ** 2)))
 
 
-def _bilinear_noise_gain(f: float) -> float:
-    """Variance factor of white noise resampled by bilinear interpolation at fractional position f (1-D)."""
-    f = f - np.floor(f)
-    return (1 - f) ** 2 + f ** 2
+def _lanczos_weights(f: float) -> np.ndarray:
+    """The 8 Lanczos-4 weights for samples floor(x) - 3 .. floor(x) + 4 at fractional position f, from the kernel
+    L(t) = sinc(t) sinc(t / 4), normalised to sum 1, with f snapped to OpenCV's 1/32 grid (written here from the
+    formula, not taken from OpenCV)."""
+    f = np.round((f - np.floor(f)) * 32.0) / 32.0
+    if f in (0.0, 1.0):
+        w = np.zeros(8)
+        w[3 if f == 0.0 else 4] = 1.0
+        return w
+    t = np.arange(8) - 3 - f
+    w = np.sinc(t) * np.sinc(t / 4.0)
+    return w / w.sum()
 
 
-def _bilinear_shift(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    """out(x) = img(x + d) by bilinear interpolation of the periodic image (written here, not taken from OpenCV)."""
+def _lanczos_noise_gain(f: float) -> float:
+    """Variance factor of white noise resampled by Lanczos-4 at fractional position f (1-D)."""
+    return float(np.sum(_lanczos_weights(f) ** 2))
+
+
+def _lanczos_shift(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """out(x) = img(x + d) by separable Lanczos-4 interpolation of the periodic image."""
+    out = np.zeros_like(img, dtype=np.float64)
+    tmp = np.zeros_like(out)
     ix, iy = int(np.floor(dx)), int(np.floor(dy))
-    fx, fy = dx - ix, dy - iy
-
-    def g(a, b):
-        return np.roll(img, (-(iy + b), -(ix + a)), axis=(0, 1))
-    return (1 - fx) * (1 - fy) * g(0, 0) + fx * (1 - fy) * g(1, 0) + (1 - fx) * fy * g(0, 1) + fx * fy * g(1, 1)
+    for k, wk in enumerate(_lanczos_weights(dx)):
+        tmp += wk * np.roll(img, -(ix + k - 3), axis=1)
+    for k, wk in enumerate(_lanczos_weights(dy)):
+        out += wk * np.roll(tmp, -(iy + k - 3), axis=0)
+    return out
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
@@ -61,12 +76,11 @@ def test_noise_falls_as_expected_for_sixteen_shifted_frames(seed):
     """16 frames, sub-pixel shifts within +-2.5 px, Gaussian noise s = 6 DN.
 
     Expected RMS error of the stack against the truth on the common area: sqrt(noise^2 + bias^2), where
-      noise = (s / N) sqrt(sum_k g(fx_k) g(fy_k)), g(f) = (1-f)^2 + f^2 the variance that bilinear resampling at
-        fraction f leaves of white noise (the reference, f = 0, keeps all of it; this is s/sqrt(N) times the
-        measured interpolation factor sqrt(mean_k g g), 0.75..0.80 for these shifts), and
-      bias = RMS of (mean of the noiseless frames resampled bilinearly by their true shifts) - truth: the smoothing
-        bilinear interpolation does to the signal (0.22..0.28 DN here), computed independently of the code.
-    Measured over 8 seeds: ratio 0.997..1.003. Tolerance +-2.5 %: the RMS over ~65 000 pixels varies by ~0.3 %,
+      noise = (s / N) sqrt(sum_k g(fx_k) g(fy_k)), g(f) = sum of the squared Lanczos-4 weights at fraction f, the
+        variance that resampling leaves of white noise (the reference, f = 0, keeps all of it), and
+      bias = RMS of (mean of the noiseless frames resampled by Lanczos-4 at their true shifts) - truth: the
+        smoothing interpolation does to the signal, computed independently of the code.
+    Measured over 8 seeds: ratio 1.002..1.012 (noise 1.35..1.39 DN, bias 0.014..0.038 DN). Tolerance +-2.5 %: the RMS over ~65 000 pixels varies by ~0.3 %,
     registration error (~0.015 px) adds ~0.2 %, and a 5 % error in the noise reduction fails. Returning frame 0
     (RMS ~ s) or averaging without registration (2.5..5.7 DN) is far outside.
     """
@@ -79,8 +93,8 @@ def test_noise_falls_as_expected_for_sixteen_shifted_frames(seed):
     r = res["reference"]
     truth = at(*t[r])
     d = t - t[r]
-    noise = s / n * np.sqrt(sum(_bilinear_noise_gain(dx) * _bilinear_noise_gain(dy) for dx, dy in d))
-    resampled = np.mean([_bilinear_shift(at(*t[k]), *d[k]) for k in range(n)], axis=0)
+    noise = s / n * np.sqrt(sum(_lanczos_noise_gain(dx) * _lanczos_noise_gain(dy) for dx, dy in d))
+    resampled = np.mean([_lanczos_shift(at(*t[k]), *d[k]) for k in range(n)], axis=0)
     va = res["valid"]
     bias = _rms(resampled, truth, va)
     expected = float(np.hypot(noise, bias))
@@ -114,15 +128,18 @@ def test_border_pixels_use_only_frames_that_cover_them():
     """A strip that only some frames cover is the merge of those frames: count is right and no border fill leaks."""
     rng = np.random.default_rng(5)
     at = _texture(5)
-    # half of the frames shifted +2.4 px in x: the reference's rightmost 3 columns are seen by the others only
+    # half of the frames shifted +2.4 px in x: near the borders some frames' Lanczos taps fall outside them
     t = np.array([(0.1 * k, 0.05 * k) if k % 2 else (2.4 + 0.05 * k, -0.04 * k) for k in range(8)])
     res = stack_frames(_noisy(at, t, 1.0, rng))
     r = res["reference"]
     truth = at(*t[r])
     d = t - t[r]
-    xs = np.arange(W)[None, :] + d[:, 0][:, None]  # sample position of each reference column in each frame
-    ys = np.arange(H)[None, :] + d[:, 1][:, None]
-    expect = ((xs >= 0) & (xs <= W - 1))[:, None, :] & ((ys >= 0) & (ys <= H - 1))[:, :, None]
+    def covered(n, dk):  # every Lanczos tap (floor - 3 .. floor + 4; just the sample on a whole pixel) inside
+        q = np.round((np.arange(n) + dk) * 32.0) / 32.0
+        base = np.floor(q)
+        reach = np.where(q == base, 0, 1)
+        return (base - 3 * reach >= 0) & (base + 4 * reach <= n - 1)
+    expect = np.array([covered(H, dk[1])[:, None] & covered(W, dk[0])[None, :] for dk in d])
     np.testing.assert_array_equal(res["count"], expect.sum(axis=0))
     # the zero border of the warp would pull edge pixels towards 0 (truth ~120); every pixel stays near the truth
     assert np.abs(res["image"] - truth).max() < 6.0

@@ -12,7 +12,7 @@ from PySide6.QtCore import QPoint, QStandardPaths
 from PySide6.QtWidgets import QApplication
 
 from microtopos.calibration import white_balance_gains
-from microtopos.camera import CameraInfo, CameraSource
+from microtopos.camera import CameraInfo, CameraSource, FrameSource
 from microtopos.gui.main_window import MainWindow
 
 
@@ -276,6 +276,38 @@ def test_a_camera_whose_exposure_steps_are_coarse_is_refused_a_response(qapp, tm
         assert w.store.get_response(cam.camera_name, (120, 160)) is None
         w.btn_hdr.click()  # and HDR says why it cannot run
         assert "measured response" in notes[-1][1]
+    finally:
+        cam.stop()
+        _close(qapp, w)
+
+
+def test_measure_rolling_shutter_button_stores_the_readout(qapp, tmp_path):
+    import test_readout_live as trl
+    import test_rollingshutter as trs
+
+    class _RSCamera(FrameSource):
+        def __init__(self):
+            super().__init__()
+            self.camera_name = f"RS camera {time.time_ns()}"
+            self.script = trl._script(trs.RollingShutterCamera(5, trl.RHO), n_cycles=12)
+
+        def _run(self):
+            i = 0
+            while self._running:
+                f = self.script[i % len(self.script)][0]
+                self._publish(np.dstack([f] * 3))
+                i += 1
+                time.sleep(0.03)
+
+    w, notes = _open(qapp, tmp_path)
+    cam = _RSCamera()
+    try:
+        _use(w, cam)
+        w.btn_measure_ro.click()
+        assert _wait_for(qapp, lambda: any(m.startswith("Rolling shutter") for _, m in notes), 180), notes[-3:]
+        v = w.store.get_camera_value("readout", cam.camera_name, (trs.H, trs.W))
+        assert v is not None and v["rho"] == pytest.approx(trl.RHO, rel=0.05), (notes[-1], v)
+        assert w.engine.readout_for((trs.H, trs.W)) == pytest.approx(v["rho"])
     finally:
         cam.stop()
         _close(qapp, w)

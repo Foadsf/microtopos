@@ -2,7 +2,7 @@
 
 Every frame is registered to a reference frame with `registration.register_pair` (translation model, full
 resolution, the same call `superres.dwell_superres` makes), frames whose registration is not a valid ECC match are
-dropped, the rest are resampled onto the reference grid by bilinear interpolation and merged per pixel with a
+dropped, the rest are resampled onto the reference grid by Lanczos-4 interpolation and merged per pixel with a
 sigma-clipped mean. The result keeps the reference frame's pixel grid and size; no pixel is invented: a pixel near
 the border uses only the frames whose interpolation taps all lie inside that frame, and `count` / `valid` say how
 many frames each pixel holds and where every used frame contributed.
@@ -10,7 +10,13 @@ many frames each pixel holds and where every used frame contributed.
 What stacking gains: the random part of the error (sensor noise, and JPEG artefacts that differ from frame to
 frame because the view moved) falls roughly as 1/sqrt(frames used). What it does not remove: anything common to
 all frames (defocus, the optics' blur, fixed-pattern noise, a JPEG artefact that repeats because the view did not
-move), and bilinear resampling smooths every frame except the reference a little.
+move), and resampling smooths every frame except the reference a little. Lanczos-4 rather than bilinear: on
+simulated camera frames (JPEG quality 43, 4:2:2, 1 px hand tremor, 16 frames) the stack was 11-14 % closer to the
+truth (640 x 360: 2.12 -> 1.89 and 2.08 -> 1.80 DN; 256 x 192: 3.87 -> 3.41 and 3.91 -> 3.36 DN), because bilinear
+interpolation loses most of the highest frequencies at half-pixel shifts. The price: Lanczos keeps more of each
+frame's noise. For strong white noise (6 DN on a fine texture, tests/test_stacking.py) bilinear's smoothing scored
+closer to the truth (about 1.0 against 1.37 DN, its signal bias 0.25 against 0.02 DN); the MikrOkular's temporal
+noise is about 0.9 DN and spatially correlated, the regime where Lanczos is better.
 """
 
 from __future__ import annotations
@@ -29,10 +35,9 @@ REFERENCES = ("median", "first")
 # register with more than half of the others is not a still view of one scene.
 PRELIMINARY_TRIES = 3
 MAD_TO_SIGMA = 1.4826  # median absolute deviation of a Gaussian sample times this estimates its sigma
-# A resampled pixel counts as observed only when its bilinear taps all fall inside the frame. OpenCV interpolates
-# on a 1/32-pixel grid, so a tap outside the frame carries a weight of at least 1/32 and an all-ones frame warped with
-# a zero border reads at most 1 - 1/32 there; this threshold separates the two cases with margin.
-FULL_SUPPORT = 1.0 - 1.0 / 64.0
+# OpenCV's Lanczos-4 reads the 8 samples floor(x) - 3 .. floor(x) + 4 along each axis; a resampled pixel counts as
+# observed only when all of them lie inside the frame (a translation warp: exact per row and column)
+LANCZOS_TAPS_BEFORE, LANCZOS_TAPS_AFTER = 3, 4
 GAIN_LOW_DN, GAIN_HIGH_DN = 5.0, 250.0  # pixels outside this range do not set a frame's brightness gain
 _ROWS_PER_CHUNK = 64  # the per-pixel sort runs on bands of rows to bound memory on full-resolution frames
 
@@ -49,9 +54,25 @@ def _translation(d: tuple[float, float]) -> np.ndarray:
 
 
 def _warp(img: np.ndarray, W: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """aligned(x) = img(W x), registration.py's convention; outside the frame the value is 0 and is masked off."""
-    return cv2.warpAffine(img, W, size, flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+    """aligned(x) = img(W x), registration.py's convention, Lanczos-4; outside the support the value is masked off."""
+    return cv2.warpAffine(img, W, size, flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP,
                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _support(W: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Pixels of the warped image whose every Lanczos tap lies inside the source frame (translation warps)."""
+    w, h = size
+    if not np.allclose(W[:, :2], np.eye(2)):
+        raise ValueError("stacking warps are translations")
+    def ok(n: int, t: float) -> np.ndarray:
+        # OpenCV snaps the position to a 1/32 px grid; on a whole pixel the kernel weights only that sample
+        q = np.round((np.arange(n) + t) * 32.0) / 32.0
+        base = np.floor(q)
+        whole = q == base
+        before = np.where(whole, 0, LANCZOS_TAPS_BEFORE)
+        after = np.where(whole, 0, LANCZOS_TAPS_AFTER)
+        return (base - before >= 0) & (base + after <= n - 1)
+    return ok(h, float(W[1, 2]))[:, None] & ok(w, float(W[0, 2]))[None, :]
 
 
 def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = None, reference: str = "median",
@@ -92,7 +113,7 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
         reference content moved by +shift (the translation of its registration warp).
       noise_sigma_single: frame-to-frame noise of one resampled sample, RMS over `valid` of the per-pixel standard
         deviation of the kept samples (a temporal estimate, right for spatially correlated camera noise; for a still
-        view it is the camera's noise, with sub-pixel shifts bilinear resampling lowers it).
+        view it is the camera's noise, with sub-pixel shifts resampling lowers it).
       gains: per used frame, its brightness relative to the reference (lamp flicker, automatic exposure), divided
         out before the merge.
       noise_sigma_stack: RMS over `valid` of each pixel's standard error, sqrt(sample variance / samples kept), from
@@ -146,14 +167,13 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
     shifts = [(shifts_p[k][0] - shifts_p[ref][0], shifts_p[k][1] - shifts_p[ref][1]) for k in keep]
     warps = [_translation(d) for d in shifts]
 
-    # ---- resample onto the reference grid; samples outside a frame's full bilinear support are NaN
+    # ---- resample onto the reference grid; samples outside a frame's full Lanczos support are NaN
     size = (w, h)
-    ones = np.ones((h, w), np.float32)
     nu = len(keep)
     S = np.empty((nu, h, w), np.float32)
     for i, (k, W) in enumerate(zip(keep, warps)):
         S[i] = _warp(lum[k], W, size)
-        S[i][_warp(ones, W, size) < FULL_SUPPORT] = np.nan
+        S[i][~_support(W, size)] = np.nan
 
     # ---- brightness: lamp flicker and automatic exposure scale whole frames; each frame's gain relative to the
     # reference (ratio of their means over the pixels both observe, clipped and near-black pixels excluded) is
@@ -166,7 +186,7 @@ def stack_frames(frames: list[np.ndarray], colour: list[np.ndarray] | None = Non
             m = np.isfinite(S[i]) & (S[i] > GAIN_LOW_DN) & (S[i] < GAIN_HIGH_DN) & (sref > GAIN_LOW_DN) \
                 & (sref < GAIN_HIGH_DN)
             if m.sum() > 0.1 * h * w:
-                # ratio of means, not least squares: noise and the bilinear smoothing of a resampled frame are
+                # ratio of means, not least squares: noise and the smoothing of a resampled frame are
                 # zero-mean, but they lower a least-squares slope against the noisy reference (regression dilution)
                 gains[i] = float(S[i][m].astype(np.float64).sum() / sref[m].astype(np.float64).sum())
                 S[i] /= np.float32(gains[i])

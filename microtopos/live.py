@@ -64,6 +64,7 @@ class DwellStill:
     wb_gains: tuple[float, float, float] | None
     exposure: float | None
     objective: Objective | None
+    color_mode: bool = False  # the engine runs in colour: products return a colour image too
 
 
 @dataclass
@@ -405,7 +406,7 @@ class LiveEngine:
                               colour=bgrs if frames and all(b is not None for b in bgrs) else None,
                               corrector=self._corrector_for(shape) if frames else None,
                               linearize=self.linearize, wb_gains=self.wb_gains, exposure=self.exposure,
-                              objective=self.objective)
+                              objective=self.objective, color_mode=self.color_mode)
 
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI

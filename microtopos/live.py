@@ -54,6 +54,19 @@ def _is_simulated(truth) -> bool:
 
 
 @dataclass
+class DwellStill:
+    """The engine's still frames with what is needed to rebuild them from the camera data (LiveEngine.dwell_still)."""
+    frames: list  # corrected luma, uint8, full resolution (what the live pipeline used)
+    jpegs: list | None  # the camera's JPEG per frame (bytes or recorded .jpg path), when every frame has one
+    colour: list | None  # BGR frames when the engine ran in colour without JPEG data (simulator)
+    corrector: RadiometricCorrector | None  # dark/flat of this objective, size and exposure
+    linearize: bool
+    wb_gains: tuple[float, float, float] | None
+    exposure: float | None
+    objective: Objective | None
+
+
+@dataclass
 class SweepCapture:
     frames: list  # full-resolution corrected luma, uint8
     z: np.ndarray | None  # physical z per frame when known (simulator / motor), else None
@@ -194,6 +207,9 @@ class LiveEngine:
         self._mosaic_hold: str | None = None  # see _mosaic_mismatch
         self._cov = None
         self._dwell = collections.deque(maxlen=16)
+        # per dwell frame: the camera's JPEG (bytes or recorded .jpg path) and, without one, the colour frame
+        self._dwell_jpeg = collections.deque(maxlen=16)
+        self._dwell_bgr = collections.deque(maxlen=16)
         self._avg = collections.deque(maxlen=8)
         self._bhist = collections.deque(maxlen=200)
         self._calib_req = None
@@ -344,6 +360,8 @@ class LiveEngine:
         self._n_preroll = 0
         self._cov = None
         self._dwell.clear()
+        self._dwell_jpeg.clear()
+        self._dwell_bgr.clear()
         self._avg.clear()
 
     def request_calibration(self, kind: str, n: int = 24):
@@ -373,6 +391,21 @@ class LiveEngine:
     def dwell_frames(self) -> list[np.ndarray]:
         with self._lock:
             return list(self._dwell)
+
+    def dwell_still(self) -> DwellStill:
+        """Everything a still-image product (stack, super-resolution) needs about the current still frames, taken
+        under the lock in one piece so the frames, their JPEG data and the corrections belong together."""
+        with self._lock:
+            frames = list(self._dwell)
+            shape = frames[0].shape if frames else (0, 0)
+            jpegs = list(self._dwell_jpeg)
+            bgrs = list(self._dwell_bgr)
+            return DwellStill(frames=frames,
+                              jpegs=jpegs if frames and all(j is not None for j in jpegs) else None,
+                              colour=bgrs if frames and all(b is not None for b in bgrs) else None,
+                              corrector=self._corrector_for(shape) if frames else None,
+                              linearize=self.linearize, wb_gains=self.wb_gains, exposure=self.exposure,
+                              objective=self.objective)
 
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
@@ -477,7 +510,7 @@ class LiveEngine:
                     continue
                 self._last_src, self._last_seq = src, seq
                 try:
-                    render = self._process(bgr, truth, src.fps, fps_proc, seq, ts)
+                    render = self._process(bgr, truth, src.fps, fps_proc, seq, ts, src.jpeg_for(seq))
                 except Exception as e:  # noqa: BLE001 - one bad frame must not kill the engine
                     self.errors += 1
                     self.error = f"{type(e).__name__}: {e}"
@@ -492,10 +525,10 @@ class LiveEngine:
             if time.perf_counter() - t0 > 1:
                 fps_proc, t0, n = n / (time.perf_counter() - t0), time.perf_counter(), 0
 
-    def process_frame(self, bgr, ts: float, seq: int, truth=None, render: bool = False) -> None:
+    def process_frame(self, bgr, ts: float, seq: int, truth=None, render: bool = False, jpeg=None) -> None:
         """Synchronous processing of one frame (batch mode, tests). Exceptions propagate."""
         with self._lock:
-            req = self._process(bgr, truth, 0.0, 0.0, seq, ts)
+            req = self._process(bgr, truth, 0.0, 0.0, seq, ts, jpeg)
             self._last_seq = seq
         if render and req is not None:
             self._render(*req)
@@ -553,7 +586,7 @@ class LiveEngine:
             self.mosaic.add_inset(objective, um_per_px, x_um, y_um, image)
             self.mosaic_version += 1
 
-    def _process(self, bgr, truth, fps_in, fps_proc, seq, ts):
+    def _process(self, bgr, truth, fps_in, fps_proc, seq, ts, jpeg=None):
         raw = bgr_to_luma(bgr, self.linearize)
         if raw.shape != getattr(self, "_frame_shape", raw.shape):
             # a camera mode change (or reconnect at another size): motion, sweep and mosaic belong to the old mode
@@ -727,10 +760,14 @@ class LiveEngine:
             render = self._render_request()
         if state == State.DWELL:
             self._dwell.append(full_u8)
+            self._dwell_jpeg.append(jpeg)
+            self._dwell_bgr.append(bgr if self.color_mode and jpeg is None else None)
             self._avg.append(prev)
             display = np.mean(self._avg, axis=0) if len(self._avg) > 1 else prev
         else:
             self._dwell.clear()
+            self._dwell_jpeg.clear()
+            self._dwell_bgr.clear()
             self._avg.clear()
             display = prev
         self._snap = Snapshot(

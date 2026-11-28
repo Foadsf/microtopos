@@ -231,7 +231,10 @@ def test_measure_response_then_hdr_recovers_the_scene_radiance(qapp, tmp_path):
         _use(w, cam)
         assert _wait_for(qapp, lambda: cam.latest() is not None)
         w.btn_measure_resp.click()
-        assert _wait_for(qapp, lambda: any("Camera response measured" in m for _, m in notes), 120), notes[-3:]
+        # as long as the bracket's own timeout (main_window.BRACKET_TIMEOUT_S) plus the solve: a slow runner (Windows
+        # CI) did not finish within 120 s; every message is shown when it fails
+        assert _wait_for(qapp, lambda: any("Camera response measured" in m for _, m in notes), 240), \
+            " | ".join(f"{k}: {m}" for k, m in notes) + f" | job line: {w.lbl_job.text()}"
         curve = w.store.get_response(cam.camera_name, (120, 160))
         assert curve is not None and curve.gamma_equivalent() == pytest.approx(GAMMA, abs=0.1)
         w.engine.linearize = True

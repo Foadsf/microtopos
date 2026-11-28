@@ -902,10 +902,10 @@ class _Tap(ReplaySource):
         self._log: list[tuple[int, float]] = []
         self._log_lock = threading.Lock()
 
-    def _publish(self, frame, truth=None, ts=None, step=1):
+    def _publish(self, frame, truth=None, ts=None, step=1, jpeg=None):
         with self._log_lock:
             self._log.append((int(frame[0, 0, 0]), self._now()))
-        super()._publish(frame, truth, ts, step)
+        super()._publish(frame, truth, ts, step, jpeg)
 
     def idx(self) -> list[int]:
         with self._log_lock:

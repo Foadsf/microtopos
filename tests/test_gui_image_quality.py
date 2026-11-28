@@ -118,3 +118,32 @@ def test_stack_button_merges_the_still_frames_and_lowers_the_noise(qapp, tmp_pat
         assert w.cmb_edf.currentIndex() == 1 and w.lbl_edf.text().startswith("Stack of")
     finally:
         _close(qapp, w)
+
+
+def test_export_still_writes_the_shown_stack_with_its_scale_and_provenance(qapp, tmp_path, monkeypatch):
+    import json
+
+    import tifffile
+
+    w, notes = _open(qapp, tmp_path)
+    try:
+        img = np.random.default_rng(1).uniform(0, 255, (60, 80)).astype(np.float32)
+        col = np.dstack([img * 0.9, img, np.minimum(img * 1.1, 255)]).astype(np.float32)
+        w._on_sr({"kind": "stack", "image": img, "colour": col, "um_per_px": 0.734, "scale": 1, "frames_used": 16,
+                  "frames_rejected": 0, "noise_sigma_single": 3.0, "noise_sigma_stack": 0.75, "rl_iterations": 0,
+                  "pixels_clipped_fraction": 0.01, "notes": ["test"]})
+        out = tmp_path / "still.tif"
+        monkeypatch.setattr(w, "_save_path", lambda *a: str(out))
+        w.btn_export_still.click()
+        assert notes[-1][0] == "success", notes[-1]
+        np.testing.assert_array_equal(tifffile.imread(out), img)
+        with tifffile.TiffFile(out) as t:
+            xres = t.pages[0].tags["XResolution"].value
+        assert 1e4 / (xres[0] / xres[1]) == pytest.approx(0.734, rel=1e-4)  # px per cm -> um per px
+        rgb = tifffile.imread(tmp_path / "still.rgb.tif")
+        assert rgb.dtype == np.uint16 and np.allclose(rgb[..., 1] / 257.0, img, atol=0.51)
+        assert np.allclose(rgb[..., 0] / 257.0, col[..., 2], atol=0.51)  # BGR -> RGB
+        meta = json.loads((tmp_path / "still.json").read_text())
+        assert meta["kind"] == "stack" and meta["um_per_px"] == 0.734 and meta["values"] == "camera DN"
+    finally:
+        _close(qapp, w)

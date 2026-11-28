@@ -1208,6 +1208,10 @@ class MainWindow(QMainWindow):
                                    "Align the last still frames and merge them, rejecting outliers: lower noise on "
                                    "the camera's own pixel grid. With 'Deconvolve' on (SR strip), Richardson-Lucy "
                                    "sharpening up to the optics' resolution follows.")
+        self.btn_export_still = self._btn("Export still image…", self._export_still,
+                                          "Save the shown still image (stack / super-resolution): 32-bit float TIFF "
+                                          "of the luma, 16-bit RGB TIFF of the colour when there is one, and "
+                                          "provenance JSON")
         self.btn_sr = self._btn("Super-resolve current view (experimental)", self._run_sr,
                                 "Drizzle + Richardson-Lucy on the last still frames, 512×512 centre crop. Gains only "
                                 "where the camera undersamples the optics (low magnification).")
@@ -1244,7 +1248,7 @@ class MainWindow(QMainWindow):
         f.addRow("L-filter λc", self.sp_lc)
         self.btn_recompute = self._btn("Recompute metrology", self._recompute)
         return section("6. Inspect", f, self.btn_manual, self.btn_repeat, self.btn_recompute, self.btn_stack,
-                       self.btn_sr,
+                       self.btn_sr, self.btn_export_still,
                        hint="Move X-Y to grow the mosaic. Turn the fine focus slowly through the surface to build a "
                             "height map; it is reconstructed automatically when the focus stops.")
 
@@ -2910,6 +2914,26 @@ class MainWindow(QMainWindow):
             paths = export.export_height(p, fmt, r["sl_surface"], r["um_per_px"], r["z_unit"], prov,
                                          f"MicroTopos {r['objective']} {r.get('z_status')}")
             self.notify(f"Saved {paths[0]} (+ mask and provenance)", "success")
+        except OSError as e:
+            self.notify(f"Export failed, nothing written: {e}", "danger")
+
+    def _export_still(self):
+        sr = self.sr_result
+        if sr is None:
+            self.notify("No still image yet: use 'Stack still frames' or super-resolution first.", "warning")
+            return
+        kind = sr.get("kind", "super-resolution")
+        p = self._save_path("Export still image", f"{kind}.tif", "TIFF (*.tif)")
+        if not p:
+            return
+        prov = {"kind": kind, "objective": self.obj.name, "software": f"MicroTopos {__version__}",
+                "scale_linear": sr.get("scale", 1), "frames_used": sr.get("frames_used"),
+                "frames_rejected": sr.get("frames_rejected"), "notes": sr.get("notes", []),
+                "noise_sigma_single": sr.get("noise_sigma_single"), "noise_sigma_stack": sr.get("noise_sigma_stack"),
+                "rl_iterations": sr.get("rl_iterations"), "values": sr.get("values", "camera DN")}
+        try:
+            paths = export.export_still(p, sr["image"], sr["um_per_px"], prov, sr.get("colour"))
+            self.notify(f"Saved {paths[0]} (+ {len(paths) - 1} file(s))", "success")
         except OSError as e:
             self.notify(f"Export failed, nothing written: {e}", "danger")
 

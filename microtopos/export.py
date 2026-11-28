@@ -217,6 +217,26 @@ def write_float32_tiff(filepath: Path | str, height_map: np.ndarray, pixel_um: f
     _atomic_bytes(filepath, buf.getvalue())
 
 
+def export_still(path: Path | str, image: np.ndarray, um_per_px: float, provenance: dict,
+                 colour: np.ndarray | None = None) -> list[Path]:
+    """A still-image product (stack, super-resolution, HDR): the luma as a 32-bit float TIFF in the product's own
+    units (camera DN, or relative radiance for HDR; never heights), the colour version as a 16-bit RGB TIFF
+    (DN x 257) beside it when there is one, and the provenance JSON. Returns the paths written."""
+    path = Path(path)
+    paths = [path]
+    write_float32_tiff(path, image, um_per_px)
+    if colour is not None:
+        rgb = np.clip(np.asarray(colour, np.float64)[..., ::-1] * 257.0 + 0.5, 0, 65535).astype(np.uint16)
+        buf = io.BytesIO()
+        px_per_cm = 1e4 / max(um_per_px, 1e-4)
+        tifffile.imwrite(buf, rgb, photometric="rgb", resolution=(px_per_cm, px_per_cm), resolutionunit="CENTIMETER")
+        paths.append(_atomic_bytes(path.with_suffix(".rgb.tif"), buf.getvalue()))
+    paths.append(write_sidecar(path.with_suffix(".json"), {**provenance, "um_per_px": um_per_px,
+                                                           "values": provenance.get("values", "camera DN"),
+                                                           "files": [p.name for p in paths]}))
+    return paths
+
+
 def _jsonable(v):
     """Strict-JSON value: numpy scalars become Python numbers, non-finite numbers become null, arrays are dropped."""
     if isinstance(v, (np.floating, np.integer, np.bool_)):

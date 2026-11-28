@@ -52,6 +52,8 @@ class ObjectiveCalibration:
     # dark/flat keyed by "WxH@exposure"
     darks: dict[str, np.ndarray] = field(default_factory=dict)
     flats: dict[str, np.ndarray] = field(default_factory=dict)
+    # how each flat was obtained, by the same key: FLAT_RECORDED or a description starting with FLAT_ESTIMATED
+    flat_sources: dict[str, str] = field(default_factory=dict)
 
     @property
     def lateral_status(self) -> CalStatus:
@@ -109,6 +111,15 @@ def today() -> str:
     return datetime.date.today().isoformat()
 
 
+FLAT_RECORDED = "recorded on a blank, defocused view"
+FLAT_ESTIMATED = "estimated from panning"
+
+
+def flat_source(cal: ObjectiveCalibration, key: str) -> str:
+    """How the flat stored under `key` was obtained (files written before this was recorded: recorded)."""
+    return cal.flat_sources.get(key, FLAT_RECORDED) if key in cal.flats else ""
+
+
 class CalibrationStore:
     """JSON metadata plus one NPZ of dark/flat frames, stored in a user data directory.
 
@@ -152,6 +163,51 @@ class CalibrationStore:
     def _npz(self) -> Path:
         return self.directory / "radiometric.npz"
 
+    @property
+    def _responses_json(self) -> Path:
+        return self.directory / "camera_response.json"
+
+    # ---------------------------------------------------------------- measured camera responses
+    # A camera's response belongs to the camera and its capture mode (the sensor mode changes with the size on the
+    # MikrOkular), not to an objective: stored per (camera name, "WxH") in camera_response.json.
+    @staticmethod
+    def _response_key(camera: str, shape: tuple[int, int]) -> str:
+        return f"{camera}|{shape[1]}x{shape[0]}"
+
+    def get_response(self, camera: str, shape: tuple[int, int]):
+        """The measured response (response.ResponseCurve) of this camera in this capture size, or None."""
+        if not camera:
+            return None
+        with self._lock:
+            d = self._responses().get(self._response_key(camera, shape))
+        if d is None:
+            return None
+        from .response import ResponseCurve
+
+        try:
+            return ResponseCurve.from_json(d)
+        except (KeyError, TypeError, ValueError):
+            return None  # a damaged entry is not a response
+
+    def set_response(self, camera: str, shape: tuple[int, int], curve) -> None:
+        with self._lock:
+            self._responses()[self._response_key(camera, shape)] = {**curve.to_json(), "date": today()}
+            if self.directory is not None:
+                tmp = self._responses_json.with_name(f".camera_response-{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(self._response_cache, indent=1), encoding="utf-8")
+                tmp.replace(self._responses_json)
+
+    def _responses(self) -> dict:
+        if getattr(self, "_response_cache", None) is None:
+            self._response_cache = {}
+            if self.directory is not None and self._responses_json.exists():
+                try:
+                    d = json.loads(self._responses_json.read_text(encoding="utf-8"))
+                    self._response_cache = d if isinstance(d, dict) else {}
+                except (OSError, json.JSONDecodeError):
+                    pass
+        return self._response_cache
+
     def touch(self, objective: Objective | str) -> int:
         """Mark a calibration as changed; returns its new revision."""
         c = self.get(objective)
@@ -171,7 +227,8 @@ class CalibrationStore:
                     k: getattr(c, k)
                     for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date",
                               "lateral_magnification", "lateral_frame",
-                              "z_um_per_frame", "z_source", "z_date", "z_uncertainty_pct", "revision")
+                              "z_um_per_frame", "z_source", "z_date", "z_uncertainty_pct", "revision",
+                              "flat_sources")
                 }
                 for kind, d in (("dark", c.darks), ("flat", c.flats)):
                     for key, arr in list(d.items()):
@@ -253,11 +310,15 @@ class RadiometricCorrector:
         return out.astype(np.float32, copy=False)
 
 
-def bgr_to_luma(bgr: np.ndarray, linearize: bool = False) -> np.ndarray:
+def bgr_to_luma(bgr: np.ndarray, linearize: bool = False, response=None) -> np.ndarray:
     """Rec.601 luma Y' of gamma-encoded camera data (8-bit or 16-bit), or linear-light Rec.709 luminance.
 
     16-bit (`uint16`) inputs are normalised to the 0..255 float32 scale while preserving full sub-DN precision.
+    linearize: with `response` (a measured response.ResponseCurve of this camera and mode) the camera's own curve
+    is inverted, scaled so that DN 255 in every channel gives 255; without one, gamma 2.2 is assumed.
     """
+    if linearize and response is not None:
+        return linear_luma(bgr, response)
     scale = (1.0 / 257.0) if bgr.dtype == np.uint16 else 1.0
     if bgr.ndim == 2:
         y = bgr.astype(np.float32) * scale
@@ -269,6 +330,55 @@ def bgr_to_luma(bgr: np.ndarray, linearize: bool = False) -> np.ndarray:
         f = bgr.astype(np.float32) * scale
         return (0.114 * f[..., 0] + 0.587 * f[..., 1] + 0.299 * f[..., 2]).astype(np.float32)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+
+def linear_luma(bgr: np.ndarray, response) -> np.ndarray:
+    """Linear-light Rec.709 luminance through a measured camera response, on the 0..255 scale (DN 255 in every
+    channel -> 255). A luma curve (measured on Y') is applied to the Rec.601 luma Y'."""
+    img = bgr
+    if img.dtype == np.uint16:
+        img = img.astype(np.float32) / 257.0
+    elif img.dtype != np.uint8:
+        img = img.astype(np.float32)
+    lut = response.lut
+    if response.channels == "luma":
+        y = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return (response.linearize(y) * (255.0 / float(lut[0, 255]))).astype(np.float32)
+    if img.ndim == 2:  # a grey frame: every channel holds that value
+        img = np.repeat(img[..., None], 3, axis=2)
+    w = np.array([0.0722, 0.7152, 0.2126], np.float32)
+    return (response.linearize(img) @ w * (255.0 / float(np.dot(w, lut[:, 255])))).astype(np.float32)
+
+
+WB_LOW_DN, WB_HIGH_DN = 10.0, 245.0  # pixels darker or brighter than this in any channel do not set white balance
+
+
+def white_balance_gains(bgr: np.ndarray) -> tuple[float, float, float]:
+    """Per-channel gains (B, G, R; G = 1) that make the mean of the usable pixels neutral (grey world).
+
+    Pixels near black or clipped in any channel are left out: a clipped channel no longer carries its colour. The
+    gains act on the camera's encoded values; for a power-law tone curve a neutral grey stays neutral in linear
+    light too. Raises ValueError when fewer than 1 % of the pixels are usable (a dark or saturated view)."""
+    f = bgr.astype(np.float32) * ((1.0 / 257.0) if bgr.dtype == np.uint16 else 1.0)
+    if f.ndim != 3 or f.shape[2] != 3:
+        raise ValueError("white balance needs a colour (3-channel) frame")
+    ok = np.all((f > WB_LOW_DN) & (f < WB_HIGH_DN), axis=2)
+    if ok.mean() < 0.01:
+        raise ValueError(f"only {ok.mean():.1%} of the pixels are between {WB_LOW_DN:.0f} and {WB_HIGH_DN:.0f} DN in "
+                         "every channel: adjust the exposure first")
+    m = f[ok].mean(axis=0)
+    return float(m[1] / m[0]), 1.0, float(m[1] / m[2])
+
+
+def apply_white_balance(bgr: np.ndarray, gains: tuple[float, float, float] | None) -> np.ndarray:
+    """Multiply each channel by its gain (B, G, R). uint8 stays uint8 (rounded, clipped); other types become float32.
+    None returns the input unchanged."""
+    if gains is None or bgr.ndim != 3:
+        return bgr
+    g = np.asarray(gains, np.float32)
+    if bgr.dtype == np.uint8:
+        return np.clip(bgr.astype(np.float32) * g + 0.5, 0, 255).astype(np.uint8)
+    return (bgr.astype(np.float32) * g).astype(np.float32)
 
 
 def bgr_to_rgb_u8(bgr: np.ndarray) -> np.ndarray:

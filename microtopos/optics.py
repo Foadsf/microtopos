@@ -56,6 +56,17 @@ class Objective:
         return WAVELENGTH_UM / (2.0 * self.na)
 
     @property
+    def nyquist_pixel_um(self) -> float:
+        """Largest object-space pixel that samples the incoherent cutoff frequency 2 NA / lambda at the Nyquist rate:
+        lambda / (4 NA). A camera with smaller pixels already records every spatial frequency the optics transfer."""
+        return WAVELENGTH_UM / (4.0 * self.na)
+
+    def optical_oversampling(self, um_per_px: float) -> float:
+        """nyquist_pixel_um / um_per_px: >= 1 when the camera samples finer than the optics resolve (no detail is lost
+        to the pixel grid, so multi-frame super-resolution has nothing to recover), < 1 when it undersamples."""
+        return self.nyquist_pixel_um / float(um_per_px)
+
+    @property
     def dof_um(self) -> float:
         """Classic wave + geometric depth of field: n*lambda/NA^2 + n*e/(M*NA), e = sensor pitch."""
         n = self.immersion_n

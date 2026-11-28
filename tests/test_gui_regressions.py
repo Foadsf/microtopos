@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QCheckBox, QSlider
 from microtopos.camera import FrameSource, ReplaySource
 from microtopos.gui import main_window
 from microtopos.gui.main_window import MainWindow
+from microtopos.live import DwellStill
 from microtopos.recording import RecordingWriter
 from microtopos.stage import StagePose
 
@@ -130,11 +131,13 @@ def test_opened_session_shows_its_blend_mode_and_rotation_tracking(window, qapp)
 
 # ---------------------------------------------------------------- super-resolution scale
 @pytest.mark.parametrize("k", [2, 3, 4])
-def test_super_resolution_pixel_size_follows_the_chosen_scale(window, qapp, k):
+def test_super_resolution_pixel_size_follows_the_chosen_scale(window, qapp, k, monkeypatch):
     w = window
     w.cmb_sr_scale.setCurrentText(f"{k}×")
-    frames = [np.full((360, 640), 100, np.float32)] * 8
-    w.engine.dwell_frames = lambda: frames
+    frames = [np.full((360, 640), 100, np.uint8)] * 8
+    w.engine.dwell_still = lambda: DwellStill(frames, None, None, None, False, None, None, w.obj)
+    # this test is about the output pixel size; the simulator's frames allow 2x only (test_gui_image_quality)
+    monkeypatch.setattr(main_window, "max_useful_scale", lambda osr: 4)
     captured = {}
 
     def fake_start(job, on_done, main=False):

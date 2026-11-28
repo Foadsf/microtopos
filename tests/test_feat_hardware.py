@@ -458,8 +458,9 @@ def test_grbl_without_a_report_unit_setting_is_refused():
 
 
 class _HoldingGrbl(FakeGrbl):
-    """A feed hold lands on the 2nd status report of a move; cycle start comes `resume_after` reports later
-    (None: never)."""
+    """A feed hold lands on the 1st status report of a move; cycle start comes `resume_after` reports later
+    (None: never). The fake moves in wall-clock time, so a hold on a later report let a slow runner finish the move
+    before the hold arrived (macOS CI, 2026-11-28)."""
 
     def __init__(self, *a, resume_after=None, **k):
         super().__init__(*a, **k)
@@ -470,7 +471,7 @@ class _HoldingGrbl(FakeGrbl):
     def _status_report(self):
         if self._move is not None and self._held is None:
             self._move_reports += 1
-            if self._move_reports == 2:
+            if self._move_reports == 1:
                 self.feed_hold()
         elif self._held is not None:
             self._held_reports += 1
@@ -488,12 +489,14 @@ def test_grbl_move_waits_through_a_feed_hold_until_the_move_finishes():
     assert p.z_um == pytest.approx(1000.0, abs=1.0) and not p.moving
 
 
+@pytest.mark.characterization("the driver was right; the fake's hold now lands on the first report of a 0.3 s move, "
+                              "so a slow runner cannot finish the move before the hold (failed on macOS CI)")
 def test_grbl_move_held_until_the_deadline_raises_instead_of_reporting_arrival():
     fake = _HoldingGrbl(feed_mm_min=60.0)
     drv = _grbl(fake, feedrate_mm_min=60.0)
     drv.connect()
     with pytest.raises(StageError, match="Hold"):
-        drv.move_to(z_um=100.0)  # 0.1 s of travel: the deadline is 0.3 s + 2 x 0.1 s
+        drv.move_to(z_um=300.0)  # 0.3 s of travel: the deadline is 0.3 s + 2 x 0.3 s
     assert drv.pose().moving  # a suspended move is busy, not idle
 
 
@@ -902,10 +905,10 @@ class _Tap(ReplaySource):
         self._log: list[tuple[int, float]] = []
         self._log_lock = threading.Lock()
 
-    def _publish(self, frame, truth=None, ts=None, step=1):
+    def _publish(self, frame, truth=None, ts=None, step=1, jpeg=None):
         with self._log_lock:
             self._log.append((int(frame[0, 0, 0]), self._now()))
-        super()._publish(frame, truth, ts, step)
+        super()._publish(frame, truth, ts, step, jpeg)
 
     def idx(self) -> list[int]:
         with self._log_lock:

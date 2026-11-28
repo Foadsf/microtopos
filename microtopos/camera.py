@@ -184,6 +184,8 @@ class FrameSource:
     def __init__(self):
         self._lock = threading.Lock()
         self._frame = None
+        self._jpeg = None  # (seq, the camera's JPEG bytes or the recorded .jpg path) of the newest frame, when known
+        self.camera_name = ""  # the physical camera behind the frames (live or recorded), "" when there is none
         self._seq = 0
         self._running = False
         self._thread: threading.Thread | None = None
@@ -218,9 +220,11 @@ class FrameSource:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1):
+    def _publish(self, frame, truth=None, ts: float | None = None, step: int = 1, jpeg=None):
         """Publish a frame. ts: capture time in seconds (default: now); step: source frames since the previous
-        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps.
+        published frame (> 1 when frames are known to be missing), so sequence gaps mean real gaps. jpeg: the
+        compressed frame exactly as the camera sent it (bytes), or the recorded file holding those bytes (Path), so
+        that still images can be restored from the JPEG data itself.
 
         During a motorised Z sweep (`label_with_stage`, set by `stage.capture_z_sweep`) with a StageDriver attached
         (`stage_driver`), a frame without truth of its own is labelled with the stage's pose read now
@@ -237,10 +241,16 @@ class FrameSource:
         with self._lock:
             self._seq += max(1, int(step))
             self._frame = (frame, time.perf_counter() if ts is None else ts, self._seq, truth)
+            self._jpeg = (self._seq, jpeg) if jpeg is not None else None
 
     def latest(self):
         with self._lock:
             return self._frame
+
+    def jpeg_for(self, seq: int):
+        """The JPEG bytes (or recorded .jpg path) of frame `seq` if it is still the newest one, else None."""
+        with self._lock:
+            return self._jpeg[1] if self._jpeg is not None and self._jpeg[0] == seq else None
 
     def _run(self):
         raise NotImplementedError
@@ -252,6 +262,7 @@ class CameraSource(FrameSource):
     def __init__(self, info: CameraInfo, width: int = 1920, height: int = 1080, fps: int = 25):
         super().__init__()
         self.info = info
+        self.camera_name = info.name
         self.req = (width, height, fps)
         self.controls = V4L2Controls(info.path)
         self.readback: dict = {}
@@ -452,7 +463,7 @@ class CameraSource(FrameSource):
                         self.rec_error = str(e)
                         self.stop_recording()
                         self.rec_error = str(e)
-            self._publish(frame)
+            self._publish(frame, jpeg=raw.tobytes() if raw.ndim != 3 else None)
             n += 1
             dt = time.perf_counter() - t0
             if dt > 1.0:
@@ -550,6 +561,7 @@ class ReplaySource(FrameSource):
         from .recording import load_manifest
 
         self.manifest = load_manifest(folder)
+        self.camera_name = str(self.manifest.meta.get("camera", "") or "")
         self.folder = self.manifest.folder
         self.files = self.manifest.files
         self.stamps = self.manifest.stamps
@@ -652,6 +664,11 @@ class ReplaySource(FrameSource):
                 continue
             yield img
 
+    def _jpeg_file(self, idx: int):
+        """The recorded file of frame idx when it holds the camera's JPEG bytes unchanged (mjpeg-raw .jpg), else None."""
+        f = self.files[idx]
+        return f if f.suffix.lower() == ".jpg" else None
+
     def _commit(self, idx: int, img, ts: float, step: int, *, seek: bool) -> bool:
         """Publish frame `idx` unless a newer transport request arrived while it was being decoded.
 
@@ -663,7 +680,7 @@ class ReplaySource(FrameSource):
             if self._seek_target is not None or (self.paused and not seek):
                 return False
             self.position = idx
-            self._publish(img, ts=ts, step=step)
+            self._publish(img, ts=ts, step=step, jpeg=self._jpeg_file(idx))
             self._last_pub = (self._now(), ts)
             return True
 
@@ -685,7 +702,7 @@ class ReplaySource(FrameSource):
                         self.error = f"{self.corrupt} damaged frame(s) skipped (last: {f.name})"
                         continue
                     self.position = idx
-                    self._publish(img, ts=ts, step=step)
+                    self._publish(img, ts=ts, step=step, jpeg=self._jpeg_file(idx))
                     prev_seq = rseq
                     self.fps = len(self.stamps) / max(self.stamps[-1], 1e-3)
                 if not self.loop:

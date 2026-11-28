@@ -12,6 +12,7 @@ package that is not installed). A skip must never turn a WRONG result into "not 
 
 from __future__ import annotations
 
+import gc
 import os
 import re
 import shutil
@@ -79,6 +80,30 @@ def _fresh_settings(tmp_path_factory, monkeypatch):
     """Every test starts from empty settings, so what one test's window saved (objective, exposure, layout) cannot
     change the result of another."""
     monkeypatch.setenv("MICROTOPOS_SETTINGS_DIR", str(tmp_path_factory.mktemp("settings")))
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """After each test (once pytest has dropped its fixture values), delete the MicroTopos windows it closed. A
+    closed top-level window is not deleted by Qt, and its signal connections keep it, its engine and its results
+    alive: the suite grew by 100-380 MB per GUI test, to 10.6 GB on a 15 GB laptop, where the kernel's OOM killer
+    then took other applications down (2026-11-28). Windows still shown (module-scoped fixtures) are left alone; a
+    run that never imported the GUI is not touched."""
+    yield
+    mw = sys.modules.get("microtopos.gui.main_window")
+    if mw is None:
+        return
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.topLevelWidgets():
+        if isinstance(w, mw.MainWindow) and not w.isVisible():
+            w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    gc.collect()
 
 
 def started_threads() -> list[threading.Thread]:

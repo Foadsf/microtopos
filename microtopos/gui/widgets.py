@@ -415,7 +415,7 @@ class FlowWidget(QWidget):
 
     def eventFilter(self, obj, ev):
         if ev.type() in (QEvent.Show, QEvent.Hide, QEvent.LayoutRequest):
-            QTimer.singleShot(0, self._reflow)
+            QTimer.singleShot(0, self, self._reflow)  # with self as context: dropped if the widget is deleted first
         return False
 
     def _arrange(self, width: int, apply: bool, reserved: bool = False) -> int:

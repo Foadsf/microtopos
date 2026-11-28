@@ -15,8 +15,18 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .calibration import CalibrationStore, RadiometricCorrector, bgr_to_luma, bgr_to_rgb_u8, radiometric_key
-from .camera import FrameSource
+from .calibration import (
+    FLAT_ESTIMATED,
+    FLAT_RECORDED,
+    CalibrationStore,
+    RadiometricCorrector,
+    apply_white_balance,
+    bgr_to_luma,
+    bgr_to_rgb_u8,
+    radiometric_key,
+)
+from .camera import FrameSource, SimulatorSource
+from .flatfield import FlatEstimator
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
 from .mosaic import (
@@ -47,6 +57,21 @@ def _is_simulated(truth) -> bool:
 
 
 @dataclass
+class DwellStill:
+    """The engine's still frames with what is needed to rebuild them from the camera data (LiveEngine.dwell_still)."""
+    frames: list  # corrected luma, uint8, full resolution (what the live pipeline used)
+    jpegs: list | None  # the camera's JPEG per frame (bytes or recorded .jpg path), when every frame has one
+    colour: list | None  # BGR frames when the engine ran in colour without JPEG data (simulator)
+    corrector: RadiometricCorrector | None  # dark/flat of this objective, size and exposure
+    linearize: bool
+    wb_gains: tuple[float, float, float] | None
+    exposure: float | None
+    objective: Objective | None
+    color_mode: bool = False  # the engine runs in colour: products return a colour image too
+    response: object | None = None  # measured camera response used when linearize is on (None: gamma 2.2)
+
+
+@dataclass
 class SweepCapture:
     frames: list  # full-resolution corrected luma, uint8
     z: np.ndarray | None  # physical z per frame when known (simulator / motor), else None
@@ -65,7 +90,9 @@ class SweepCapture:
     preview_shape: tuple[int, int] = (0, 0)  # live preview size at capture (for pinning into the mosaic)
     optics: Objective | None = None  # the objective's optics at capture (the list may be edited before reconstruction)
     manual: bool = False  # True when captured under manual Z override (Space)
-    color_frames: list | None = None  # raw colour (BGR) frames matching `frames`, when the engine runs in colour mode
+    color_frames: list | None = None  # colour (BGR) frames matching `frames`, when the engine runs in colour mode
+    white_balance: tuple[float, float, float] | None = None  # (B, G, R) gains already applied to color_frames
+    linearization: str = ""  # LiveEngine.linearization at capture: what the luma values are
 
     @property
     def usable(self) -> bool:
@@ -148,6 +175,9 @@ class LiveEngine:
         self.exposure: float | None = None
         self.linearize = False
         self.color_mode = False  # when True, colour frames flow through SweepBuffer.color_frames and the RGB mosaic
+        # (B, G, R) gains applied to every colour output (preview, sweep colour frames, colour mosaic), never to luma:
+        # the measurement, darks and flats stay independent of the white balance
+        self.wb_gains: tuple[float, float, float] | None = None
         # when an objective change restarts the mosaic, keep the previous objective's mosaic as an overview inset
         self.keep_overview_insets = True
         self.on_sweep = None  # callback(SweepCapture)
@@ -183,9 +213,15 @@ class LiveEngine:
         self._mosaic_hold: str | None = None  # see _mosaic_mismatch
         self._cov = None
         self._dwell = collections.deque(maxlen=16)
+        # per dwell frame: the camera's JPEG (bytes or recorded .jpg path) and, without one, the colour frame
+        self._dwell_jpeg = collections.deque(maxlen=16)
+        self._dwell_bgr = collections.deque(maxlen=16)
         self._avg = collections.deque(maxlen=8)
         self._bhist = collections.deque(maxlen=200)
         self._calib_req = None
+        self._flat_req = None  # an estimated-flat request (start_flat_estimate)
+        self.flat_status: str | None = None  # the last estimate's outcome, for the GUI
+        self.last_flat_estimate: dict | None = None  # FlatEstimator.result() of the last completed estimate
         self.calib_error: str | None = None
         self.events: collections.deque = collections.deque(maxlen=500)  # (seq, text) for diagnostics
         self._last_state = None
@@ -333,13 +369,13 @@ class LiveEngine:
         self._n_preroll = 0
         self._cov = None
         self._dwell.clear()
+        self._dwell_jpeg.clear()
+        self._dwell_bgr.clear()
         self._avg.clear()
 
     def request_calibration(self, kind: str, n: int = 24):
         """Average the next n raw frames into a dark or flat frame. The source, objective, exposure and gamma
         setting are frozen now; if any changes before the average is complete, the request is cancelled."""
-        from .camera import SimulatorSource
-
         with self._lock:
             if isinstance(self.source, SimulatorSource) and self.store.directory is not None:
                 self.calib_error = f"{kind.capitalize()} frame cancelled: the simulator never writes to disk."
@@ -355,6 +391,69 @@ class LiveEngine:
             self.calib_error = f"{self._calib_req['kind'].capitalize()} frame cancelled: {why}."
             self._calib_req = None
 
+    def start_flat_estimate(self) -> None:
+        """Estimate this objective's flat field from the frames of the next pan (flatfield.FlatEstimator) and store
+        it like a recorded flat, under the current capture size and exposure. The source, objective, exposure and
+        gamma setting are frozen now; a change cancels the estimate."""
+        with self._lock:
+            self.flat_status = None
+            self._flat_req = {"gen": self.source_generation, "objective": self.objective.name,
+                              "exposure": self.exposure, "linearize": self.linearize, "est": None}
+
+    def cancel_flat_estimate(self, why: str = "cancelled") -> None:
+        with self._lock:
+            if self._flat_req is not None:
+                self._flat_req = None
+                self.flat_status = f"Flat estimate {why}."
+
+    def flat_estimate_progress(self) -> dict | None:
+        """The running estimate's FlatEstimator.progress(), or None when none is running."""
+        r = self._flat_req
+        est = None if r is None else r["est"]
+        return None if est is None else est.progress()
+
+    def _feed_flat_estimate(self, raw: np.ndarray, feat) -> None:
+        """Offer every frame to the estimator with the motion detector's shift (its own gate picks the frames). On
+        the simulator this gave the same gain error as shifts measured by register_pair (0.5-1.3 % either way), so
+        no second registration runs on the engine thread. A scene cut (no measurable motion) restarts the chain."""
+        r = self._flat_req
+        if (r["gen"] != self.source_generation or r["objective"] != self.objective.name
+                or r["exposure"] != self.exposure or r["linearize"] != self.linearize
+                or (r["est"] is not None and r["est"].shape != raw.shape)):
+            self._flat_req = None
+            self.flat_status = "Flat estimate cancelled: the camera mode, exposure or objective changed."
+            return
+        h, w = raw.shape
+        if r["est"] is None:
+            cal = self.store.get(self.objective)
+            dark = cal.darks.get(radiometric_key(raw.shape, self.exposure))
+            r["est"] = FlatEstimator(raw.shape, downsample=max(2, w // 320), dark=dark)
+            r["est"].add(raw, None)
+            return
+        if feat.cut:
+            r["est"].break_chain()
+            r["est"].add(raw, None)
+            return
+        r["est"].add(raw, (feat.dx_field * w, feat.dy_field * h))
+        if r["est"].progress()["ready"]:
+            res = r["est"].result()
+            rkey = radiometric_key(raw.shape, self.exposure)
+            self._flat_req = None
+            note = (f"{FLAT_ESTIMATED}: {res['pairs']} frame pairs, {res['travel']:.1f} fields of travel, residual "
+                    f"{res['residual_rms']:.3f}, brightness change {res['brightness_rms']:.3f} (log units)")
+            if self.store.directory is not None and isinstance(self.source, SimulatorSource):
+                self.flat_status = "Flat estimated, not stored: the simulator never writes to disk. " + note
+                self.last_flat_estimate = res
+                return
+            cal = self.store.get(self.objective)
+            with self.store._lock:
+                cal.flats[rkey] = res["flat"]
+                cal.flat_sources[rkey] = note
+                self.store.touch(self.objective)
+                self.store.save()
+            self.last_flat_estimate = res
+            self.flat_status = f"Flat stored for {rkey}. " + note
+
     def calibration_progress(self):
         c = self._calib_req
         return None if c is None else (c["kind"], len(c["frames"]), c["n"])
@@ -362,6 +461,22 @@ class LiveEngine:
     def dwell_frames(self) -> list[np.ndarray]:
         with self._lock:
             return list(self._dwell)
+
+    def dwell_still(self) -> DwellStill:
+        """Everything a still-image product (stack, super-resolution) needs about the current still frames, taken
+        under the lock in one piece so the frames, their JPEG data and the corrections belong together."""
+        with self._lock:
+            frames = list(self._dwell)
+            shape = frames[0].shape if frames else (0, 0)
+            jpegs = list(self._dwell_jpeg)
+            bgrs = list(self._dwell_bgr)
+            return DwellStill(frames=frames,
+                              jpegs=jpegs if frames and all(j is not None for j in jpegs) else None,
+                              colour=bgrs if frames and all(b is not None for b in bgrs) else None,
+                              corrector=self._corrector_for(shape) if frames else None,
+                              linearize=self.linearize, wb_gains=self.wb_gains, exposure=self.exposure,
+                              objective=self.objective, color_mode=self.color_mode,
+                              response=self.response_for(shape) if frames and self.linearize else None)
 
     def snapshot(self) -> Snapshot:
         return self._snap  # replaced atomically by the engine thread; never blocks the GUI
@@ -380,7 +495,9 @@ class LiveEngine:
                            self.source_generation,
                            self.mosaic_generation if mosaic_generation is None else mosaic_generation,
                            self.exposure, self.linearize, prev_shape,
-                           self.objective, manual=manual, color_frames=c_frames)
+                           self.objective, manual=manual, color_frames=c_frames,
+                           white_balance=self.wb_gains if c_frames is not None else None,
+                           linearization=self.linearization(shape))
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -465,7 +582,7 @@ class LiveEngine:
                     continue
                 self._last_src, self._last_seq = src, seq
                 try:
-                    render = self._process(bgr, truth, src.fps, fps_proc, seq, ts)
+                    render = self._process(bgr, truth, src.fps, fps_proc, seq, ts, src.jpeg_for(seq))
                 except Exception as e:  # noqa: BLE001 - one bad frame must not kill the engine
                     self.errors += 1
                     self.error = f"{type(e).__name__}: {e}"
@@ -480,10 +597,10 @@ class LiveEngine:
             if time.perf_counter() - t0 > 1:
                 fps_proc, t0, n = n / (time.perf_counter() - t0), time.perf_counter(), 0
 
-    def process_frame(self, bgr, ts: float, seq: int, truth=None, render: bool = False) -> None:
+    def process_frame(self, bgr, ts: float, seq: int, truth=None, render: bool = False, jpeg=None) -> None:
         """Synchronous processing of one frame (batch mode, tests). Exceptions propagate."""
         with self._lock:
-            req = self._process(bgr, truth, 0.0, 0.0, seq, ts)
+            req = self._process(bgr, truth, 0.0, 0.0, seq, ts, jpeg)
             self._last_seq = seq
         if render and req is not None:
             self._render(*req)
@@ -541,8 +658,28 @@ class LiveEngine:
             self.mosaic.add_inset(objective, um_per_px, x_um, y_um, image)
             self.mosaic_version += 1
 
-    def _process(self, bgr, truth, fps_in, fps_proc, seq, ts):
-        raw = bgr_to_luma(bgr, self.linearize)
+    def response_for(self, shape: tuple[int, int]):
+        """The measured response of the source's camera in this capture size (CalibrationStore.get_response)."""
+        cam = getattr(self.source, "camera_name", "")
+        key = (cam, tuple(shape[:2]))
+        if getattr(self, "_response_key", None) != key:
+            self._response_key, self._response = key, self.store.get_response(cam, shape[:2])
+        return self._response
+
+    def forget_response(self) -> None:
+        """A response was measured or replaced: look it up again on the next frame."""
+        self._response_key = None
+
+    def linearization(self, shape: tuple[int, int]) -> str:
+        """What 'linearize' means for frames of this size now: the provenance word for results."""
+        if not self.linearize:
+            return "off (gamma-encoded luma Y')"
+        c = self.response_for(shape)
+        return (f"measured camera response (gamma-equivalent {c.gamma_equivalent():.2f})" if c is not None
+                else "gamma 2.2 assumed (no measured response for this camera and size)")
+
+    def _process(self, bgr, truth, fps_in, fps_proc, seq, ts, jpeg=None):
+        raw = bgr_to_luma(bgr, self.linearize, self.response_for(bgr.shape) if self.linearize else None)
         if raw.shape != getattr(self, "_frame_shape", raw.shape):
             # a camera mode change (or reconnect at another size): motion, sweep and mosaic belong to the old mode
             self.log(f"frame size changed {self._frame_shape[1]}x{self._frame_shape[0]} -> "
@@ -567,9 +704,11 @@ class LiveEngine:
                 if len(req["frames"]) >= req["n"]:
                     cal = self.store.get(req["objective"])
                     avg = np.mean(np.stack(req["frames"]).astype(np.float64), 0).astype(np.float32)
+                    rkey = radiometric_key(raw.shape, req["exposure"])
                     with self.store._lock:
-                        (cal.darks if req["kind"] == "dark" else cal.flats)[radiometric_key(raw.shape,
-                                                                                            req["exposure"])] = avg
+                        (cal.darks if req["kind"] == "dark" else cal.flats)[rkey] = avg
+                        if req["kind"] == "flat":
+                            cal.flat_sources[rkey] = FLAT_RECORDED
                         self.store.touch(req["objective"])
                         self.store.save()
                     self._corrector_key = None
@@ -584,8 +723,9 @@ class LiveEngine:
         ph = round(h * pw / w)
         prev = cv2.resize(corr, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else corr
         prev_rgb = None
+        cbgr = apply_white_balance(bgr, self.wb_gains) if self.color_mode else None
         if self.color_mode:
-            rgb_full = bgr_to_rgb_u8(bgr)
+            rgb_full = bgr_to_rgb_u8(cbgr)
             prev_rgb = cv2.resize(rgb_full, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else rgb_full
 
         while self._pending_patches:
@@ -614,6 +754,8 @@ class LiveEngine:
             self.sm.sweep_complete = _completeness(self._buf.tiles + [tiles]) >= MIN_COMPLETENESS
         self._seq_hist.append(seq)
         state, feat, events = self.sm.update(prev)
+        if self._flat_req is not None:
+            self._feed_flat_estimate(raw, feat)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
             self._last_state = state
@@ -673,7 +815,7 @@ class LiveEngine:
                 self.log(f"view changed (magnification ratio {ev.detail.get('magnification_ratio')})", seq)
             if ev.kind == "objective_change" and self.on_objective_hint:
                 self.on_objective_hint(ev.detail.get("magnification_ratio"))
-        self._preroll.append((full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None))
+        self._preroll.append((full_u8, z_true, tiles, seq, ts, cbgr))
         if self._held is not None and (seq > self._held[3] or state == State.PAN):
             held, self._held = self._held, None
             if state != State.PAN:  # the stage moved: the held part no longer belongs to this view
@@ -686,7 +828,7 @@ class LiveEngine:
                     self._buf.thin()  # sequence numbers are thinned too, so z spacing stays in source frames
                     self._n_preroll = (self._n_preroll + 1) // 2
                     self._stride *= 2
-                self._buf.append(full_u8, z_true, tiles, seq, ts, bgr if self.color_mode else None)
+                self._buf.append(full_u8, z_true, tiles, seq, ts, cbgr)
             self._zcount += 1
             self._cov = fm if self._cov is None else np.maximum(self._cov, fm)
             in_focus = fm >= 0.7 * self._cov
@@ -714,10 +856,14 @@ class LiveEngine:
             render = self._render_request()
         if state == State.DWELL:
             self._dwell.append(full_u8)
+            self._dwell_jpeg.append(jpeg)
+            self._dwell_bgr.append(bgr if self.color_mode and jpeg is None else None)
             self._avg.append(prev)
             display = np.mean(self._avg, axis=0) if len(self._avg) > 1 else prev
         else:
             self._dwell.clear()
+            self._dwell_jpeg.clear()
+            self._dwell_bgr.clear()
             self._avg.clear()
             display = prev
         self._snap = Snapshot(

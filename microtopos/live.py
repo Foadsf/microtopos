@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import rollingshutter
 from .calibration import (
     FLAT_ESTIMATED,
     FLAT_RECORDED,
@@ -23,9 +24,12 @@ from .calibration import (
     apply_white_balance,
     bgr_to_luma,
     bgr_to_rgb_u8,
+    distortion_for,
+    lateral_ca_for,
     radiometric_key,
 )
 from .camera import FrameSource, SimulatorSource
+from .distortion import DistortionEstimator, RadialModel
 from .flatfield import FlatEstimator
 from .focus import focus_map
 from .kinematics import Override, State, StateMachine
@@ -40,6 +44,7 @@ from .mosaic import (
     underlay_insets,
 )
 from .optics import Objective
+from .registration import register_pair
 from .stage import StageReadout
 
 PREVIEW_W = 640
@@ -56,6 +61,13 @@ def _is_simulated(truth) -> bool:
     return truth is not None and not isinstance(truth, StageReadout)
 
 
+# rolling-shutter measurement (preview pixels per frame): a frame slower than READOUT_STILL_PX is a still reference,
+# one at READOUT_FAST_PX or more pairs with it while within READOUT_REACH of the shorter side; READOUT_PAIRS pairs
+READOUT_STILL_PX = 0.3
+READOUT_FAST_PX = 3.0
+READOUT_REACH = 0.3
+READOUT_PAIRS = 24
+
 @dataclass
 class DwellStill:
     """The engine's still frames with what is needed to rebuild them from the camera data (LiveEngine.dwell_still)."""
@@ -68,6 +80,7 @@ class DwellStill:
     exposure: float | None
     objective: Objective | None
     color_mode: bool = False  # the engine runs in colour: products return a colour image too
+    lateral_ca: object | None = None  # chromatic.LateralCA of the objective at this size, applied to colour only
     response: object | None = None  # measured camera response used when linearize is on (None: gamma 2.2)
 
 
@@ -93,6 +106,7 @@ class SweepCapture:
     color_frames: list | None = None  # colour (BGR) frames matching `frames`, when the engine runs in colour mode
     white_balance: tuple[float, float, float] | None = None  # (B, G, R) gains already applied to color_frames
     linearization: str = ""  # LiveEngine.linearization at capture: what the luma values are
+    lateral_ca: object | None = None  # chromatic.LateralCA to apply to color_frames (not yet applied)
 
     @property
     def usable(self) -> bool:
@@ -216,12 +230,15 @@ class LiveEngine:
         # per dwell frame: the camera's JPEG (bytes or recorded .jpg path) and, without one, the colour frame
         self._dwell_jpeg = collections.deque(maxlen=16)
         self._dwell_bgr = collections.deque(maxlen=16)
-        self._avg = collections.deque(maxlen=8)
+        self._avg = collections.deque(maxlen=8)  # (preview, position) of the last still frames, for the display
+        self._avg_pos = np.zeros(2)
         self._bhist = collections.deque(maxlen=200)
         self._calib_req = None
         self._flat_req = None  # an estimated-flat request (start_flat_estimate)
         self.flat_status: str | None = None  # the last estimate's outcome, for the GUI
         self.last_flat_estimate: dict | None = None  # FlatEstimator.result() of the last completed estimate
+        self._ro_req = None  # rolling-shutter measurement in progress (start_readout_estimate)
+        self._dist_req = None  # lens-distortion estimate in progress (start_distortion_estimate)
         self.calib_error: str | None = None
         self.events: collections.deque = collections.deque(maxlen=500)  # (seq, text) for diagnostics
         self._last_state = None
@@ -372,6 +389,7 @@ class LiveEngine:
         self._dwell_jpeg.clear()
         self._dwell_bgr.clear()
         self._avg.clear()
+        self._avg_pos = np.zeros(2)
 
     def request_calibration(self, kind: str, n: int = 24):
         """Average the next n raw frames into a dark or flat frame. The source, objective, exposure and gamma
@@ -454,6 +472,145 @@ class LiveEngine:
             self.last_flat_estimate = res
             self.flat_status = f"Flat stored for {rkey}. " + note
 
+    # ---------------------------------------------------------------- rolling shutter
+    def readout_for(self, shape: tuple[int, int]) -> float | None:
+        """The camera's measured rolling-shutter readout fraction for this capture size, or None."""
+        cam = getattr(self.source, "camera_name", "")
+        key = (cam, tuple(shape[:2]))
+        if getattr(self, "_ro_key", None) != key:
+            v = self.store.get_camera_value("readout", cam, shape[:2])
+            self._ro_key, self._ro = key, (float(v["rho"]) if v and v.get("rho") is not None else None)
+        return self._ro
+
+    def forget_readout(self) -> None:
+        self._ro_key = None
+
+    def start_readout_estimate(self) -> None:
+        """Collect (still frame, fast-pan frame) pairs for rollingshutter.estimate_readout: the user holds still,
+        then pans fast, stops, pans fast in another direction... Pairs are taken while the view is within
+        READOUT_REACH of the still frame (preview pixels, the velocities' unit)."""
+        with self._lock:
+            self._ro_req = {"gen": self.source_generation, "ref": None, "disp": np.zeros(2), "pairs": [],
+                            "shape": None}
+
+    def cancel_readout_estimate(self) -> None:
+        with self._lock:
+            self._ro_req = None
+
+    def readout_progress(self) -> tuple[int, int] | None:
+        r = self._ro_req
+        return None if r is None else (len(r["pairs"]), READOUT_PAIRS)
+
+    def take_readout_pairs(self) -> tuple[list, tuple[int, int]] | None:
+        """The collected pairs and the frame shape they belong to, once READOUT_PAIRS are in (ends the request)."""
+        with self._lock:
+            r = self._ro_req
+            if r is None or len(r["pairs"]) < READOUT_PAIRS:
+                return None
+            self._ro_req = None
+            return r["pairs"], r["shape"]
+
+    def _feed_readout(self, prev: np.ndarray, feat) -> None:
+        r = self._ro_req
+        if r["gen"] != self.source_generation or len(r["pairs"]) >= READOUT_PAIRS:
+            return
+        ph, pw = prev.shape
+        v = self._velocity(feat, pw, ph)
+        speed = float(np.hypot(*v))
+        if speed < READOUT_STILL_PX and not feat.cut:  # at rest: this frame is the new still reference
+            r["ref"], r["disp"], r["shape"] = (prev.copy(), (float(v[0]), float(v[1]))), np.zeros(2), self._frame_shape
+            return
+        if r["ref"] is None:
+            return
+        r["disp"] = r["disp"] + v
+        if feat.cut or float(np.hypot(*r["disp"])) > READOUT_REACH * min(pw, ph):
+            r["ref"] = None  # too far from the still frame (or lost): wait for the next stop
+            return
+        if speed >= READOUT_FAST_PX:
+            r["pairs"].append((r["ref"][0], r["ref"][1], prev.copy(), (float(v[0]), float(v[1]))))
+
+    def _velocity(self, feat, pw: int, ph: int) -> np.ndarray:
+        """Motion per SOURCE frame (preview px): the engine processes the newest frame and may skip some, so the shift
+        since the previous processed frame is divided by the sequence gap. The rolling shutter's skew follows the
+        speed per frame interval (a skipped frame halved the measured readout in a GUI run)."""
+        step = self._seq_hist[-1] - self._seq_hist[-2] if len(self._seq_hist) >= 2 else 1
+        return np.array([feat.dx_field * pw, feat.dy_field * ph]) / max(1, step)
+
+    def _mosaic_frame(self, prev, prev_rgb, feat, shape):
+        """The preview (and its colour) as the mosaic should stitch it: the rolling shutter's skew of this frame's
+        motion removed first, then the objective's radial distortion (the camera applied them in the reverse order:
+        the optics distort, then the rows are read out one after another)."""
+        ph, pw = prev.shape
+        rho = self.readout_for(shape)
+        if rho is not None:
+            v = self._velocity(feat, pw, ph)
+            if np.hypot(*v) >= READOUT_STILL_PX:
+                prev = rollingshutter.deskew(prev, v, rho)
+                prev_rgb = None if prev_rgb is None else rollingshutter.deskew(prev_rgb, v, rho)
+        maps = self._undistort_maps(shape, (ph, pw))
+        if maps is not None:
+            prev = cv2.remap(prev, maps[0], maps[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            if prev_rgb is not None:
+                prev_rgb = cv2.remap(prev_rgb, maps[0], maps[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        return prev, prev_rgb
+
+    def _undistort_maps(self, shape, preview_shape):
+        """remap maps of the objective's estimated distortion at preview size (the model is normalised to the
+        half-diagonal, so it carries over to a scaled copy of the same field), cached; None without a model."""
+        cal = self.store.get(self.objective)
+        d = cal.distortion.get(f"{shape[1]}x{shape[0]}")
+        key = (self.objective.name, tuple(shape[:2]), tuple(preview_shape), None if d is None else (d["k1"], d["k2"]))
+        if getattr(self, "_undist_key", None) != key:
+            model = distortion_for(cal, shape[:2])
+            self._undist_key = key
+            self._undist_maps = None if model is None else \
+                RadialModel(tuple(preview_shape), model.k1, model.k2).undistort_maps()
+        return self._undist_maps
+
+    # ---------------------------------------------------------------- lens distortion
+    def start_distortion_estimate(self) -> None:
+        """Estimate the objective's radial distortion from the next pan (distortion.DistortionEstimator). The GUI
+        takes the estimator once it is ready (take_distortion_estimator) and solves it off the engine thread."""
+        with self._lock:
+            self._dist_req = {"gen": self.source_generation, "objective": self.objective.name, "est": None,
+                              "shape": None}
+
+    def cancel_distortion_estimate(self) -> None:
+        with self._lock:
+            self._dist_req = None
+
+    def distortion_progress(self) -> dict | None:
+        r = self._dist_req
+        return None if r is None or r["est"] is None else r["est"].progress()
+
+    def take_distortion_estimator(self):
+        """(estimator, frame shape, objective name) once ready (ends the request), else None."""
+        with self._lock:
+            r = self._dist_req
+            if r is None or r["est"] is None or not r["est"].progress()["ready"]:
+                return None
+            self._dist_req = None
+            return r["est"], r["shape"], r["objective"]
+
+    def _feed_distortion(self, raw: np.ndarray, feat) -> None:
+        r = self._dist_req
+        if r["gen"] != self.source_generation or r["objective"] != self.objective.name \
+                or (r["shape"] is not None and r["shape"] != raw.shape):
+            self._dist_req = None
+            return
+        h, w = raw.shape
+        if r["est"] is None:
+            cal = self.store.get(self.objective)
+            dark = cal.darks.get(radiometric_key(raw.shape, self.exposure))
+            r["est"] = DistortionEstimator(raw.shape, dark=float(np.mean(dark)) if dark is not None else 0.0)
+            r["shape"] = raw.shape
+            r["est"].add(raw, None)
+            return
+        if r["est"].progress()["ready"]:
+            return
+        if not feat.cut:  # a cut has no measurable motion: the frame is not offered
+            r["est"].add(raw, (feat.dx_field * w, feat.dy_field * h))
+
     def calibration_progress(self):
         c = self._calib_req
         return None if c is None else (c["kind"], len(c["frames"]), c["n"])
@@ -461,6 +618,21 @@ class LiveEngine:
     def dwell_frames(self) -> list[np.ndarray]:
         with self._lock:
             return list(self._dwell)
+
+    def _aligned_average(self) -> np.ndarray:
+        """Mean of the averaging buffer, each frame translated (bilinear) onto the newest frame's position; pixels a
+        shifted frame does not cover use only the frames that cover them."""
+        newest = self._avg[-1][1]
+        h, w = self._avg[-1][0].shape
+        acc = np.zeros((h, w), np.float64)
+        cnt = np.zeros((h, w), np.float64)
+        ones = np.ones((h, w), np.float32)
+        for img, pos in self._avg:
+            d = newest - pos
+            M = np.float32([[1, 0, d[0]], [0, 1, d[1]]])
+            acc += cv2.warpAffine(img.astype(np.float32), M, (w, h), flags=cv2.INTER_LINEAR)
+            cnt += cv2.warpAffine(ones, M, (w, h), flags=cv2.INTER_LINEAR)
+        return (acc / np.maximum(cnt, 1e-6)).astype(np.float32)
 
     def dwell_still(self) -> DwellStill:
         """Everything a still-image product (stack, super-resolution) needs about the current still frames, taken
@@ -476,6 +648,7 @@ class LiveEngine:
                               corrector=self._corrector_for(shape) if frames else None,
                               linearize=self.linearize, wb_gains=self.wb_gains, exposure=self.exposure,
                               objective=self.objective, color_mode=self.color_mode,
+                              lateral_ca=self.lateral_ca_for(shape) if frames and self.color_mode else None,
                               response=self.response_for(shape) if frames and self.linearize else None)
 
     def snapshot(self) -> Snapshot:
@@ -497,7 +670,8 @@ class LiveEngine:
                            self.exposure, self.linearize, prev_shape,
                            self.objective, manual=manual, color_frames=c_frames,
                            white_balance=self.wb_gains if c_frames is not None else None,
-                           linearization=self.linearization(shape))
+                           linearization=self.linearization(shape),
+                           lateral_ca=self.lateral_ca_for(shape) if c_frames is not None else None)
         if self.sync_callbacks:
             self.on_sweep(cap)
         else:
@@ -670,6 +844,14 @@ class LiveEngine:
         """A response was measured or replaced: look it up again on the next frame."""
         self._response_key = None
 
+    def lateral_ca_for(self, shape: tuple[int, int]):
+        """The objective's measured lateral chromatic aberration for this capture size (colour outputs only)."""
+        cal = self.store.get(self.objective)
+        key = (self.objective.name, tuple(shape[:2]), cal.lateral_ca.get(f"{shape[1]}x{shape[0]}"))
+        if getattr(self, "_ca_key", None) != key:
+            self._ca_key, self._ca = key, lateral_ca_for(cal, shape[:2])
+        return self._ca
+
     def linearization(self, shape: tuple[int, int]) -> str:
         """What 'linearize' means for frames of this size now: the provenance word for results."""
         if not self.linearize:
@@ -725,8 +907,11 @@ class LiveEngine:
         prev_rgb = None
         cbgr = apply_white_balance(bgr, self.wb_gains) if self.color_mode else None
         if self.color_mode:
-            rgb_full = bgr_to_rgb_u8(cbgr)
-            prev_rgb = cv2.resize(rgb_full, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else rgb_full
+            small = cv2.resize(cbgr, (pw, ph), interpolation=cv2.INTER_AREA) if pw < w else cbgr
+            ca = self.lateral_ca_for((h, w))
+            if ca is not None:  # the colour preview (and so the colour mosaic) without fringes, at preview size
+                small = ca.rescaled(pw, ph).apply(small) if pw < w else ca.apply(small)
+            prev_rgb = bgr_to_rgb_u8(small)
 
         while self._pending_patches:
             op = self._pending_patches.pop(0)
@@ -756,6 +941,10 @@ class LiveEngine:
         state, feat, events = self.sm.update(prev)
         if self._flat_req is not None:
             self._feed_flat_estimate(raw, feat)
+        if self._ro_req is not None:
+            self._feed_readout(prev, feat)
+        if self._dist_req is not None:
+            self._feed_distortion(raw, feat)
         if state != self._last_state:
             self.log(f"state {state.value}  (shift {feat.shift_px:.1f}px, corr {feat.response:.2f}, z {feat.z_score:+.1f})", seq)
             self._last_state = state
@@ -837,7 +1026,8 @@ class LiveEngine:
             # the mosaic's grid is this objective's preview at this mode: record (or refresh) what it is
             self.mosaic.objective, self.mosaic.um_per_px = self.objective.name, um
             was_lost = self.mosaic.lost
-            added, _ = self.mosaic.track(prev, rgb=prev_rgb)
+            m_prev, m_rgb = self._mosaic_frame(prev, prev_rgb, feat, (h, w))
+            added, _ = self.mosaic.track(m_prev, rgb=m_rgb)
             ev = self.mosaic.last_event  # set by this track() call: a join also changes `areas`, the other way
             if ev == "new_area":
                 self.log(f"mosaic: started separate area ({self.mosaic.areas} now; position of this view unknown)", seq)
@@ -858,13 +1048,26 @@ class LiveEngine:
             self._dwell.append(full_u8)
             self._dwell_jpeg.append(jpeg)
             self._dwell_bgr.append(bgr if self.color_mode and jpeg is None else None)
-            self._avg.append(prev)
-            display = np.mean(self._avg, axis=0) if len(self._avg) > 1 else prev
+            # display only: the averaged frames are aligned on the newest one, so hand tremor does not blur the average.
+            # Each frame is registered to the previous one (ECC at ~320 px: 0.007 px median error on a trembling test
+            # texture, against 0.22 px for the motion detector's phase correlation, which blurred the average);
+            # a failed registration restarts the average. this(x) = previous(x - d): a frame seen at position p moves
+            # by p_now - p onto the newest.
+            if self._avg:
+                r = register_pair(self._avg[-1][0], prev, max(1, prev.shape[1] // 320))
+                if r.ok:
+                    self._avg_pos = self._avg_pos + r.warp[:, 2].astype(np.float64)
+                else:
+                    self._avg.clear()
+                    self._avg_pos = np.zeros(2)
+            self._avg.append((prev, self._avg_pos.copy()))
+            display = self._aligned_average() if len(self._avg) > 1 else prev
         else:
             self._dwell.clear()
             self._dwell_jpeg.clear()
             self._dwell_bgr.clear()
             self._avg.clear()
+            self._avg_pos = np.zeros(2)
             display = prev
         self._snap = Snapshot(
             preview=display.astype(np.float32), preview_rgb=prev_rgb, state=state, fps_in=fps_in, fps_proc=fps_proc,

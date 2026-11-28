@@ -43,9 +43,24 @@ uv run microtopos-bench        # CPU vs OpenCL focus-measure timing with a parit
 
 Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Python 3.11 the Qt bindings abort with a reference-count error, so 3.11 is not supported.
 
-## Status (v0.11, November 2026)
+## Status (v0.12, November 2026)
 
-v0.11.0 adds image-quality tools for still views, chosen after measuring what limits the MikrOkular. The camera is an OmniVision OV2710 1920×1080 sensor behind an Alcor USB 2.0 bridge (firmware CA1.529). The bridge sends MJPEG only: JPEG quality about 43, 4:2:2 chroma, 40–190 kB per frame. It offers no uncompressed, 16-bit or full-colour mode, and no white-balance or gain control. Every objective is already sampled at least 1.9× as finely as its optics resolve (λ/4NA against 0.734 µm/px at 4×). So compression, noise and light limit the image, not the pixel count. The additions:
+v0.12.0 adds measurements of the optics themselves, each stored per objective (or per camera) and capture size, and used from then on:
+
+- **Measure sharpness from an edge** (Inspect). It runs the slanted-edge method on a straight edge (a razor blade, a stage-micrometer line) and reports MTF50 in cycles per pixel and lp/mm, against the objective's diffraction limit. Stacking and super-resolution then deconvolve with the measured blur instead of the textbook one. The previous edge fit read the blur 18 % high at σ 0.8 px. On synthetic edges the new method matches the closed form within 0.6 % in MTF50 and 0.8 % in σ.
+- **Measure colour fringes** (Objective) estimates how far red and blue are scaled and shifted against green (lateral chromatic aberration). It removes the fringes from the colour preview, the colour mosaic, colour sweeps and still images, never from the luma that heights come from. Synthetic fringes were recovered within 0.5 × 10⁻⁴ in scale and cut 6–9×.
+- **Measure lens distortion** (Lateral scale) estimates barrel or pincushion distortion from a pan, with no target, and removes it from the frames the mosaic stitches. Simulated distortion of 3 px at the corner was recovered within 5 %. Vignetting otherwise mimics barrel distortion, so the tracking runs on a high-passed image.
+- **Measure rolling shutter** (Camera). The OV2710 reads its rows one after another, so a fast pan skews the frame. Pairs of a still frame and a fast-pan frame give the readout time, and the mosaic stitches straightened frames. On a synthetic camera the readout fraction was recovered within 0.1 %, with the engine skipping frames (velocity per source frame, not per processed frame).
+- **Stacking** resamples with Lanczos-4: 11–14 % closer to the truth on simulated camera frames with hand tremor.
+- **The live view's still average** is aligned on the newest frame, so hand tremor no longer blurs it (display only).
+
+Tried and not adopted, because they did not improve the result:
+- Restoring the JPEG data of focus-sweep frames recovered 0–1 % of the 4–16 % height accuracy that compression costs.
+- Reconstructing several frames jointly within every frame's quantisation intervals added nothing reliable over a Lanczos stack at realistic sizes, for 5–9 s.
+
+These measurements ran on simulated or synthetic inputs only, with one exception: on three still 1920×1080 frames from the MikrOkular, with the objective then in use, the colour-fringe estimate took 13 s. It found no measurable lateral chromatic aberration: 0.05–0.12 px at the corner, within its uncertainty, so nothing would be stored. Edge sharpness, distortion and rolling shutter need a razor-blade edge or panning by hand on the real microscope.
+
+v0.11.0 added image-quality tools for still views, chosen after measuring what limits the MikrOkular. The camera is an OmniVision OV2710 1920×1080 sensor behind an Alcor USB 2.0 bridge (firmware CA1.529). The bridge sends MJPEG only: JPEG quality about 43, 4:2:2 chroma, 40–190 kB per frame. It offers no uncompressed, 16-bit or full-colour mode, and no white-balance or gain control. Every objective is already sampled at least 1.9× as finely as its optics resolve (λ/4NA against 0.734 µm/px at 4×). So compression, noise and light limit the image, not the pixel count. The additions:
 
 - **Stack still frames** aligns the still frames, rejects outliers and divides out frame-to-frame brightness changes (±1.2 % on the MikrOkular), on the camera's own grid. On 16 real still frames the noise fell from 0.91 to 0.23 DN. Optional Richardson–Lucy sharpening up to the optical cutoff.
 - **JPEG restoration.** When the camera's JPEG data is available (live, or a raw recording), still images are rebuilt from it. The decoder's exact luma is deblocked within the quantisation limits the camera's own tables allow, and the half-resolution colour is upsampled along luma edges. Against simulator ground truth encoded like the MikrOkular, frames are 16 % closer to the truth and a 12-frame stack 7–10 % closer than a plain decode. On real frames, blockiness fell from 0.86 to 0.21.
@@ -204,10 +219,14 @@ session files (schema 2), also for a mosaic alone.
 | All-in-focus | streaming Laplacian-pyramid fusion with softmax weights at full capture resolution |
 | Metrology | polynomial form removal (0 = mean only … 3 = cubic), ISO 16610-61 Gaussian S/L filters (σ = 0.1874 λ; refused below 4 px per cut-off), Sa Sq Sp Sv Sz Ssk Sku, triangulated Sdr (µm only), Sk Spk Svk Smr1 Smr2 (40 % secant, tie-safe crossings), Sal Str Std (lag-support-aware autocorrelation), radial PSD slope and fractal dimension (only for 2 < β < 4); height groups withheld when < 30 % of pixels are reliable, with the reason per group. GLCM texture and h-minima watershed regions (Feret, Heyn intercept, ASTM E112-style G) come from the all-in-focus image and are labelled image-based |
 | Still images | one preparation for every still product (`stills.prepare`): frames rebuilt from the camera's JPEG data when present (exact decoder luma, quantisation-constrained deblocking, luma-guided 4:2:2/4:2:0 chroma), dark/flat and linearisation as live, white balance on colour only |
-| Stacking | ECC translation registration, per-frame brightness gain (ratio of means), per-pixel sigma-clipped mean about the median (MAD scale, floored at the unresampled noise), per-pixel frame count instead of border fill, temporal noise estimate, optional Richardson–Lucy |
+| Stacking | ECC translation registration, Lanczos-4 resampling, per-frame brightness gain (ratio of means), per-pixel sigma-clipped mean about the median (MAD scale, floored at the unresampled noise), per-pixel frame count instead of border fill, temporal noise estimate, optional Richardson–Lucy |
 | Super-resolution | drizzle (true drop-overlap weights) onto a 2× (linear) grid of still frames with ECC sub-pixel shifts, Richardson–Lucy with a discrepancy stop; frames without a valid registration are dropped, too little sub-pixel motion is refused, and so is a grid finer than the Nyquist pixel λ/4NA; experimental |
 | Camera response / HDR | Debevec–Malik (OpenCV solver, samples spread over the scene's brightness), monotonic and still-scene checks, refusal when a longer exposure does not brighten the frames; hat-weighted two-pass bracket merge to relative radiance |
 | Estimated flat | pairwise log ratios of panned frames at their measured shift, a degree-4 polynomial of log shading, readiness from pairs, travel and direction spread |
+| Edge sharpness | slanted-edge method: sub-pixel line fit to the edge, 4× oversampled edge spread function, windowed line spread function, MTF with the bin boxes divided out, MTF50; Gaussian blur fitted with the projected pixel aperture removed |
+| Colour fringes | R and B against G: isotropic scale about the centre plus shift, from translation ECC of 32 px tiles on band-passed planes after a Lanczos pre-warp, least squares, significance from the tile scatter |
+| Lens distortion | Brown radial k1, k2 about the centre (r = 1 at the half-diagonal), from forward–backward-checked feature tracks of panned frames on a high-passed log image, robust least squares with a free translation per pair |
+| Rolling shutter | affine ECC between a still and a fast-pan frame; the shear and stretch terms are linear in the readout fraction; deskew about the middle row with velocities per source frame |
 | Compute | CPU reference; optional OpenCL DoG focus measure (`ZSettings.backend`), CPU fallback, parity-checked; jobs check their memory need against available RAM before starting |
 
 ## Verified (`microtopos-selftest`, seeds 11/22/33: 130 checks passed, 0 failed, 30 informational)
@@ -284,6 +303,11 @@ Real specimen (`--real recordings/…`, texture and noise from the Bresser camer
   On real frames only internal figures exist (noise, blockiness); there is no optical target. The estimated flat,
   the camera response and HDR ran on simulated cameras only. A 1080p stack of 16 frames with JPEG restoration
   takes about 20 s on a laptop CPU.
+- JPEG compression costs height accuracy that no restoration recovers. Simulated sweeps encoded like the MikrOkular
+  (quality 43, 4:2:2) had 4–16 % higher height RMSE than uncompressed ones (4×, 10× and 40×, three seeds each).
+  Every usable focus measure lost 8–20 % at 10×, and DoG band-pass stayed the most accurate. Restoring each frame from
+  its JPEG data recovered 0–1 %, so sweeps are not restored: the lost detail was removed by the camera's quantisation.
+  A camera that sends uncompressed frames is the remedy.
 - Focus breathing (magnification change with focus) is not corrected by default: two estimators were biased by
   defocus more than the breathing itself (about 1 px at the image edges in far-defocused frames). The opt-in
   correction on the 3D tab is experimental and caps the excursion it applies at 1.5 % over a sweep.

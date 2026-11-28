@@ -148,3 +148,21 @@ def test_with_gamma_linearisation_on_the_rebuilt_frames_are_linear_luminance():
     # measured: 1.66 DN mean change from deblocking and guided chroma (amplified ~1.2-1.6x by the 2.2 curve in the
     # highlights), against 68 DN between linear luminance and Y'
     assert err_lin < 2.5 and err_y > 20 * err_lin
+
+
+@pytest.mark.parametrize("seed,measured", [(3, 3.41), (11, 3.36)])
+def test_a_trembling_view_is_stacked_with_lanczos_resampling(seed, measured):
+    """Camera-like frames (q 43, 4:2:2) of a view trembling by 1 px: the stack of the rebuilt frames against the
+    truth on frame 0's grid. Measured with Lanczos-4: 3.41 / 3.36 DN; bilinear resampling gave 3.87 / 3.91 DN."""
+    sim = SpecimenSimulator(seed, OBJ, 256, 192)
+    _, hz = sim.truth_patch()
+    sim.focus_z_um = float(np.median(hz))
+    sim.tremor_px = 1.0
+    renders = [sim.render(tremor=False, breathing=False)[0]]
+    renders += [sim.render(tremor=True, breathing=False)[0] for _ in range(15)]
+    truth = np.mean([bgr_to_luma(sim.render(tremor=False, breathing=False)[0]) for _ in range(64)], axis=0)
+    params = [cv2.IMWRITE_JPEG_QUALITY, 43, cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_422]
+    jpegs = [cv2.imencode(".jpg", r, params)[1].tobytes() for r in renders]
+    p = stills.prepare(DwellStill([np.zeros((1, 1), np.uint8)] * 16, jpegs, None, None, False, None, None, OBJ))
+    err = _rms(stack_frames(p["frames"], reference="first")["image"], truth)
+    assert err == pytest.approx(measured, rel=0.04) and err < 3.6

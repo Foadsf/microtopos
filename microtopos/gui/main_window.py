@@ -47,7 +47,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, export, metrology, response, stills, units, zstack
+from .. import (
+    __version__,
+    chromatic,
+    distortion,
+    edgemtf,
+    export,
+    metrology,
+    response,
+    rollingshutter,
+    stills,
+    units,
+    zstack,
+)
 from .. import objectives as objlib
 from ..calibration import (
     FLAT_ESTIMATED,
@@ -55,6 +67,7 @@ from ..calibration import (
     CalStatus,
     bgr_to_rgb_u8,
     flat_source,
+    psf_for,
     radiometric_key,
     today,
     white_balance_gains,
@@ -165,6 +178,16 @@ RESPONSE_EXPOSURES, RESPONSE_FRAMES = 8, 3
 HDR_EXPOSURES, HDR_FRAMES = 5, 2
 
 
+def _distortion_job(est, progress=None, cancelled=None):
+    """The estimator's least-squares solve; a string when there is no measurable distortion."""
+    if progress:
+        progress(0.1, "Solving for the radial distortion...")
+    try:
+        return est.result()
+    except distortion.NoMeasurableDistortion as e:
+        return f"no measurable distortion (at most {e.bound_px:.2f} px at the field corner)"
+
+
 def _disconnect_job(job: Job) -> None:
     """Drop every connection of a finished job's signals (MainWindow._job_finished)."""
     for sig in (job.progress, job.done, job.failed, job.finished):
@@ -172,6 +195,12 @@ def _disconnect_job(job: Job) -> None:
             sig.disconnect()
         except RuntimeError:  # PySide raises when the signal has no connection left; nothing to drop then
             pass
+
+
+def _readout_job(pairs, progress=None, cancelled=None):
+    if progress:
+        progress(0.1, "Measuring the skew of the fast-pan frames...")
+    return rollingshutter.estimate_readout(pairs)
 
 
 def _response_job(frames, times, progress=None, cancelled=None):
@@ -197,18 +226,47 @@ def _hdr_job(frames, times, curve, progress=None, cancelled=None):
                       "display: tone-mapped"]}
 
 
-def _stack_job(still, psf, progress=None, cancelled=None):
+def _stack_job(still, psf, psf_source="nominal", progress=None, cancelled=None):
     if progress:
         progress(0.1, "Aligning and merging the still frames...")
     prep = stills.prepare(still)
     r = stack_frames(prep["frames"], colour=prep["colour"], deconvolve_psf_sigma=psf)
-    return {**r, "notes": prep["notes"]}
+    notes = prep["notes"] + ([f"Richardson-Lucy PSF sigma {psf:.2f} px ({psf_source})"] if psf else [])
+    return {**r, "notes": notes, "psf_sigma_px": psf, "psf_source": psf_source if psf else None}
+
+
+def _reconstruct_job(*args, color_frames=None, lateral_ca=None, **kw):
+    """zstack.reconstruct, with the objective's lateral chromatic aberration removed from the colour frames first
+    (colour only; the luma the heights come from is not resampled)."""
+    if color_frames is not None and lateral_ca is not None:
+        color_frames = [lateral_ca.apply(c) for c in color_frames]
+    return zstack.reconstruct(*args, color_frames=color_frames, **kw)
+
+
+CA_FRAMES = 3
+
+
+def _ca_job(frames, progress=None, cancelled=None):
+    if progress:
+        progress(0.1, "Registering red and blue on green...")
+    return chromatic.estimate_lateral_ca(frames, require_significant=False)
+
+
+def _edge_job(still, progress=None, cancelled=None):
+    """The slanted-edge measurement on the mean of the still frames (less noise), over the middle 60 % of the view."""
+    if progress:
+        progress(0.1, "Measuring the edge...")
+    frames = stills.prepare(still, restore_jpeg=False)["frames"]
+    img = np.mean(frames, axis=0)
+    h, w = img.shape
+    return edgemtf.measure_edge(img, roi=(int(0.2 * w), int(0.2 * h), int(0.6 * w), int(0.6 * h)), saturation=250.0)
 
 
 SR_CROP = 512  # super-resolution works on the centre crop: its output has scale^2 times the pixels
 
 
-def _sr_job(still, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None):
+def _sr_job(still, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, deconvolve=True, oversampling=None,
+            psf_source="nominal"):
     if progress:
         progress(0.1, "Registering dwell frames and drizzling...")
     frames = stills.prepare(still)
@@ -216,7 +274,8 @@ def _sr_job(still, psf, progress=None, cancelled=None, scale=2, pixfrac=0.7, dec
     c = min(SR_CROP, h, w)
     y0, x0 = (h - c) // 2, (w - c) // 2
     crops = [f[y0:y0 + c, x0:x0 + c] for f in frames["frames"]]
-    r = dwell_superres(crops, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve, oversampling=oversampling)
+    r = dwell_superres(crops, psf, scale=scale, pixfrac=pixfrac, deconvolve=deconvolve, oversampling=oversampling,
+                       psf_source=psf_source)
     return {**r, "input": crops[0], "notes": frames["notes"]}
 
 
@@ -1009,8 +1068,13 @@ class MainWindow(QMainWindow):
         stg.addWidget(stage_hint, 0, 0, 1, 2)
         self.stage_details.setVisible(False)
         self.stage_box = section("Stage", drv_row, self.stage_details)
+        self.btn_measure_ro = self._btn("Measure rolling shutter", self._toggle_readout,
+                                        "The sensor reads its rows one after another, so a fast pan skews the image. "
+                                        "Click, hold still, then pan fast and stop, several times, in X and in Y: "
+                                        "the readout time is measured and fast-pan frames are straightened before "
+                                        "stitching the mosaic.")
         return section("1. Camera", self.cmb_source, self.cmb_res, self.chk_autoexp, exp, rot, self.chk_linear,
-                       self.btn_measure_resp, self.lbl_readback, self.demo_box, self.stage_box,
+                       self.btn_measure_resp, self.btn_measure_ro, self.lbl_readback, self.demo_box, self.stage_box,
                        hint="Pick the microscope camera. Exposure is locked and in-camera sharpening is switched off, "
                             "because both would corrupt focus measurements.")
 
@@ -1161,7 +1225,12 @@ class MainWindow(QMainWindow):
         self.lbl_optics = QLabel()
         self.lbl_optics.setObjectName("mono")
         self.lbl_optics.setWordWrap(True)
-        box = section(self._objective_title(), self.cmb_obj, self.btn_edit_obj, self.lbl_optics,
+        self.btn_measure_ca = self._btn("Measure colour fringes", self._measure_ca,
+                                        "Colour camera, a textured view in focus, held still: measures how far the red "
+                                        "and blue images are scaled and shifted against green (lateral chromatic "
+                                        "aberration of this objective) and removes those fringes from colour images "
+                                        "from now on. The measurement (luma) is not changed.")
+        box = section(self._objective_title(), self.cmb_obj, self.btn_edit_obj, self.btn_measure_ca, self.lbl_optics,
                       hint="Sets the numerical aperture used for focus windows, depth of field and the roughness "
                            "S-filter. Change it whenever you turn the nosepiece. Enter the objectives on your "
                            "nosepiece as engraved (Edit objectives…); the lateral scale still needs a stage "
@@ -1201,6 +1270,42 @@ class MainWindow(QMainWindow):
         msg = f"Objective list saved ({len(new_set.objectives)} objectives, {new_set.source})."
         self.notify(" ".join([msg] + notes), "warning" if any("cleared" in n for n in notes) else "success")
 
+    def _measure_ca(self):
+        if self.source is None or self.source.latest() is None or self.source.latest()[0].ndim != 3:
+            self.notify("Measuring colour fringes needs a colour frame from the camera.", "warning")
+            return
+        self._ca_frames, self._ca_seq = [], -1
+        self.btn_measure_ca.setEnabled(False)
+        QTimer.singleShot(0, self, self._ca_collect)
+
+    def _ca_collect(self):
+        """Three distinct frames, 150 ms apart, then the estimate in a background job."""
+        item = self.source.latest() if self.source is not None else None
+        if item is not None and item[2] != self._ca_seq:
+            self._ca_seq = item[2]
+            self._ca_frames.append(np.ascontiguousarray(item[0]))
+        if len(self._ca_frames) < CA_FRAMES:
+            QTimer.singleShot(150, self, self._ca_collect)
+            return
+        frames, obj = self._ca_frames, self.obj
+        job = Job(_ca_job, frames, label="Colour fringes")
+
+        def done(ca):
+            self.btn_measure_ca.setEnabled(True)
+            if not ca.significant:
+                self.notify(f"No measurable colour fringes for {obj.name}: at most {ca.fringe_px_at_corner():.2f} px at "
+                            "the corner, within the measurement's uncertainty. Nothing stored.", "success")
+                return
+            cal = self.store.get(obj)
+            cal.lateral_ca[f"{ca.size[0]}x{ca.size[1]}"] = ca.to_json()
+            self.store.touch(obj)
+            self.store.save()
+            self.notify(f"Colour fringes of {obj.name} measured: red scale {ca.scale_r:.5f}, blue {ca.scale_b:.5f}, up "
+                        f"to {ca.fringe_px_at_corner():.2f} px at the corner. Removed from colour images from now on.",
+                        "success")
+        job.failed.connect(lambda _m: self.btn_measure_ca.setEnabled(True))
+        self._start_job(job, done)
+
     def _page_radiometric(self):
         self.btn_dark = self._btn("Record dark  (lamp off)", lambda: self._record("dark"),
                                   "Average 24 frames with the light blocked: removes sensor offset")
@@ -1227,7 +1332,12 @@ class MainWindow(QMainWindow):
         self.lbl_lat = QLabel()
         self.lbl_lat.setObjectName("muted")
         self.lbl_lat.setWordWrap(True)
-        return section("4. Lateral scale", self.btn_lat, self.btn_lat_clear, self.lbl_lat,
+        self.btn_measure_dist = self._btn("Measure lens distortion", self._toggle_distortion,
+                                          "Click, then pan the specimen in two directions over 2-3 field widths: the "
+                                          "objective's radial (barrel / pincushion) distortion is estimated from how "
+                                          "the same features move across the field, and removed from the frames the "
+                                          "mosaic stitches. No target needed.")
+        return section("4. Lateral scale", self.btn_lat, self.btn_lat_clear, self.btn_measure_dist, self.lbl_lat,
                        hint="Put a stage micrometer under the objective. Drag the blue line's ends onto two graduation "
                             "marks on the Live view, then enter their distance in µm.")
 
@@ -1269,6 +1379,11 @@ class MainWindow(QMainWindow):
                                    "Align the last still frames and merge them, rejecting outliers: lower noise on "
                                    "the camera's own pixel grid. With 'Deconvolve' on (SR strip), Richardson-Lucy "
                                    "sharpening up to the optics' resolution follows.")
+        self.btn_edge = self._btn("Measure sharpness from an edge", self._measure_edge,
+                                  "Put one straight, sharp edge (razor blade, a stage-micrometer line) across the "
+                                  "middle of the view, a few degrees off vertical or horizontal, in focus and still: "
+                                  "the slanted-edge method gives this objective's MTF50 and blur, stored and used to "
+                                  "sharpen stacks and super-resolution")
         self.btn_hdr = self._btn("HDR still (exposure bracket)", self._run_hdr,
                                  "Keep the view still: frames at several exposures are merged into one relative "
                                  "radiance image through the measured camera response (needs one for this camera "
@@ -1313,7 +1428,7 @@ class MainWindow(QMainWindow):
         f.addRow("L-filter λc", self.sp_lc)
         self.btn_recompute = self._btn("Recompute metrology", self._recompute)
         return section("6. Inspect", f, self.btn_manual, self.btn_repeat, self.btn_recompute, self.btn_stack,
-                       self.btn_sr, self.btn_hdr, self.btn_export_still,
+                       self.btn_sr, self.btn_edge, self.btn_hdr, self.btn_export_still,
                        hint="Move X-Y to grow the mosaic. Turn the fine focus slowly through the surface to build a "
                             "height map; it is reconstructed automatically when the focus stops.")
 
@@ -1702,6 +1817,78 @@ class MainWindow(QMainWindow):
         lo, hi = self.source.exposure_range()
         return sorted({round(float(v)) for v in np.geomspace(lo, hi, n)})
 
+    def _toggle_distortion(self):
+        if self.engine._dist_req is not None:
+            self.engine.cancel_distortion_estimate()
+            self.btn_measure_dist.setText("Measure lens distortion")
+            return
+        self.engine.start_distortion_estimate()
+        self.btn_measure_dist.setText("Cancel distortion measurement")
+        self.notify("Pan the specimen slowly in two directions over 2-3 field widths.")
+
+    def _poll_distortion(self):
+        p = self.engine.distortion_progress()
+        if p is not None and not p["ready"]:
+            self.lbl_job.setText(f"Lens distortion: {p['pairs']} frame pairs, {p['matches']} matches"
+                                 + (f" · still needs: {'; '.join(p['missing'])}" if p["missing"] else ""))
+        got = self.engine.take_distortion_estimator()
+        if got is None:
+            return
+        est, shape, obj_name = got
+        self.btn_measure_dist.setText("Measure lens distortion")
+        job = Job(_distortion_job, est, label="Lens distortion")
+
+        def done(r):
+            if isinstance(r, str):
+                self.notify(f"{obj_name}: {r}. Nothing stored.", "success")
+                return
+            cal = self.store.get(obj_name)
+            cal.distortion[f"{shape[1]}x{shape[0]}"] = {**r.model.to_json(), "corner_u_px": r.corner_u_px,
+                                                        "date": today()}
+            self.store.touch(obj_name)
+            if self.sim_source is None:
+                self.store.save()
+            kind = "barrel" if r.corner_displacement_px < 0 else "pincushion"
+            self.notify(f"{obj_name}: {kind} distortion, {abs(r.corner_displacement_px):.2f} ± {r.corner_u_px:.2f} px "
+                        f"at the field corner (match residual {r.residual_before_px:.2f} → {r.residual_after_px:.2f} px)."
+                        " Removed from the frames the mosaic stitches from now on.", "success")
+        self._start_job(job, done)
+
+    def _toggle_readout(self):
+        if self.engine.readout_progress() is not None:
+            self.engine.cancel_readout_estimate()
+            self.btn_measure_ro.setText("Measure rolling shutter")
+            return
+        self.engine.start_readout_estimate()
+        self.btn_measure_ro.setText("Cancel rolling-shutter measurement")
+        self.notify("Hold still, then pan fast and stop, several times, in X and in Y.")
+
+    def _poll_readout(self):
+        """From _tick: progress, and the estimate once the engine has collected its pairs."""
+        p = self.engine.readout_progress()
+        if p is not None:
+            self.lbl_job.setText(f"Rolling shutter: {p[0]}/{p[1]} pairs of a still and a fast-pan frame")
+        got = self.engine.take_readout_pairs()
+        if got is None:
+            return
+        pairs, shape = got
+        cam = getattr(self.source, "camera_name", "")
+        self.btn_measure_ro.setText("Measure rolling shutter")
+        job = Job(_readout_job, pairs, label="Rolling shutter")
+
+        def done(r):
+            if not r["observable"]:
+                self.notify(f"Rolling shutter not measured: {r['reason']}.", "warning")
+                return
+            if cam and shape:
+                self.store.set_camera_value("readout", cam, shape, {"rho": r["rho"], "rho_se": r["rho_se"],
+                                                                     "pairs": r["n_pairs"]})
+                self.engine.forget_readout()
+            self.notify(f"Rolling shutter: rows read out over {r['rho']:.2f} ± {r['rho_se']:.2f} of the frame interval "
+                        f"({r['n_pairs']} pairs). Fast-pan frames are straightened before stitching from now on."
+                        + ("" if cam else " (Not stored: this source is not a camera.)"), "success")
+        self._start_job(job, done)
+
     def _measure_response(self):
         if not self._bracket_camera_ok("Measuring the camera response"):
             return
@@ -1720,6 +1907,33 @@ class MainWindow(QMainWindow):
             self.engine.forget_response()
             self.notify(f"Camera response measured for {cam} at {shape[1]}x{shape[0]}: gamma-equivalent "
                         f"{curve.gamma_equivalent():.2f}, consistency {curve.inconsistency_dn:.1f} DN.", "success")
+        self._start_job(job, done)
+
+    def _measure_edge(self):
+        still = self.engine.dwell_still()
+        if len(still.frames) < 4:
+            self.notify("Hold the edge still for a moment (needs 4 still frames).", "warning")
+            return
+        h, w = still.frames[0].shape
+        cal = self.store.get(self.obj)
+        um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w, self.obj, h)
+        lat = "nominal" if self.sim_source is not None or cal.lateral_status_for(w, h) != CalStatus.CALIBRATED \
+            else "measured"
+        obj = self.obj
+        job = Job(_edge_job, still, label="Edge sharpness")
+
+        def done(m):
+            theory = obj.psf_sigma_px(um)
+            m["date"] = today()
+            cal.measured_psf[f"{w}x{h}"] = {k: m[k] for k in ("psf_sigma_px", "mtf50_cyc_per_px", "angle_deg", "snr",
+                                                                "date")}
+            self.store.touch(obj)
+            if self.sim_source is None:
+                self.store.save()
+            lp = edgemtf.mtf50_to_lp_per_mm(m["mtf50_cyc_per_px"], um)
+            self.notify(f"{obj.name}: MTF50 {m['mtf50_cyc_per_px']:.3f} cycles/pixel ({lp:.0f} lp/mm at {um:.3g} µm/px, "
+                        f"{lat} scale), blur σ {m['psf_sigma_px']:.2f} px against {theory:.2f} px for a perfect "
+                        f"NA {obj.na:.2f} objective. Used for sharpening from now on.", "success")
         self._start_job(job, done)
 
     def _run_hdr(self):
@@ -2243,6 +2457,8 @@ class MainWindow(QMainWindow):
                                 + ("\nMosaic tracking lost: move back over a mapped area" if s.mosaic_lost else ""))
         if s.brenner_hist:
             self.spark_curve.setData(np.asarray(s.brenner_hist, float))
+        self._poll_readout()
+        self._poll_distortion()
         fp = self.engine.flat_estimate_progress()
         if fp is not None:
             self.lbl_job.setText(f"Estimating flat: {fp['pairs']} pairs, {fp['travel']:.1f} fields of travel"
@@ -2512,11 +2728,14 @@ class MainWindow(QMainWindow):
                 "preview_shape": list(cap.preview_shape), "exposure": cap.exposure, "linearize": cap.linearize,
                 "white_balance": list(cap.white_balance) if cap.white_balance else None,
                 "linearization": cap.linearization,
+                "lateral_ca_corner_px": (round(cap.lateral_ca.fringe_px_at_corner(), 3)
+                                         if cap.lateral_ca is not None else None),
                 "z_source": zsrc or (cal.z_source if zstat == CalStatus.ESTIMATED.value else ""),
                 "sweep_seq_range": [cap.seqs[0], cap.seqs[-1]] if cap.seqs else None}
         sample_pos = np.asarray(cap.seqs, float) if cap.seqs and z is None else None
-        job = Job(zstack.reconstruct, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
-                  sample_pos=sample_pos, z_sign=sign if z is None else None, color_frames=cap.color_frames)
+        job = Job(_reconstruct_job, cap.frames, z, obj, um, unit, zcal, st, label="Reconstruction",
+                  sample_pos=sample_pos, z_sign=sign if z is None else None, color_frames=cap.color_frames,
+                  lateral_ca=cap.lateral_ca)
         if self._start_job(job, lambda r: self._on_result({**r, **meta}), main=True):
             self.notify(f"Focus sweep captured ({len(cap.frames)} frames). Reconstructing…")
 
@@ -2703,8 +2922,8 @@ class MainWindow(QMainWindow):
         h, w = still.frames[0].shape
         cal = self.store.get(self.obj)
         um = self.obj.nominal_um_per_px(w) if self.sim_source is not None else cal.um_per_px(w, self.obj, h)
-        psf = self.obj.psf_sigma_px(um) if self.sr_deconvolve else None
-        job = Job(_stack_job, still, psf, label="Stack")
+        psf, psf_src = psf_for(cal, self.obj, (h, w), um)
+        job = Job(_stack_job, still, psf if self.sr_deconvolve else None, psf_src, label="Stack")
         self.sr_job = job
         self._start_job(job, lambda r: self._on_sr({**r, "kind": "stack", "um_per_px": um, "scale": 1,
                                                      "input": still.frames[0]}))
@@ -2729,9 +2948,9 @@ class MainWindow(QMainWindow):
                         f"camera samples {self.obj.name} {osr:.1f}× finer than the optics resolve (λ/4NA = "
                         f"{self.obj.nyquist_pixel_um:.3g} µm). Use 'Stack still frames' instead.", "warning")
             return
-        job = Job(_sr_job, still, self.obj.psf_sigma_px(um),
-                  scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve, oversampling=osr,
-                  label="Super-resolution")
+        psf, psf_src = psf_for(cal, self.obj, (h, w), um)
+        job = Job(_sr_job, still, psf, scale=self.sr_scale, pixfrac=self.sr_pixfrac, deconvolve=self.sr_deconvolve,
+                  oversampling=osr, psf_source=psf_src, label="Super-resolution")
         self.sr_job = job
         scale = int(self.sr_scale)  # the drizzle output grid is `scale` times finer in each direction
         self._start_job(job, lambda r: self._on_sr({**r, "um_per_px": um / scale, "scale": scale}))

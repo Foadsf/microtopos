@@ -54,6 +54,12 @@ class ObjectiveCalibration:
     flats: dict[str, np.ndarray] = field(default_factory=dict)
     # how each flat was obtained, by the same key: FLAT_RECORDED or a description starting with FLAT_ESTIMATED
     flat_sources: dict[str, str] = field(default_factory=dict)
+    # measured lateral chromatic aberration (chromatic.LateralCA JSON) keyed by capture size "WxH"
+    lateral_ca: dict[str, str] = field(default_factory=dict)
+    # PSF measured on a straight edge (edgemtf.measure_edge) keyed by capture size "WxH": psf_sigma_px, mtf50, date
+    measured_psf: dict[str, dict] = field(default_factory=dict)
+    # estimated radial distortion (distortion.RadialModel JSON + corner_u_px, date) keyed by capture size "WxH"
+    distortion: dict[str, dict] = field(default_factory=dict)
 
     @property
     def lateral_status(self) -> CalStatus:
@@ -109,6 +115,43 @@ def radiometric_key(shape: tuple[int, int], exposure: float | None) -> str:
 
 def today() -> str:
     return datetime.date.today().isoformat()
+
+
+def lateral_ca_for(cal: ObjectiveCalibration, shape: tuple[int, int]):
+    """This objective's measured lateral chromatic aberration (chromatic.LateralCA) for frames of `shape`, or None.
+    Only the capture size it was measured at: another mode may be a crop, which shows a different field."""
+    text = cal.lateral_ca.get(f"{shape[1]}x{shape[0]}")
+    if not text:
+        return None
+    from .chromatic import LateralCA
+
+    try:
+        return LateralCA.from_json(text)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def psf_for(cal: ObjectiveCalibration, objective: Objective, shape: tuple[int, int], um_per_px: float) -> tuple[float, str]:
+    """The PSF sigma (px) to deconvolve frames of `shape` with, and where it comes from: the one measured on an
+    edge for this objective and capture size, else the objective's theoretical one (optics.psf_sigma_px)."""
+    m = cal.measured_psf.get(f"{shape[1]}x{shape[0]}")
+    if m and m.get("psf_sigma_px", 0) > 0:
+        return float(m["psf_sigma_px"]), (f"measured on an edge ({m.get('date', '?')}, MTF50 "
+                                          f"{m.get('mtf50_cyc_per_px', float('nan')):.3f} cyc/px)")
+    return objective.psf_sigma_px(um_per_px), "nominal"
+
+
+def distortion_for(cal: ObjectiveCalibration, shape: tuple[int, int]):
+    """This objective's estimated radial distortion (distortion.RadialModel) for frames of `shape`, or None."""
+    d = cal.distortion.get(f"{shape[1]}x{shape[0]}")
+    if not d:
+        return None
+    from .distortion import RadialModel
+
+    try:
+        return RadialModel.from_json(d)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 FLAT_RECORDED = "recorded on a blank, defocused view"
@@ -189,13 +232,29 @@ class CalibrationStore:
         except (KeyError, TypeError, ValueError):
             return None  # a damaged entry is not a response
 
+    def get_camera_value(self, kind: str, camera: str, shape: tuple[int, int]) -> dict | None:
+        """A per-camera, per-capture-size measurement other than the response (e.g. kind "readout": the rolling
+        shutter's readout fraction), stored next to the responses under its own kind."""
+        if not camera:
+            return None
+        with self._lock:
+            return self._responses().get(f"{kind}:{self._response_key(camera, shape)}")
+
+    def set_camera_value(self, kind: str, camera: str, shape: tuple[int, int], value: dict) -> None:
+        with self._lock:
+            self._responses()[f"{kind}:{self._response_key(camera, shape)}"] = {**value, "date": today()}
+            self._save_responses()
+
+    def _save_responses(self) -> None:
+        if self.directory is not None:
+            tmp = self._responses_json.with_name(f".camera_response-{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self._response_cache, indent=1), encoding="utf-8")
+            tmp.replace(self._responses_json)
+
     def set_response(self, camera: str, shape: tuple[int, int], curve) -> None:
         with self._lock:
             self._responses()[self._response_key(camera, shape)] = {**curve.to_json(), "date": today()}
-            if self.directory is not None:
-                tmp = self._responses_json.with_name(f".camera_response-{os.getpid()}.tmp")
-                tmp.write_text(json.dumps(self._response_cache, indent=1), encoding="utf-8")
-                tmp.replace(self._responses_json)
+            self._save_responses()
 
     def _responses(self) -> dict:
         if getattr(self, "_response_cache", None) is None:
@@ -228,7 +287,7 @@ class CalibrationStore:
                     for k in ("lateral_um_per_px_full", "lateral_source", "lateral_date",
                               "lateral_magnification", "lateral_frame",
                               "z_um_per_frame", "z_source", "z_date", "z_uncertainty_pct", "revision",
-                              "flat_sources")
+                              "flat_sources", "lateral_ca", "measured_psf", "distortion")
                 }
                 for kind, d in (("dark", c.darks), ("flat", c.flats)):
                     for key, arr in list(d.items()):

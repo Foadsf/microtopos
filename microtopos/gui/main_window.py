@@ -165,6 +165,15 @@ RESPONSE_EXPOSURES, RESPONSE_FRAMES = 8, 3
 HDR_EXPOSURES, HDR_FRAMES = 5, 2
 
 
+def _disconnect_job(job: Job) -> None:
+    """Drop every connection of a finished job's signals (MainWindow._job_finished)."""
+    for sig in (job.progress, job.done, job.failed, job.finished):
+        try:
+            sig.disconnect()
+        except RuntimeError:  # PySide raises when the signal has no connection left; nothing to drop then
+            pass
+
+
 def _response_job(frames, times, progress=None, cancelled=None):
     if progress:
         progress(0.1, "Solving for the camera response...")
@@ -492,7 +501,7 @@ class MainWindow(QMainWindow):
         self.tab3d = QWidget()
         self._build_3d()
         self.tabs.addTab(self.tab3d, "3D")
-        self.tabs.currentChanged.connect(lambda i: QTimer.singleShot(400, self._check_gl) if i == 4 else None)
+        self.tabs.currentChanged.connect(lambda i: QTimer.singleShot(400, self, self._check_gl) if i == 4 else None)
         self.report = QTextBrowser()
         self.report.setOpenExternalLinks(False)
         self.tabs.addTab(self.report, "Report")
@@ -1387,7 +1396,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(stylesheet(t))
         self.btn_theme.setText("Light theme" if self.dark else "Dark theme")
         if hasattr(self, "dock_left"):
-            QTimer.singleShot(0, self._fit_left_dock)  # after the new style sheet has re-polished the pages
+            QTimer.singleShot(0, self, self._fit_left_dock)  # after the new style sheet has re-polished the pages
         for c in (self.chip_rec, self.chip_state, self.chip_xy, self.chip_z, self.chip_rad, self.chip_src, self.chip_fps, self.chip_sat,
                   *self.step_chips):
             c.retheme(t)
@@ -1527,7 +1536,7 @@ class MainWindow(QMainWindow):
                 self.source.set_speed(float(self.cmb_replay_speed.currentText().replace("×", "")))
             self._replay_sync_button()
         self._apply_exposure()
-        QTimer.singleShot(1500, self._show_readback)
+        QTimer.singleShot(1500, self, self._show_readback)
         self._refresh_checklist()
 
     def _rot_panels(self):
@@ -1582,7 +1591,7 @@ class MainWindow(QMainWindow):
         self._ae_stalls = 0
         self._ae_seq = self.engine.snapshot().seq
         self.btn_autoexp_once.setEnabled(False)
-        QTimer.singleShot(600, self._auto_exposure_step)
+        QTimer.singleShot(600, self, self._auto_exposure_step)
 
     def _auto_exposure_step(self):
         if (not getattr(self, "_ae_active", False) or not isinstance(self.source, CameraSource)
@@ -1598,7 +1607,7 @@ class MainWindow(QMainWindow):
                 self.btn_autoexp_once.setEnabled(True)
                 self.notify("One-shot exposure timed out: no new frames from the camera.", "warning")
                 return
-            QTimer.singleShot(300, self._auto_exposure_step)
+            QTimer.singleShot(300, self, self._auto_exposure_step)
             return
         self._ae_stalls = 0
         self._ae_seq = s.seq
@@ -1616,7 +1625,7 @@ class MainWindow(QMainWindow):
             return
         self.sl_exp.setValue(new)
         self._apply_exposure()
-        QTimer.singleShot(700, self._auto_exposure_step)  # let a few frames with the new exposure arrive
+        QTimer.singleShot(700, self, self._auto_exposure_step)  # let a few frames with the new exposure arrive
 
     # ---------------------------------------------------------------- exposure brackets (response, HDR)
     def _bracket_camera_ok(self, what: str) -> bool:
@@ -1640,7 +1649,7 @@ class MainWindow(QMainWindow):
         self.engine.sm.override = Override.PAUSE
         self.btn_measure_resp.setEnabled(False)
         self.btn_hdr.setEnabled(False)
-        QTimer.singleShot(0, self._bracket_step)
+        QTimer.singleShot(0, self, self._bracket_step)
 
     def _bracket_end(self, error: str | None = None):
         b, self._brk = self._brk, None
@@ -1687,7 +1696,7 @@ class MainWindow(QMainWindow):
                         return
                     b["state"] = "set"
         self.lbl_job.setText(f"{b['label']}: exposure {b['i'] + 1}/{len(b['exp'])} ({e / 10:.1f} ms, {b['state']})")
-        QTimer.singleShot(30, self._bracket_step)
+        QTimer.singleShot(30, self, self._bracket_step)
 
     def _exposure_series(self, n: int) -> list[int]:
         lo, hi = self.source.exposure_range()
@@ -2446,7 +2455,7 @@ class MainWindow(QMainWindow):
         job.progress.connect(lambda f, m, j=job: self._on_progress(j, f, m))
         job.done.connect(on_done)
         job.failed.connect(lambda msg, j=job: self._on_failed(j, msg))
-        job.finished.connect(lambda j=job: self.jobs.remove(j) if j in self.jobs else None)
+        job.finished.connect(lambda j=job: self._job_finished(j))
         self.jobs.append(job)
         if main:
             self.job = job
@@ -2454,6 +2463,15 @@ class MainWindow(QMainWindow):
             job.finished.connect(lambda: self.btn_cancel.setEnabled(False))
         job.start()
         return True
+
+    def _job_finished(self, job: Job):
+        """A job's thread has ended: forget it and, once every queued signal has been delivered, disconnect its
+        signals. Their slots (lambdas) capture the window, and a connection held on the C++ side is invisible to
+        Python's garbage collector: every finished job kept its window, engine and results alive (100-380 MB per
+        closed window in the test suite)."""
+        if job in self.jobs:
+            self.jobs.remove(job)
+        QTimer.singleShot(0, self, lambda: _disconnect_job(job))
 
     def _reconstruct(self, cap: SweepCapture, force: bool = False):
         if not cap.usable and self.engine.sm.override != Override.Z and not force:

@@ -45,6 +45,8 @@ Python 3.12 or newer (CI tests 3.12 and 3.13; development runs on 3.14). On Pyth
 
 ## Status (v0.10, November 2026)
 
+v0.10.3 fixes super-resolution's motion gate. Frames from a microscope nobody touched passed as having sub-pixel motion, and came back resampled and labelled as a super-resolved image. Registration noise of a few thousandths of a pixel either side of zero was counted as different sub-pixel phases. Such frames are now refused. This was found by running v0.10.2 against the MikrOkular camera: 16 still frames, with shifts of 0.00–0.01 px, had been accepted. Super-resolution with real hand motion on that camera has not been tried yet.
+
 v0.10.2 fixes defects found in two reviews of the code added since v0.9.0 (PR #22 and PR #23). The ones that change a measurement:
 
 - **Step height:** the standard error of a step height is computed from the least-squares covariance. It was about 15× too small before. A one-pixel-wide region no longer returns a wrong step.
